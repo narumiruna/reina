@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process"
+import { once } from "node:events"
 
 if (process.argv.includes("--version")) {
   process.stdout.write("1.5.0\n")
@@ -25,10 +26,12 @@ if (task.includes("DETACHED") || task.includes("TIMEOUT")) {
     process.execPath,
     [
       "-e",
-      "const fs=require('node:fs');setInterval(()=>fs.writeFileSync('/workspace/heartbeat',String(Date.now())),5);",
+      "const fs=require('node:fs');const beat=()=>fs.writeFileSync('/workspace/heartbeat',String(Date.now()));beat();setInterval(beat,5);process.send('ready',()=>process.disconnect());",
     ],
-    { detached: true, stdio: "ignore" },
+    { detached: true, stdio: ["ignore", "ignore", "ignore", "ipc"] },
   )
+  const [ready] = await once(child, "message")
+  if (ready !== "ready") throw new Error("detached_fixture_not_ready")
   child.unref()
 }
 if (task.includes("TIMEOUT")) {
