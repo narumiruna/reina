@@ -1,0 +1,47 @@
+{
+  "repository": { "owner": "octo-org", "name": "example", "id": 77, "installationId": 88 },
+  "bot": { "id": 99, "login": "reina[bot]", "type": "Bot" },
+  "actor": { "id": 42, "login": "maintainer", "type": "User" },
+  "issue": {
+    "id": 123,
+    "number": 12,
+    "title": "Correct the documented result",
+    "body": "The result must be Correct instead of Original.",
+    "state": "open",
+    "labels": ["fix_available", "bot:approved"]
+  },
+  "comments": [
+    {
+      "id": 1,
+      "user": { "id": 42, "login": "maintainer", "type": "User" },
+      "body": "Reproduced with the current release.",
+      "created_at": "2026-11-03T09:00:00Z"
+    },
+    {
+      "id": 2,
+      "user": { "id": 99, "login": "reina[bot]", "type": "Bot" },
+      "body": "An earlier Reina assessment.",
+      "created_at": "2026-11-03T09:01:00Z"
+    }
+  ],
+  "events": [
+    {
+      "id": 1001,
+      "event": "labeled",
+      "label": { "name": "fix_available" },
+      "actor": { "id": 99, "login": "reina[bot]", "type": "Bot" },
+      "created_at": "2026-11-03T10:01:00Z"
+    },
+    {
+      "id": 1002,
+      "event": "labeled",
+      "label": { "name": "bot:approved" },
+      "actor": { "id": 42, "login": "maintainer", "type": "User" },
+      "created_at": "2026-11-03T10:02:00Z"
+    }
+  ],
+  "baseSha": "1111111111111111111111111111111111111111",
+  "baseContent": "Original.\n",
+  "changedContent": "Correct.\n",
+  "now": "2026-11-03T10:03:00Z"
+}
