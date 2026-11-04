@@ -18,7 +18,9 @@ npm run ci
 npm run test:runtime
 ```
 
-`npm run ci` runs Biome, Changesets metadata checks, credential-free Vitest tests, and the TypeScript build. Runtime tests use
+`npm run ci` runs Biome, credential-free Vitest tests, and the TypeScript build. CI separately runs
+`npm run check:changesets` on pull requests, except the generated `changeset-release/main` release
+PR, which has already consumed its changesets. Runtime tests use
 the real pinned Pi CLI, Docker, and a local protocol fixture, not a paid model or real GitHub App.
 They prepare a disposable test image and require the pinned Node base image locally:
 
