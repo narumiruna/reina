@@ -68,6 +68,17 @@ describe("issue-local evidence limits", () => {
     expect(value.api.rest.issues.listComments.mock.calls.length).toBeLessThanOrEqual(1)
   })
 
+  test("a comment-count mismatch includes a local retry deadline", async () => {
+    const value = fixture()
+    value.issue.comments = 1
+    const error = await value.github.issue(12).catch((error: unknown) => error)
+    expect(error).toMatchObject({
+      code: "github_issue_changed_during_read",
+      retryAt: expect.any(Number),
+    })
+    expect(error).not.toBeInstanceOf(GitHubDeferred)
+  })
+
   test("exactly 100 comments are accepted without truncation", async () => {
     const value = fixture()
     for (let id = 1; id <= 100; id++) {

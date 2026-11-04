@@ -43,7 +43,10 @@ export class GitHubDeferred extends GitHubError {
 
 /** Incomplete issue evidence must not pause unrelated GitHub work. */
 export class GitHubIssueDeferred extends GitHubError {
-  constructor(code: string) {
+  constructor(
+    code: string,
+    readonly retryAt?: number,
+  ) {
     super(code)
     this.name = "GitHubIssueDeferred"
   }
@@ -357,7 +360,7 @@ export class GitHub {
     if (data.comments > 100) throw new GitHubIssueDeferred("github_comments_limit")
     const comments = await this.readComments(number)
     if (comments.length !== data.comments)
-      throw new GitHubIssueDeferred("github_issue_changed_during_read")
+      throw new GitHubIssueDeferred("github_issue_changed_during_read", Date.now() + 15 * 60_000)
     if (
       Buffer.byteLength(data.title) +
         Buffer.byteLength(data.body ?? "") +

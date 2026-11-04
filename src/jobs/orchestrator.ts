@@ -271,13 +271,23 @@ export class Orchestrator {
         if (this.stopped) return
         this.store.completeDelivery(delivery.id)
       } catch (error) {
-        if (error instanceof GitHubDeferred) {
-          const delay = Math.max(1_000, Math.ceil(error.retryAt - Date.now()))
-          if (Number.isSafeInteger(Date.now() + delay)) this.store.deferDelivery(delivery.id, delay)
+        const retryAt =
+          error instanceof GitHubDeferred || error instanceof GitHubIssueDeferred
+            ? error.retryAt
+            : undefined
+        if (retryAt !== undefined) {
+          const delay = Math.max(1_000, Math.ceil(retryAt - Date.now()))
+          if (Number.isSafeInteger(Date.now() + delay))
+            this.store.deferDelivery(
+              delivery.id,
+              delay,
+              error instanceof GitHubIssueDeferred ? "issue" : "global",
+            )
           else this.store.completeDelivery(delivery.id)
           this.event("deferred", work.kind === "issue" ? work.ref : undefined, {
             correlationId: delivery.id,
-            reason: "github_rate_or_transient_limit",
+            reason:
+              error instanceof GitHubIssueDeferred ? error.code : "github_rate_or_transient_limit",
           })
         } else {
           if (this.stopped) return

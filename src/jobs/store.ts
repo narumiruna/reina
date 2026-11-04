@@ -371,16 +371,20 @@ export class Store {
   private migrate(): void {
     const db = this.database()
     const version = db.prepare("PRAGMA user_version").get()?.user_version
-    if (version === 3) return
-    if (version === 1 || version === 2) {
+    if (version === 4) return
+    if (version === 1 || version === 2 || version === 3) {
       this.transaction(() => {
         if (version === 1)
           db.exec(
             "CREATE TABLE assessments (key TEXT PRIMARY KEY, created_at INTEGER NOT NULL) STRICT;",
           )
-        db.exec(`CREATE UNIQUE INDEX one_active_job_slot ON jobs((1)) WHERE state IN ('approved','working','validating','publishing');
-          CREATE TABLE scan_cursor (id INTEGER PRIMARY KEY CHECK(id = 1), page INTEGER NOT NULL CHECK(page BETWEEN 1 AND 9007199254740991)) STRICT;
-          INSERT INTO scan_cursor(id,page) VALUES(1,1); PRAGMA user_version = 3;`)
+        if (version < 3)
+          db.exec(`CREATE UNIQUE INDEX one_active_job_slot ON jobs((1)) WHERE state IN ('approved','working','validating','publishing');
+            CREATE TABLE scan_cursor (id INTEGER PRIMARY KEY CHECK(id = 1), page INTEGER NOT NULL CHECK(page BETWEEN 1 AND 9007199254740991)) STRICT;
+            INSERT INTO scan_cursor(id,page) VALUES(1,1);`)
+        db.exec(`ALTER TABLE deliveries ADD COLUMN global_until INTEGER NOT NULL DEFAULT 0 CHECK(global_until >= 0);
+          UPDATE deliveries SET global_until = available_at WHERE attempts > 0;
+          PRAGMA user_version = 4;`)
       })
       return
     }
@@ -389,7 +393,8 @@ export class Store {
       db.exec(`
         CREATE TABLE deliveries (
           id TEXT PRIMARY KEY, payload TEXT, status TEXT NOT NULL CHECK(status IN ('pending','complete','failed')),
-          accepted_at INTEGER NOT NULL, available_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 8)
+          accepted_at INTEGER NOT NULL, available_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 8),
+          global_until INTEGER NOT NULL DEFAULT 0 CHECK(global_until >= 0)
         ) STRICT;
         CREATE TABLE proposals (
           revision TEXT PRIMARY KEY, issue_key TEXT NOT NULL, json TEXT NOT NULL,
@@ -418,7 +423,7 @@ export class Store {
         CREATE TABLE assessments (key TEXT PRIMARY KEY, created_at INTEGER NOT NULL) STRICT;
         CREATE TABLE scan_cursor (id INTEGER PRIMARY KEY CHECK(id = 1), page INTEGER NOT NULL CHECK(page BETWEEN 1 AND 9007199254740991)) STRICT;
         INSERT INTO scan_cursor(id,page) VALUES(1,1);
-        PRAGMA user_version = 3;
+        PRAGMA user_version = 4;
       `)
     })
   }
@@ -512,26 +517,23 @@ export class Store {
 
   blockedUntil(): number {
     const row = this.database()
-      .prepare(
-        "SELECT COALESCE(MAX(available_at),0) AS deadline FROM deliveries WHERE attempts > 0",
-      )
+      .prepare("SELECT COALESCE(MAX(global_until),0) AS deadline FROM deliveries")
       .get()
     return validate(timestamp, row?.deadline, "GitHub cooldown")
   }
 
-  deferDelivery(id: string, delayMs: number): void {
+  deferDelivery(id: string, delayMs: number, scope: "global" | "issue" = "global"): void {
     const db = this.database()
     deliveryId(id)
-    if (
-      !Number.isSafeInteger(delayMs) ||
-      delayMs < 0 ||
-      !Number.isSafeInteger(Date.now() + delayMs)
-    )
+    const deadline = Date.now() + delayMs
+    if (!Number.isSafeInteger(delayMs) || delayMs < 0 || !Number.isSafeInteger(deadline))
       throw new Error("Invalid delivery delay")
     db.prepare(`UPDATE deliveries SET attempts = attempts + 1, available_at = ?,
+      global_until = MAX(global_until, ?),
       status = CASE WHEN attempts + 1 >= ? THEN 'failed' ELSE 'pending' END
       WHERE id = ? AND status = 'pending' AND attempts < ?`).run(
-      Date.now() + delayMs,
+      deadline,
+      scope === "global" ? deadline : 0,
       MAX_DELIVERY_ATTEMPTS,
       id,
       MAX_DELIVERY_ATTEMPTS,

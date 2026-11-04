@@ -686,7 +686,11 @@ describe("durable discovery through one trusted draft", () => {
     const value = fixture()
     const read = required(value.github.issue.getMockImplementation())
     value.github.issue.mockImplementation(async (number) => {
-      if (number === 11) throw new GitHubIssueDeferred(code)
+      if (number === 11)
+        throw new GitHubIssueDeferred(
+          code,
+          code === "github_issue_changed_during_read" ? now + 1_000 : undefined,
+        )
       return read(number)
     })
     value.github.discover.mockResolvedValueOnce({ numbers: [11, 12], nextPage: 2 })
@@ -721,6 +725,32 @@ describe("durable discovery through one trusted draft", () => {
     )
     await value.deliver(value.work(), "unrelated-delivery")
     expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+  })
+
+  test("transient evidence retains approval for local retry across restart", async () => {
+    const value = fixture()
+    await value.propose()
+    const approval = value.approval()
+    value.github.issue.mockRejectedValueOnce(
+      new GitHubIssueDeferred("github_issue_changed_during_read", now + 1_000),
+    )
+    await value.deliver(approval, "transient-approval")
+    expect(value.store.jobs()).toEqual([])
+    expect(value.store.blockedUntil()).toBe(0)
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    value.orchestrator.scan()
+    await value.orchestrator.drain()
+    expect(value.github.discover).toHaveBeenCalledTimes(1)
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    await value.restart()
+    expect(value.store.blockedUntil()).toBe(0)
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    now += 1_000
+    expect(value.store.deliveries()).toContainEqual({ id: "transient-approval", payload: approval })
+    await value.orchestrator.drain()
+    expect(value.store.jobs()[0].state).toBe("pr_ready")
+    expect(value.runtime.code).toHaveBeenCalledTimes(1)
+    expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
   })
 
   test("a real scan rate limit keeps the page and pauses all dispatch", async () => {
