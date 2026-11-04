@@ -25,9 +25,11 @@ jobs:
           node-version: 26
           cache: npm
       - run: npm ci
-      - name: Set the Changesets base reference
-        if: github.ref != 'refs/heads/main'
-        run: git branch --force main origin/main
+      - name: Check changesets
+        if: github.event_name == 'pull_request' && github.head_ref != 'changeset-release/main'
+        run: |
+          git branch --force main origin/main
+          npm run check:changesets
       - run: npm run ci
 
   runtime:

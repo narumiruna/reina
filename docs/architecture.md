@@ -214,7 +214,8 @@ memory cgroup but do not perform a 2 GiB out-of-memory stress test.
 
 | Check                                         | Status   | Evidence                                                                |
 | --------------------------------------------- | -------- | ----------------------------------------------------------------------- |
-| `npm run ci`                                  | verified | Biome, Changesets metadata, 473 Vitest tests, and TypeScript build pass |
+| `npm run ci`                                  | verified | Biome, 473 Vitest tests, and TypeScript build pass                      |
+| `npm run check:changesets`                    | verified | Changesets metadata is valid for normal pull requests                   |
 | Strict test-source type check                 | verified | All `tests/*.test.ts` pass strict NodeNext TypeScript checks            |
 | `npm run test:runtime`                        | verified | 12 actual Docker/Pi checks pass; none skipped                           |
 | `npm audit --audit-level=moderate`            | verified | No reported project dependency vulnerabilities                          |
@@ -224,6 +225,7 @@ memory cgroup but do not perform a 2 GiB out-of-memory stress test.
 The runtime checks include host-proxy credential exclusion and scoped orphan staging cleanup.
 Changeset Markdown formatting is disabled at the narrow `.changeset/*.md` scope because the
 current formatter rewrites YAML frontmatter as Markdown. `check:changesets` validates that metadata.
+CI runs this check only for pull requests other than the generated `changeset-release/main` release PR.
 
 TypeScript remains strict for application sources. `skipLibCheck` avoids the current
 `pino-http@11` / `@types/node@26` declaration-augmentation incompatibility. It does not disable

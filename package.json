@@ -19,7 +19,7 @@
     "test:runtime": "npm run build && node --test --test-concurrency=1 tests/runtime/*.test.mjs",
     "prepare:worker": "npm run build && node scripts/prepare-worker.mjs",
     "check:changesets": "changeset status",
-    "ci": "npm run check && npm run check:changesets && npm test && npm run build",
+    "ci": "npm run check && npm test && npm run build",
     "changeset": "changeset",
     "release": "npm run build && changeset publish",
     "prepare": "husky"
