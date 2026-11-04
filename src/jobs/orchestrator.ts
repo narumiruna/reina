@@ -7,11 +7,12 @@ import {
   type GitHub,
   GitHubDeferred,
   GitHubError,
+  GitHubIssueDeferred,
   sameRepository,
 } from "../github/scanner.js"
 import { fingerprint, policyHash } from "../triage/policy.js"
 import { triage } from "../triage/service.js"
-import type { AgentRuntime, Config, IssueRef, Job, Logger, Proposal } from "../types.js"
+import type { AgentRuntime, Config, Issue, IssueRef, Job, Logger, Proposal } from "../types.js"
 import type { Store } from "./store.js"
 import { Worker } from "./worker.js"
 
@@ -53,6 +54,7 @@ const reasons = new Set([
   "proposal_stale",
   "base_changed",
   "job_cancelled",
+  "service_stopping",
   "verification_failed",
   "artifact_invalid",
   "runtime_timeout",
@@ -99,7 +101,7 @@ function failureReason(error: unknown): string {
 
 export class Orchestrator {
   private draining?: Promise<void>
-  private stopped = false
+  private shutdown = new AbortController()
   private disabled = false
   private timer?: ReturnType<typeof setInterval>
   private scanTimer?: ReturnType<typeof setInterval>
@@ -156,6 +158,10 @@ export class Orchestrator {
     void this.drain()
   }
 
+  private get stopped(): boolean {
+    return this.shutdown.signal.aborted
+  }
+
   private enabled(ref: IssueRef): boolean {
     return sameRepository(ref, this.config.repository)
   }
@@ -168,7 +174,9 @@ export class Orchestrator {
 
   async start(): Promise<void> {
     await this.runtime.cleanup()
+    if (this.stopped) return
     await this.runtime.preflight()
+    if (this.stopped) return
     try {
       await this.recover()
     } catch (error) {
@@ -177,6 +185,7 @@ export class Orchestrator {
       this.store.acceptDelivery(id, { kind: "scan", reason: "publication_recovery" })
       this.store.deferDelivery(id, Math.max(1_000, Math.ceil(error.retryAt - Date.now())))
     }
+    if (this.stopped) return
     this.timer = setInterval(() => {
       void this.drain()
     }, 1_000)
@@ -224,9 +233,23 @@ export class Orchestrator {
         if (work.kind === "issue" && !this.disabled) await this.issue(work, delivery.id)
         if (work.kind === "scan" && !this.disabled) {
           const { github } = await this.boundaries()
+          if (this.stopped) return
           const batch = await github.discover(this.config.maxIssuesPerScan, this.store.scanPage())
           for (const number of batch.numbers) {
-            const issue = await github.issue(number)
+            if (this.stopped) return
+            let issue: Issue
+            try {
+              issue = await github.issue(number)
+            } catch (error) {
+              if (!(error instanceof GitHubIssueDeferred)) throw error
+              this.event("deferred", undefined, {
+                correlationId: delivery.id,
+                issue: number,
+                reason: error.code,
+              })
+              continue
+            }
+            if (this.stopped) return
             if (
               issue.state === "open" &&
               !issue.pullRequest &&
@@ -241,28 +264,47 @@ export class Orchestrator {
               } satisfies Work)
             }
           }
+          if (this.stopped) return
           this.store.saveScanPage(batch.nextPage)
           await this.recover()
         }
+        if (this.stopped) return
         this.store.completeDelivery(delivery.id)
       } catch (error) {
-        if (error instanceof GitHubDeferred) {
-          const delay = Math.max(1_000, Math.ceil(error.retryAt - Date.now()))
-          if (Number.isSafeInteger(Date.now() + delay)) this.store.deferDelivery(delivery.id, delay)
+        const retryAt =
+          error instanceof GitHubDeferred || error instanceof GitHubIssueDeferred
+            ? error.retryAt
+            : undefined
+        if (retryAt !== undefined) {
+          const delay = Math.max(1_000, Math.ceil(retryAt - Date.now()))
+          if (Number.isSafeInteger(Date.now() + delay))
+            this.store.deferDelivery(
+              delivery.id,
+              delay,
+              error instanceof GitHubIssueDeferred ? "issue" : "global",
+            )
           else this.store.completeDelivery(delivery.id)
           this.event("deferred", work.kind === "issue" ? work.ref : undefined, {
             correlationId: delivery.id,
-            reason: "github_rate_or_transient_limit",
+            reason:
+              error instanceof GitHubIssueDeferred ? error.code : "github_rate_or_transient_limit",
           })
         } else {
+          if (this.stopped) return
           this.store.completeDelivery(delivery.id)
-          this.event("failed", work.kind === "issue" ? work.ref : undefined, {
-            correlationId: delivery.id,
-            reason:
-              error instanceof Error && reasons.has(error.message)
-                ? error.message
-                : "request_rejected_or_failed",
-          })
+          this.event(
+            error instanceof GitHubIssueDeferred ? "deferred" : "failed",
+            work.kind === "issue" ? work.ref : undefined,
+            {
+              correlationId: delivery.id,
+              reason:
+                error instanceof GitHubIssueDeferred
+                  ? error.code
+                  : error instanceof Error && reasons.has(error.message)
+                    ? error.message
+                    : "request_rejected_or_failed",
+            },
+          )
         }
       }
     }
@@ -273,7 +315,9 @@ export class Orchestrator {
     correlationId: string,
   ): Promise<void> {
     const { github, publisher } = await this.boundaries()
+    if (this.stopped) return
     const issue = await github.issue(work.ref.number)
+    if (this.stopped) return
     if (!this.enabled(issue.ref) || issue.ref.issueId !== work.ref.issueId)
       throw new Error("issue_identity_changed")
     this.event("discovered", issue.ref, { correlationId })
@@ -295,6 +339,7 @@ export class Orchestrator {
     }
     let proposal = this.store.proposal(issue.ref)
     const head = await github.head()
+    if (this.stopped) return
     if (
       proposal &&
       (proposal.fingerprint !== fingerprint(issue, this.botId) ||
@@ -322,6 +367,7 @@ export class Orchestrator {
     if (proposal && work.action === "labeled" && work.label === "bot:approved") {
       if (!work.actor) throw new Error("actor_missing")
       const approval = await authorize(github, issue, proposal, work.actor)
+      if (this.stopped) return
       const job = this.store.claim(proposal, approval)
       if (!job) return
       this.event("approved", issue.ref, {
@@ -337,7 +383,7 @@ export class Orchestrator {
     // Scanning a label is not permission to execute; a new proposal needs a new human transition.
     if (issue.labels.includes("bot:approved"))
       await publisher.labels(issue.ref.number, [], ["bot:approved"])
-    if (await github.conflicts(issue.ref.number)) return
+    if ((await github.conflicts(issue.ref.number)) || this.stopped) return
     const assessment = createHash("sha256")
       .update(
         JSON.stringify([
@@ -351,22 +397,17 @@ export class Orchestrator {
       )
       .digest("hex")
     if (this.store.assessed(assessment)) return
-    this.store.rememberAssessment(assessment)
     const snapshot = await github.snapshotAt(head.branch, head.sha)
+    if (this.stopped) return
+    this.store.rememberAssessment(assessment)
     const controller = new AbortController()
+    const signal = AbortSignal.any([controller.signal, this.shutdown.signal])
     this.controllers.set(key(issue.ref), controller)
     this.controllerBranches.set(key(issue.ref), snapshot.branch)
     try {
       this.event("triage_started", issue.ref, { correlationId })
-      proposal = await triage(
-        issue,
-        snapshot,
-        this.config,
-        this.runtime,
-        this.botId,
-        controller.signal,
-      )
-      controller.signal.throwIfAborted()
+      proposal = await triage(issue, snapshot, this.config, this.runtime, this.botId, signal)
+      signal.throwIfAborted()
       this.event("triage_decision", issue.ref, { correlationId, eligible: Boolean(proposal) })
       if (!proposal) return
       const current = await github.issue(issue.ref.number)
@@ -380,7 +421,7 @@ export class Orchestrator {
       ) {
         throw new Error("proposal_stale")
       }
-      controller.signal.throwIfAborted()
+      signal.throwIfAborted()
       this.store.saveProposal(proposal)
       Object.assign(
         proposal,
@@ -403,12 +444,14 @@ export class Orchestrator {
     github: GitHub,
     publisher: Publisher,
   ): Promise<void> {
+    if (this.stopped) return
     const controller = new AbortController()
+    const signal = AbortSignal.any([controller.signal, this.shutdown.signal])
     this.controllers.set(key(job.ref), controller)
     this.controllerBranches.set(key(job.ref), proposal.baseBranch)
     this.event("dispatched", job.ref, { jobId: job.id, proposalId: proposal.revision })
     try {
-      await this.worker.run(job, proposal, github, publisher, controller.signal)
+      await this.worker.run(job, proposal, github, publisher, signal)
       const current = this.store.job(job.id)
       if (current?.state === "pr_ready") {
         current.notified = true
@@ -434,7 +477,7 @@ export class Orchestrator {
       }
       if (current && !terminal.has(current.state)) {
         const revoked =
-          controller.signal.aborted ||
+          signal.aborted ||
           (error instanceof Error &&
             ["proposal_stale", "base_changed", "job_cancelled"].includes(error.message)) ||
           (error instanceof GitHubError &&
@@ -482,6 +525,7 @@ export class Orchestrator {
       }
       try {
         const { github, publisher } = await this.boundaries()
+        if (this.stopped) return
         if (job.state === "publishing") {
           const proposal = this.store.proposal(job.ref)
           if (proposal) await this.execute(job, proposal, github, publisher)
@@ -512,11 +556,9 @@ export class Orchestrator {
   }
 
   async stop(): Promise<void> {
-    this.stopped = true
+    this.shutdown.abort(new Error("service_stopping"))
     clearInterval(this.timer)
     clearInterval(this.scanTimer)
-    for (const controller of this.controllers.values())
-      controller.abort(new Error("service_stopping"))
     await this.draining
     await this.runtime.cleanup()
   }

@@ -9,6 +9,7 @@ import {
   GitHubDeferred,
   GitHubError,
   GitHubOutcomeUnknown,
+  GitHubWriteRejected,
   gitHash,
   githubRead,
   githubWrite,
@@ -218,10 +219,17 @@ export class Publisher {
     }
     let comment = await reconcile()
     if (!comment) {
-      if (proposal.commentIntent || this.attemptedComments.has(proposal.revision)) {
+      const retryAt = proposal.commentIntent ? proposal.commentRetryAt : undefined
+      if (
+        (proposal.commentIntent || this.attemptedComments.has(proposal.revision)) &&
+        (retryAt === undefined || !save)
+      ) {
         throw new GitHubOutcomeUnknown("github_comment_outcome_unknown")
       }
+      if (retryAt !== undefined && retryAt > Date.now()) throw new GitHubWriteRejected(retryAt)
       proposal.commentIntent = true
+      // Consume the one-use grant before POST. A failed save must not send a request.
+      delete proposal.commentRetryAt
       save?.(proposal)
       this.attemptedComments.add(proposal.revision)
       try {
@@ -234,6 +242,11 @@ export class Publisher {
         )
         comment = response.data
       } catch (error) {
+        if (error instanceof GitHubWriteRejected && save) {
+          const rejected = { ...proposal, commentRetryAt: error.retryAt }
+          save(rejected)
+          proposal.commentRetryAt = error.retryAt
+        }
         if (error instanceof GitHubDeferred) throw error
         // A complete read must find the accepted comment before anything is retried.
         try {
@@ -256,6 +269,10 @@ export class Publisher {
     }
     const publishedAt = Date.parse(comment.created_at)
     if (!Number.isFinite(publishedAt)) throw new GitHubError("publication_comment_timestamp")
+    if (proposal.commentRetryAt !== undefined) {
+      delete proposal.commentRetryAt
+      save?.(proposal)
+    }
     return { commentId: numericId(comment.id), publishedAt }
   }
 
@@ -506,9 +523,15 @@ export class Publisher {
     if (existing && existing !== sha) throw new GitHubError("publication_branch_conflict")
     let pr = await this.reconcilePR(job, proposal, sha)
     if (!pr) {
-      if (job.publication?.prIntent || job.publication?.prNumber || job.state === "pr_ready") {
+      const retryAt = job.publication?.prIntent ? job.publication.prRetryAt : undefined
+      if (
+        (job.publication?.prIntent && retryAt === undefined) ||
+        job.publication?.prNumber ||
+        job.state === "pr_ready"
+      ) {
         throw new GitHubOutcomeUnknown("github_pr_outcome_unknown")
       }
+      if (retryAt !== undefined && retryAt > Date.now()) throw new GitHubWriteRejected(retryAt)
       if (!existing) {
         await this.currentBase(proposal)
         save(job)
@@ -538,9 +561,10 @@ export class Publisher {
       pr = await this.reconcilePR(job, proposal, sha)
       if (!pr) {
         await this.currentBase(proposal)
+        const { prRetryAt: _retryAt, ...publication } = job.publication ?? { branch }
         job = {
           ...job,
-          publication: { ...job.publication, branch, commitSha: sha, prIntent: true },
+          publication: { ...publication, branch, commitSha: sha, prIntent: true },
           updatedAt: Date.now(),
         }
         save(job) // A crash here must reconcile, not blindly repeat POST /pulls.
@@ -559,6 +583,14 @@ export class Publisher {
           this.verifyPR(data, job, proposal, sha)
           pr = data
         } catch (error) {
+          if (error instanceof GitHubWriteRejected) {
+            job = {
+              ...job,
+              publication: { ...job.publication, branch, prRetryAt: error.retryAt },
+              updatedAt: Date.now(),
+            }
+            save(job)
+          }
           if (error instanceof GitHubDeferred) throw error
           try {
             pr = await this.reconcilePR(job, proposal, sha)

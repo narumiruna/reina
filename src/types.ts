@@ -55,6 +55,7 @@ export interface Proposal {
   createdAt: number
   expiresAt: number
   commentIntent?: boolean
+  commentRetryAt?: number
   commentId?: number
   publishedAt?: number
 }
@@ -115,6 +116,7 @@ export interface Publication {
   branch: string
   commitSha?: string
   prIntent?: boolean
+  prRetryAt?: number
   prNumber?: number
   prUrl?: string
 }

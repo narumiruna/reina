@@ -88,6 +88,11 @@ Identical assessments, including failed or deferred ones, run at most once per U
 issue-content/base/policy key. A changed key permits a new assessment. State-only reopening or
 removing an exclusion can therefore wait for the next assessment day. Scans use a durable page
 cursor so skipped or previously assessed issues do not permanently hide older issues.
+Oversized or changing issue evidence is deferred for that issue only. The scan can process other
+issues and advance its cursor. No incomplete evidence is sent to triage. Real GitHub rate limits
+and exhausted transient reads still apply a persistent global cooldown. A temporary comment-count
+mismatch retains its delivery for issue-local retry after 15 minutes. The signed approval action
+stays available for fresh authorization. Local retries use the same eight-attempt limit.
 
 The patch allowlist is further narrowed by the proposal's exact file list. Hard exclusions cover
 credentials, agent instructions/configuration, workflows, dependencies, tooling, and deployment.
@@ -112,6 +117,9 @@ SQLite stores proposals, consumed approval events, inbox deliveries, jobs, and p
 It uses foreign keys, WAL, full synchronous durability, and an independent process-lifetime
 SQLite lock. The OS releases that lock after a crash. The directory is service-owned and private.
 Ephemeral storage, network filesystems, and multiple service instances are unsupported.
+Schema version 4 stores global cooldowns separately from local delivery deadlines. The transactional
+upgrade preserves existing cooldowns from schema versions 1, 2, and 3. Stop the service and take a
+consistent backup before an upgrade.
 
 Normal job states are approved, working, validating, publishing, and pr_ready. Failed and
 cancelled jobs cannot resume coding. The public labels are projections of state:
@@ -131,6 +139,10 @@ GitHub observations, webhook delivery, and local transactions are not atomic. A 
 can race the last check; there is no claim of instantaneous distributed revocation or exactly-once
 remote transactions. A base change does not authorize an automatic rebase.
 
+Shutdown aborts active worker signals and prevents new claims, triage, coding, and publication
+recovery. A delivery stopped before dispatch stays in the durable inbox. A later service instance
+must check its evidence and authority again.
+
 ## Publication and recovery
 
 Only the trusted GitHub boundary obtains narrowly scoped installation write tokens.
@@ -147,6 +159,10 @@ Commit inputs are stable, and publication intent/resource IDs are persisted befo
 Unknown write responses require reconciliation. The publisher compares the exact ref/commit and
 App-owned PR marker, head, base, and author across all PR states. Existing closed or merged PRs
 are terminal. Unknown comment/PR creation with no conclusive result does not permit another POST.
+An explicit rate-limit rejection with HTTP 403 or 429 can record a single-use retry deadline.
+Intent stays recorded. After the deadline, the publisher reconciles first and consumes that retry
+authorization in durable state before another POST. A lost retry response cannot reuse it.
+Other responses, including HTTP 5xx with rate-limit headers, do not authorize a retry.
 Conflicting resources are not overwritten, force-pushed, reopened, or deleted.
 
 On restart, the service terminates its own orphan containers, volumes, and private staging directories,
@@ -170,7 +186,9 @@ changed, do not resume remote writes. Existing remote effects require operator r
 6. For unknown publication, inspect the stored intent and matching GitHub resources. Do not
    delete a branch/PR or reset an intent without explicit maintainer authorization.
 7. On rollback, stop scans/dispatch, cancel workers, preserve resource IDs, and restore a compatible
-   application. Do not automatically close existing PRs or delete branches.
+   application. Older binaries cannot open schema version 4 or read the optional retry deadlines.
+   Restore a matching state backup before using an older version. Do not automatically close
+   existing PRs or delete branches.
 
 Logs include event, repository ID/name, issue, installation, job/proposal, and correlation IDs.
 They use reason codes instead of raw API/model errors. Do not enable raw Probot debug payload
@@ -196,7 +214,7 @@ memory cgroup but do not perform a 2 GiB out-of-memory stress test.
 
 | Check                                         | Status   | Evidence                                                                |
 | --------------------------------------------- | -------- | ----------------------------------------------------------------------- |
-| `npm run ci`                                  | verified | Biome, Changesets metadata, 420 Vitest tests, and TypeScript build pass |
+| `npm run ci`                                  | verified | Biome, Changesets metadata, 473 Vitest tests, and TypeScript build pass |
 | Strict test-source type check                 | verified | All `tests/*.test.ts` pass strict NodeNext TypeScript checks            |
 | `npm run test:runtime`                        | verified | 12 actual Docker/Pi checks pass; none skipped                           |
 | `npm audit --audit-level=moderate`            | verified | No reported project dependency vulnerabilities                          |

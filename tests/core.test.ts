@@ -238,6 +238,8 @@ describe("atomic revocation and persistent GitHub cooldown", () => {
     store.deferDelivery("cooldown", 2 * 86_400_000)
     const deadline = store.blockedUntil()
     expect(deadline).toBeGreaterThanOrEqual(now + 2 * 86_400_000)
+    store.completeDelivery("cooldown")
+    expect(store.blockedUntil()).toBe(deadline)
     store.close()
     expect(openStore().blockedUntil()).toBe(deadline)
   })
@@ -666,6 +668,69 @@ describe("durable store", () => {
     expect(store.acceptDelivery("retry", {})).toBe(false)
   })
 
+  test("issue-local retries retain the payload across restart without blocking other deliveries", () => {
+    vi.useFakeTimers()
+    const now = Date.now()
+    vi.setSystemTime(now)
+    let store = openStore()
+    const payload = { kind: "approval", number: 1 }
+    store.acceptDelivery("local", payload)
+    store.deferDelivery("local", 5_000, "issue")
+    store.acceptDelivery("unrelated", { number: 2 })
+    expect(store.deliveries()).toEqual([{ id: "unrelated", payload: { number: 2 } }])
+    expect(store.blockedUntil()).toBe(0)
+    store.close()
+    store = openStore()
+    expect(store.deliveries()).toEqual([{ id: "unrelated", payload: { number: 2 } }])
+    expect(store.blockedUntil()).toBe(0)
+    store.completeDelivery("unrelated")
+    vi.advanceTimersByTime(4_999)
+    expect(store.deliveries()).toEqual([])
+    vi.advanceTimersByTime(1)
+    expect(store.deliveries()).toEqual([{ id: "local", payload }])
+    store.completeDelivery("local")
+    expect(store.acceptDelivery("local", payload)).toBe(false)
+  })
+
+  test("issue-local retries exhaust the eight-attempt limit durably", () => {
+    vi.useFakeTimers()
+    let store = openStore()
+    store.acceptDelivery("local-exhausted", {})
+    for (let attempt = 1; attempt <= 8; attempt++) {
+      store.deferDelivery("local-exhausted", 1_000, "issue")
+      expect(store.deliveries()).toEqual([])
+      expect(store.blockedUntil()).toBe(0)
+      vi.advanceTimersByTime(1_000)
+      expect(store.deliveries()).toHaveLength(attempt < 8 ? 1 : 0)
+    }
+    store.close()
+    store = openStore()
+    expect(store.deliveries()).toEqual([])
+    expect(store.acceptDelivery("local-exhausted", {})).toBe(false)
+    expect(store.blockedUntil()).toBe(0)
+  })
+
+  test("issue-local retries neither clear nor extend an earlier global cooldown", () => {
+    vi.useFakeTimers()
+    let store = openStore()
+    store.acceptDelivery("mixed", {})
+    store.deferDelivery("mixed", 5_000)
+    const deadline = store.blockedUntil()
+    expect(deadline).toBe(Date.now() + 5_000)
+    store.deferDelivery("mixed", 1_000, "issue")
+    expect(store.blockedUntil()).toBe(deadline)
+    vi.advanceTimersByTime(1_000)
+    expect(store.deliveries()).toEqual([{ id: "mixed", payload: {} }])
+    store.deferDelivery("mixed", 10_000, "issue")
+    expect(store.blockedUntil()).toBe(deadline)
+    store.close()
+    store = openStore()
+    expect(store.blockedUntil()).toBe(deadline)
+    expect(store.deliveries()).toEqual([])
+    store.completeDelivery("mixed")
+    expect(store.blockedUntil()).toBe(deadline)
+  })
+
   test("rejects non-JSON, credentials, and oversized inbox input without accepting it", () => {
     const store = openStore()
     const circular: Record<string, unknown> = {}
@@ -703,21 +768,61 @@ describe("durable store", () => {
     ).toBe(false)
   })
 
-  test.each([1, 2])("migrates version %s without losing inbox state", (version) => {
-    let store = openStore()
-    store.acceptDelivery("before-migration", {})
-    store.close()
-    const db = new DatabaseSync(join(directory, "state", "reina.sqlite"))
-    db.exec(
-      `DROP TABLE scan_cursor; DROP INDEX one_active_job_slot; ${version === 1 ? "DROP TABLE assessments;" : ""} PRAGMA user_version = ${version};`,
-    )
-    db.close()
-    store = openStore()
-    expect(store.deliveries()).toEqual([{ id: "before-migration", payload: {} }])
-    expect(store.scanPage()).toBe(1)
-    store.rememberAssessment("migrated")
-    expect(store.assessed("migrated")).toBe(true)
-  })
+  test.each([1, 2, 3])(
+    "migrates version %s without losing inbox state or legacy global cooldowns",
+    (version) => {
+      vi.useFakeTimers()
+      const now = Date.now()
+      vi.setSystemTime(now)
+      let store = openStore()
+      store.acceptDelivery("before-migration", {})
+      store.acceptDelivery("pending", {})
+      store.deferDelivery("pending", 1_000)
+      store.acceptDelivery("complete", {})
+      store.deferDelivery("complete", 2_000)
+      store.completeDelivery("complete")
+      store.acceptDelivery("failed", {})
+      for (let attempt = 0; attempt < 8; attempt++) store.deferDelivery("failed", 3_000)
+      store.close()
+      const path = join(directory, "state", "reina.sqlite")
+      const db = new DatabaseSync(path)
+      db.exec(`ALTER TABLE deliveries DROP COLUMN global_until;
+        ${version < 3 ? "DROP TABLE scan_cursor; DROP INDEX one_active_job_slot;" : ""}
+        ${version === 1 ? "DROP TABLE assessments;" : ""}
+        PRAGMA user_version = ${version};`)
+      db.close()
+      store = openStore()
+      expect(store.deliveries()).toEqual([{ id: "before-migration", payload: {} }])
+      expect(store.blockedUntil()).toBe(now + 3_000)
+      expect(store.scanPage()).toBe(1)
+      store.rememberAssessment("migrated")
+      expect(store.assessed("migrated")).toBe(true)
+      const migrated = new DatabaseSync(path, { readOnly: true })
+      try {
+        expect(migrated.prepare("PRAGMA user_version").get()?.user_version).toBe(4)
+        expect(
+          migrated
+            .prepare("SELECT id,global_until FROM deliveries ORDER BY id")
+            .all()
+            .map((row) => ({ ...row })),
+        ).toEqual([
+          { id: "before-migration", global_until: 0 },
+          { id: "complete", global_until: now + 2_000 },
+          { id: "failed", global_until: now + 3_000 },
+          { id: "pending", global_until: now + 1_000 },
+        ])
+      } finally {
+        migrated.close()
+      }
+      vi.advanceTimersByTime(3_000)
+      expect(store.deliveries()).toEqual([
+        { id: "before-migration", payload: {} },
+        { id: "pending", payload: {} },
+      ])
+      store.close()
+      expect(openStore().blockedUntil()).toBe(now + 3_000)
+    },
+  )
 
   test("persists the bounded single-repository scan cursor", () => {
     let store = openStore()
@@ -850,6 +955,93 @@ describe("durable store", () => {
         ...value,
         commentIntent: true,
         decision: decision({ proposedFix: "Another change" }),
+      }),
+    ).toThrow(/immutable/)
+  })
+
+  test("retry authorizations survive SQLite reopen and consumption without clearing intent", () => {
+    let store = openStore()
+    const { commentId: _id, publishedAt: _published, ...pending } = proposal(2)
+    const retryAt = Date.now() + 1000
+    store.saveProposal(pending)
+    store.saveProposal({ ...pending, commentRetryAt: retryAt })
+    let job = publishing(store, claim(store))
+    job = advance(store, job, "publishing", {
+      publication: {
+        branch: "narumi/fix/reina-issue-1",
+        commitSha: "f".repeat(40),
+        prIntent: true,
+        prRetryAt: retryAt,
+      },
+    })
+    store.close()
+    store = openStore()
+    expect(store.proposal(pending.ref)?.commentRetryAt).toBe(retryAt)
+    expect(store.job(job.id)?.publication?.prRetryAt).toBe(retryAt)
+    const { commentRetryAt: _commentRetry, ...consumed } = required(store.proposal(pending.ref))
+    store.saveProposal(consumed)
+    const { prRetryAt: _prRetry, ...publication } = required(
+      required(store.job(job.id)).publication,
+    )
+    store.saveJob({ ...job, publication })
+    store.close()
+    store = openStore()
+    expect(store.proposal(pending.ref)).toMatchObject({ commentIntent: true })
+    expect(store.proposal(pending.ref)?.commentRetryAt).toBeUndefined()
+    expect(store.job(job.id)?.publication).toMatchObject({ prIntent: true })
+    expect(store.job(job.id)?.publication?.prRetryAt).toBeUndefined()
+    expect(() => store.saveProposal({ ...consumed, commentIntent: false })).toThrow(/immutable/)
+    expect(() =>
+      store.saveJob({ ...job, publication: { ...publication, prIntent: false } }),
+    ).toThrow(/immutable/)
+  })
+
+  test("retry state requires intent, valid timestamps, and no confirmed identity", () => {
+    const store = openStore()
+    const {
+      commentIntent: _intent,
+      commentId: _id,
+      publishedAt: _published,
+      ...pending
+    } = proposal(2)
+    const retryAt = Date.now() + 1000
+    for (const fields of [
+      { commentRetryAt: retryAt },
+      { commentIntent: true, commentRetryAt: -1 },
+      { commentIntent: true, commentRetryAt: 1.5 },
+      { commentIntent: true, commentRetryAt: retryAt, commentId: 20 },
+    ])
+      expect(() => store.saveProposal({ ...pending, ...fields })).toThrow()
+    const confirmed = proposal(2)
+    store.saveProposal(confirmed)
+    expect(() => store.saveProposal({ ...confirmed, commentId: 999 })).toThrow(/immutable/)
+    let job = publishing(store, claim(store))
+    const publication = { branch: "narumi/fix/reina-issue-1", commitSha: "f".repeat(40) }
+    for (const fields of [
+      { prRetryAt: retryAt },
+      { prIntent: true, prRetryAt: -1 },
+      { prIntent: true, prRetryAt: retryAt, prNumber: 20 },
+      { prIntent: true, prRetryAt: retryAt, prUrl: "https://github.com/example/project/pull/20" },
+    ])
+      expect(() => store.saveJob({ ...job, publication: { ...publication, ...fields } })).toThrow()
+    job = advance(store, job, "pr_ready", {
+      publication: {
+        ...publication,
+        prIntent: true,
+        prNumber: 20,
+        prUrl: "https://github.com/example/project/pull/20",
+      },
+    })
+    expect(() =>
+      store.saveJob({ ...job, publication: { ...required(job.publication), prNumber: 21 } }),
+    ).toThrow(/immutable/)
+    expect(() =>
+      store.saveJob({
+        ...job,
+        publication: {
+          ...required(job.publication),
+          prUrl: "https://github.com/example/project/pull/21",
+        },
       }),
     ).toThrow(/immutable/)
   })
