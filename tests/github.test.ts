@@ -903,6 +903,219 @@ describe("proposal comments and labels", () => {
   })
 })
 
+describe("publication retry authorization", () => {
+  function operation(kind: "comment" | "PR") {
+    const { api, publisher } = setup()
+    const p = proposal()
+    delete p.commentId
+    delete p.publishedAt
+    let durableProposal = clone(p)
+    let durableJob = job(p)
+    let saveFault: "grant" | "consume" | undefined
+    const post = kind === "comment" ? api.rest.issues.createComment : api.rest.pulls.create
+    const commentPost = api.rest.issues.createComment.getMockImplementation()
+    const prPost = api.rest.pulls.create.getMockImplementation()
+    if (!commentPost || !prPost) throw new Error("Missing mock implementation")
+    const checkSave = (previous: number | undefined, next: number | undefined) => {
+      if (
+        (saveFault === "grant" && next !== undefined) ||
+        (saveFault === "consume" && previous !== undefined && next === undefined)
+      )
+        throw new Error("save failed")
+    }
+    const saveProposal = (saved: Proposal) => {
+      checkSave(durableProposal.commentRetryAt, saved.commentRetryAt)
+      durableProposal = clone(saved)
+    }
+    const saveJob = (saved: Job) => {
+      checkSave(durableJob.publication?.prRetryAt, saved.publication?.prRetryAt)
+      durableJob = clone(saved)
+    }
+    return {
+      api,
+      publisher,
+      post,
+      accept: () =>
+        kind === "comment"
+          ? commentPost(api.rest.issues.createComment.mock.calls[0][0])
+          : prPost(api.rest.pulls.create.mock.calls[0][0]),
+      beforePost(check: () => void) {
+        if (kind === "comment") {
+          api.rest.issues.createComment.mockImplementationOnce(async (params) => {
+            check()
+            return commentPost(params)
+          })
+        } else {
+          api.rest.pulls.create.mockImplementationOnce(async (params) => {
+            check()
+            return prPost(params)
+          })
+        }
+      },
+      failSave: (phase?: "grant" | "consume") => {
+        saveFault = phase
+      },
+      retryAt: () =>
+        kind === "comment" ? durableProposal.commentRetryAt : durableJob.publication?.prRetryAt,
+      intent: () =>
+        kind === "comment" ? durableProposal.commentIntent : durableJob.publication?.prIntent,
+      run: (current = publisher) =>
+        kind === "comment"
+          ? current.propose(clone(durableProposal), saveProposal)
+          : current.publish(durableJob, p, saveJob),
+    }
+  }
+
+  test.each([
+    ["comment", 403, false],
+    ["comment", 403, true],
+    ["comment", 429, false],
+    ["comment", 429, true],
+    ["PR", 403, false],
+    ["PR", 403, true],
+    ["PR", 429, false],
+    ["PR", 429, true],
+  ] as const)("%s retries confirmed %s once (restart=%s)", async (kind, status, restart) => {
+    const op = operation(kind)
+    op.post.mockRejectedValueOnce(apiError(status, { "retry-after": "1" }))
+    await expect(op.run()).rejects.toMatchObject({ retryAt: now + 1000 })
+    expect(op.retryAt()).toBe(now + 1000)
+    expect(op.intent()).toBe(true)
+    const current = restart ? new Publisher(op.api.client(), repository, bot.id) : op.publisher
+    await expect(op.run(current)).rejects.toMatchObject({ retryAt: now + 1000 })
+    expect(op.post).toHaveBeenCalledTimes(1)
+    vi.setSystemTime(now + 1000)
+    op.beforePost(() => {
+      expect(op.retryAt()).toBeUndefined()
+      expect(op.intent()).toBe(true)
+    })
+    await op.run(current)
+    expect(op.retryAt()).toBeUndefined()
+    expect(op.post).toHaveBeenCalledTimes(2)
+  })
+
+  test.each(["comment", "PR"] as const)(
+    "%s consumes authorization even when retry acceptance is hidden",
+    async (kind) => {
+      const op = operation(kind)
+      op.post.mockRejectedValueOnce(apiError(429, { "retry-after": "1" }))
+      await expect(op.run()).rejects.toBeInstanceOf(GitHubDeferred)
+      expect(op.retryAt()).toBe(now + 1000)
+      vi.setSystemTime(now + 1000)
+      if (kind === "comment") {
+        op.api.fail("issues.createComment", "after")
+        op.api.rest.issues.listComments.mockResolvedValueOnce(response([]))
+        op.api.rest.issues.listComments.mockResolvedValueOnce(response([]))
+      } else {
+        op.api.fail("pulls.create", "after")
+        for (let i = 0; i < 3; i++) op.api.rest.pulls.list.mockResolvedValueOnce(response([]))
+      }
+      await expect(op.run()).rejects.toBeInstanceOf(GitHubOutcomeUnknown)
+      expect(op.retryAt()).toBeUndefined()
+      const restarted = new Publisher(op.api.client(), repository, bot.id)
+      if (kind === "comment") op.api.rest.issues.listComments.mockResolvedValueOnce(response([]))
+      else op.api.rest.pulls.list.mockResolvedValueOnce(response([]))
+      await expect(op.run(restarted)).rejects.toBeInstanceOf(GitHubOutcomeUnknown)
+      expect(op.post).toHaveBeenCalledTimes(2)
+      await op.run(restarted)
+      expect(op.post).toHaveBeenCalledTimes(2)
+    },
+  )
+
+  test.each(["comment", "PR"] as const)(
+    "%s never grants a retry for 503 with Retry-After",
+    async (kind) => {
+      const op = operation(kind)
+      op.post.mockRejectedValueOnce(apiError(503, { "retry-after": "1" }))
+      await expect(op.run()).rejects.toBeInstanceOf(GitHubDeferred)
+      expect(op.retryAt()).toBeUndefined()
+      vi.setSystemTime(now + 1000)
+      await expect(op.run()).rejects.toBeInstanceOf(GitHubOutcomeUnknown)
+      await expect(
+        op.run(new Publisher(op.api.client(), repository, bot.id)),
+      ).rejects.toBeInstanceOf(GitHubOutcomeUnknown)
+      expect(op.post).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  test.each(["comment", "PR"] as const)("%s fails closed on grant save failure", async (kind) => {
+    const op = operation(kind)
+    op.failSave("grant")
+    op.post.mockRejectedValueOnce(apiError(429, { "retry-after": "1" }))
+    await expect(op.run()).rejects.toThrow("save failed")
+    expect(op.retryAt()).toBeUndefined()
+    expect(op.intent()).toBe(true)
+    op.failSave()
+    vi.setSystemTime(now + 1000)
+    await expect(op.run()).rejects.toBeInstanceOf(GitHubOutcomeUnknown)
+    await expect(op.run(new Publisher(op.api.client(), repository, bot.id))).rejects.toBeInstanceOf(
+      GitHubOutcomeUnknown,
+    )
+    expect(op.post).toHaveBeenCalledTimes(1)
+  })
+
+  test.each(["comment", "PR"] as const)("%s needs durable grant consumption", async (kind) => {
+    const op = operation(kind)
+    op.post.mockRejectedValueOnce(apiError(429, { "retry-after": "1" }))
+    await expect(op.run()).rejects.toBeInstanceOf(GitHubDeferred)
+    op.failSave("consume")
+    vi.setSystemTime(now + 1000)
+    await expect(op.run()).rejects.toThrow("save failed")
+    expect(op.post).toHaveBeenCalledTimes(1)
+    op.failSave()
+    await op.run(new Publisher(op.api.client(), repository, bot.id))
+    expect(op.post).toHaveBeenCalledTimes(2)
+  })
+
+  test.each(["comment", "PR"] as const)("%s reconciles before the retry deadline", async (kind) => {
+    const op = operation(kind)
+    op.post.mockRejectedValueOnce(apiError(429, { "retry-after": "1" }))
+    await expect(op.run()).rejects.toBeInstanceOf(GitHubDeferred)
+    await op.accept()
+    await op.run(new Publisher(op.api.client(), repository, bot.id))
+    expect(op.retryAt()).toBeUndefined()
+    expect(op.post).toHaveBeenCalledTimes(1)
+  })
+
+  test.each(["comment", "PR"] as const)("%s keeps its grant on a read deferral", async (kind) => {
+    const op = operation(kind)
+    op.post.mockRejectedValueOnce(apiError(429, { "retry-after": "1" }))
+    await expect(op.run()).rejects.toBeInstanceOf(GitHubDeferred)
+    const read = kind === "comment" ? op.api.rest.issues.listComments : op.api.rest.pulls.list
+    read.mockRejectedValueOnce(apiError(429, { "retry-after": "3600" }))
+    await expect(op.run()).rejects.toMatchObject({ retryAt: now + 3_600_000 })
+    expect(op.retryAt()).toBe(now + 1000)
+    expect(op.post).toHaveBeenCalledTimes(1)
+    vi.setSystemTime(now + 1000)
+    await op.run()
+    expect(op.post).toHaveBeenCalledTimes(2)
+  })
+
+  test.each(["comment", "PR"] as const)("%s renews a grant only after rejection", async (kind) => {
+    const op = operation(kind)
+    op.post.mockRejectedValueOnce(apiError(403, { "retry-after": "1" }))
+    await expect(op.run()).rejects.toBeInstanceOf(GitHubDeferred)
+    vi.setSystemTime(now + 1000)
+    op.post.mockRejectedValueOnce(apiError(429, { "retry-after": "1" }))
+    await expect(op.run()).rejects.toBeInstanceOf(GitHubDeferred)
+    expect(op.retryAt()).toBe(now + 2000)
+    vi.setSystemTime(now + 2000)
+    await op.run()
+    expect(op.post).toHaveBeenCalledTimes(3)
+  })
+
+  test("comments without durable saves receive no retry grant", async () => {
+    const { api, publisher } = setup()
+    const p = proposal()
+    api.rest.issues.createComment.mockRejectedValueOnce(apiError(429, { "retry-after": "1" }))
+    await expect(publisher.propose(p)).rejects.toBeInstanceOf(GitHubDeferred)
+    expect(p.commentRetryAt).toBeUndefined()
+    vi.setSystemTime(now + 1000)
+    await expect(publisher.propose(p)).rejects.toBeInstanceOf(GitHubOutcomeUnknown)
+    expect(api.rest.issues.createComment).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe("publication read faults and delayed visibility", () => {
   test.each(["proposal", "labels", "blob", "branch", "PR"])(
     "%s writes retain Retry-After without immediate reconciliation",

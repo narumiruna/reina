@@ -52,6 +52,7 @@ const proposalSchema: z.ZodType<Proposal> = z
     createdAt: timestamp,
     expiresAt: timestamp,
     commentIntent: z.boolean().optional(),
+    commentRetryAt: timestamp.optional(),
     commentId: positiveId.optional(),
     publishedAt: timestamp.optional(),
   })
@@ -63,6 +64,10 @@ const proposalSchema: z.ZodType<Proposal> = z
       !value.decision.requiresHumanDecision &&
       value.decision.risks.length === 0 &&
       value.decision.affectedFiles.every(safePath) &&
+      (value.commentRetryAt === undefined ||
+        (value.commentIntent === true &&
+          value.commentId === undefined &&
+          value.publishedAt === undefined)) &&
       (value.publishedAt === undefined ||
         (value.commentId !== undefined &&
           value.publishedAt >= value.createdAt &&
@@ -101,24 +106,34 @@ const artifactSchema = z.strictObject({
     .min(1)
     .max(8),
 })
-const publicationSchema = z.strictObject({
-  branch: boundedText(255),
-  commitSha: gitSha.optional(),
-  prIntent: z.boolean().optional(),
-  prNumber: positiveId.optional(),
-  prUrl: z
-    .string()
-    .max(2_048)
-    .refine((value) => {
-      try {
-        const url = new URL(value)
-        return url.protocol === "https:" && !url.username && !url.password
-      } catch {
-        return false
-      }
-    })
-    .optional(),
-})
+const publicationSchema = z
+  .strictObject({
+    branch: boundedText(255),
+    commitSha: gitSha.optional(),
+    prIntent: z.boolean().optional(),
+    prRetryAt: timestamp.optional(),
+    prNumber: positiveId.optional(),
+    prUrl: z
+      .string()
+      .max(2_048)
+      .refine((value) => {
+        try {
+          const url = new URL(value)
+          return url.protocol === "https:" && !url.username && !url.password
+        } catch {
+          return false
+        }
+      })
+      .optional(),
+  })
+  .refine(
+    (value) =>
+      value.prRetryAt === undefined ||
+      (value.prIntent === true &&
+        value.commitSha !== undefined &&
+        value.prNumber === undefined &&
+        value.prUrl === undefined),
+  )
 const jobSchema: z.ZodType<Job> = z
   .strictObject({
     id: boundedText(100),
@@ -558,11 +573,12 @@ export class Store {
         const previous = parseRecord(proposalSchema, previousRow.json, "proposal")
         const {
           commentIntent: oldIntent,
+          commentRetryAt: _oldRetryAt,
           commentId: oldComment,
           publishedAt: oldPublished,
           ...oldScope
         } = previous
-        const { commentIntent, commentId, publishedAt, ...scope } = value
+        const { commentIntent, commentRetryAt: _retryAt, commentId, publishedAt, ...scope } = value
         if (
           previousRow.valid !== 1 ||
           stable(oldScope) !== stable(scope) ||
@@ -731,7 +747,12 @@ export class Store {
         if (
           !publication ||
           Object.entries(previous.publication).some(([field, entry]) => {
-            if (entry === undefined || (field === "prIntent" && entry === false)) return false
+            if (
+              entry === undefined ||
+              field === "prRetryAt" ||
+              (field === "prIntent" && entry === false)
+            )
+              return false
             const next = publication[field as keyof typeof publication]
             return next === undefined || stable(entry) !== stable(next)
           })

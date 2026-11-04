@@ -854,6 +854,93 @@ describe("durable store", () => {
     ).toThrow(/immutable/)
   })
 
+  test("retry authorizations survive SQLite reopen and consumption without clearing intent", () => {
+    let store = openStore()
+    const { commentId: _id, publishedAt: _published, ...pending } = proposal(2)
+    const retryAt = Date.now() + 1000
+    store.saveProposal(pending)
+    store.saveProposal({ ...pending, commentRetryAt: retryAt })
+    let job = publishing(store, claim(store))
+    job = advance(store, job, "publishing", {
+      publication: {
+        branch: "narumi/fix/reina-issue-1",
+        commitSha: "f".repeat(40),
+        prIntent: true,
+        prRetryAt: retryAt,
+      },
+    })
+    store.close()
+    store = openStore()
+    expect(store.proposal(pending.ref)?.commentRetryAt).toBe(retryAt)
+    expect(store.job(job.id)?.publication?.prRetryAt).toBe(retryAt)
+    const { commentRetryAt: _commentRetry, ...consumed } = required(store.proposal(pending.ref))
+    store.saveProposal(consumed)
+    const { prRetryAt: _prRetry, ...publication } = required(
+      required(store.job(job.id)).publication,
+    )
+    store.saveJob({ ...job, publication })
+    store.close()
+    store = openStore()
+    expect(store.proposal(pending.ref)).toMatchObject({ commentIntent: true })
+    expect(store.proposal(pending.ref)?.commentRetryAt).toBeUndefined()
+    expect(store.job(job.id)?.publication).toMatchObject({ prIntent: true })
+    expect(store.job(job.id)?.publication?.prRetryAt).toBeUndefined()
+    expect(() => store.saveProposal({ ...consumed, commentIntent: false })).toThrow(/immutable/)
+    expect(() =>
+      store.saveJob({ ...job, publication: { ...publication, prIntent: false } }),
+    ).toThrow(/immutable/)
+  })
+
+  test("retry state requires intent, valid timestamps, and no confirmed identity", () => {
+    const store = openStore()
+    const {
+      commentIntent: _intent,
+      commentId: _id,
+      publishedAt: _published,
+      ...pending
+    } = proposal(2)
+    const retryAt = Date.now() + 1000
+    for (const fields of [
+      { commentRetryAt: retryAt },
+      { commentIntent: true, commentRetryAt: -1 },
+      { commentIntent: true, commentRetryAt: 1.5 },
+      { commentIntent: true, commentRetryAt: retryAt, commentId: 20 },
+    ])
+      expect(() => store.saveProposal({ ...pending, ...fields })).toThrow()
+    const confirmed = proposal(2)
+    store.saveProposal(confirmed)
+    expect(() => store.saveProposal({ ...confirmed, commentId: 999 })).toThrow(/immutable/)
+    let job = publishing(store, claim(store))
+    const publication = { branch: "narumi/fix/reina-issue-1", commitSha: "f".repeat(40) }
+    for (const fields of [
+      { prRetryAt: retryAt },
+      { prIntent: true, prRetryAt: -1 },
+      { prIntent: true, prRetryAt: retryAt, prNumber: 20 },
+      { prIntent: true, prRetryAt: retryAt, prUrl: "https://github.com/example/project/pull/20" },
+    ])
+      expect(() => store.saveJob({ ...job, publication: { ...publication, ...fields } })).toThrow()
+    job = advance(store, job, "pr_ready", {
+      publication: {
+        ...publication,
+        prIntent: true,
+        prNumber: 20,
+        prUrl: "https://github.com/example/project/pull/20",
+      },
+    })
+    expect(() =>
+      store.saveJob({ ...job, publication: { ...required(job.publication), prNumber: 21 } }),
+    ).toThrow(/immutable/)
+    expect(() =>
+      store.saveJob({
+        ...job,
+        publication: {
+          ...required(job.publication),
+          prUrl: "https://github.com/example/project/pull/21",
+        },
+      }),
+    ).toThrow(/immutable/)
+  })
+
   test("terminal PR history blocks new approvals, including a PR recorded after cancellation", () => {
     const store = openStore()
     let job = publishing(store, claim(store))

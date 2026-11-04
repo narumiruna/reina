@@ -41,6 +41,22 @@ export class GitHubDeferred extends GitHubError {
   }
 }
 
+/** Incomplete issue evidence must not pause unrelated GitHub work. */
+export class GitHubIssueDeferred extends GitHubError {
+  constructor(code: string) {
+    super(code)
+    this.name = "GitHubIssueDeferred"
+  }
+}
+
+/** A rate-limit response confirms that this write was rejected. */
+export class GitHubWriteRejected extends GitHubDeferred {
+  constructor(retryAt: number) {
+    super("github_write_rate_limit", retryAt)
+    this.name = "GitHubWriteRejected"
+  }
+}
+
 export class GitHubOutcomeUnknown extends GitHubError {
   constructor(code: string) {
     super(code)
@@ -115,7 +131,10 @@ export async function githubWrite<T>(write: () => Promise<T>): Promise<T> {
   } catch (error) {
     if (error instanceof GitHubDeferred) throw error
     const retryAt = rateLimit(error)
-    if (retryAt !== undefined) throw new GitHubDeferred("github_write_rate_limit", retryAt)
+    if (retryAt !== undefined) {
+      if ([403, 429].includes(errorStatus(error) ?? 0)) throw new GitHubWriteRejected(retryAt)
+      throw new GitHubDeferred("github_write_rate_limit", retryAt)
+    }
     throw error
   }
 }
@@ -301,7 +320,15 @@ export class GitHub {
       (comment) => Buffer.byteLength(comment.body ?? ""),
       contextBytes,
       1,
-    )
+    ).catch((error: unknown) => {
+      if (
+        error instanceof GitHubDeferred &&
+        ["github_read_limit", "github_pagination_limit"].includes(error.code)
+      ) {
+        throw new GitHubIssueDeferred(error.code)
+      }
+      throw error
+    })
     const ids = new Set<number>()
     for (const comment of comments) {
       const id = numericId(comment.id)
@@ -327,16 +354,17 @@ export class GitHub {
       }),
     )
     if (data.number !== number) throw new GitHubError("github_issue_mismatch")
-    if (data.comments > 100) defer("github_comments_limit")
+    if (data.comments > 100) throw new GitHubIssueDeferred("github_comments_limit")
     const comments = await this.readComments(number)
-    if (comments.length !== data.comments) defer("github_issue_changed_during_read")
+    if (comments.length !== data.comments)
+      throw new GitHubIssueDeferred("github_issue_changed_during_read")
     if (
       Buffer.byteLength(data.title) +
         Buffer.byteLength(data.body ?? "") +
         comments.reduce((sum, comment) => sum + Buffer.byteLength(comment.body ?? ""), 0) >
       contextBytes
     ) {
-      defer("github_context_limit")
+      throw new GitHubIssueDeferred("github_context_limit")
     }
     return {
       ref: { ...this.repository, number, issueId: numericId(data.id) },

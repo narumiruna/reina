@@ -11,6 +11,7 @@ import {
   type GitHubClient,
   GitHubDeferred,
   GitHubError,
+  GitHubIssueDeferred,
   GitHubOutcomeUnknown,
 } from "../src/github/scanner.js"
 import { Orchestrator, type Work } from "../src/jobs/orchestrator.js"
@@ -675,6 +676,69 @@ describe("durable discovery through one trusted draft", () => {
     expect(value.runtime.triage).toHaveBeenCalledTimes(1)
   })
 
+  test.each([
+    "github_comments_limit",
+    "github_context_limit",
+    "github_read_limit",
+    "github_pagination_limit",
+    "github_issue_changed_during_read",
+  ])("scan skips %s without blocking later issues or pages", async (code) => {
+    const value = fixture()
+    const read = required(value.github.issue.getMockImplementation())
+    value.github.issue.mockImplementation(async (number) => {
+      if (number === 11) throw new GitHubIssueDeferred(code)
+      return read(number)
+    })
+    value.github.discover.mockResolvedValueOnce({ numbers: [11, 12], nextPage: 2 })
+    value.github.discover.mockResolvedValueOnce({ numbers: [], nextPage: 1 })
+    value.orchestrator.scan()
+    value.orchestrator.accept("webhook-during-limited-scan", value.work())
+    await value.orchestrator.drain()
+    expect(value.store.blockedUntil()).toBe(0)
+    expect(value.store.scanPage()).toBe(2)
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    expect(value.store.deliveries()).toEqual([])
+    expect(value.log.info).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "deferred", issue: 11, reason: code }),
+    )
+    value.orchestrator.scan()
+    await value.orchestrator.drain()
+    expect(value.github.discover.mock.calls).toEqual([
+      [10, 1],
+      [10, 2],
+    ])
+    expect(value.store.scanPage()).toBe(1)
+  })
+
+  test("issue-local evidence limits do not pause unrelated deliveries", async () => {
+    const value = fixture()
+    value.github.issue.mockRejectedValueOnce(new GitHubIssueDeferred("github_comments_limit"))
+    await value.deliver()
+    expect(value.store.blockedUntil()).toBe(0)
+    expect(value.store.deliveries()).toEqual([])
+    expect(value.log.info).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "deferred", issue: 12, reason: "github_comments_limit" }),
+    )
+    await value.deliver(value.work(), "unrelated-delivery")
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+  })
+
+  test("a real scan rate limit keeps the page and pauses all dispatch", async () => {
+    const value = fixture()
+    value.github.discovered = [12]
+    value.github.issue.mockRejectedValueOnce(new GitHubDeferred("github_rate_limit", now + 30_000))
+    value.orchestrator.scan()
+    value.orchestrator.accept("webhook-during-scan-cooldown", value.work())
+    await value.orchestrator.drain()
+    expect(value.store.scanPage()).toBe(1)
+    expect(value.store.blockedUntil()).toBe(now + 30_000)
+    expect(value.runtime.triage).not.toHaveBeenCalled()
+    expect(value.github.issue).toHaveBeenCalledTimes(1)
+    now += 30_000
+    await value.orchestrator.drain()
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+  })
+
   test("rate-limited discovery remains durable and retries only after its due time", async () => {
     const value = fixture()
     value.github.issue.mockRejectedValueOnce(new GitHubDeferred("github_rate_limit", now + 30_000))
@@ -1214,6 +1278,109 @@ describe("restart and shutdown", () => {
     expect(value.store.claim(proposal, approval)).toBeUndefined()
     expect(value.runtime.code).not.toHaveBeenCalled()
     expectNoPublication(value)
+  })
+
+  test.each(["boundaries", "issue", "head", "authorization"])(
+    "shutdown during a pending %s read does not claim or dispatch approval",
+    async (phase) => {
+      const value = fixture()
+      await value.propose()
+      const entered = Promise.withResolvers<void>()
+      const release = Promise.withResolvers<void>()
+      const wait = async <T>(read: Promise<T>): Promise<T> => {
+        const result = await read
+        entered.resolve()
+        await release.promise
+        return result
+      }
+      if (phase === "boundaries") {
+        const read = required(value.boundaries.getMockImplementation())
+        value.boundaries.mockImplementationOnce(() => wait(read()))
+      }
+      if (phase === "issue") {
+        const read = required(value.github.issue.getMockImplementation())
+        value.github.issue.mockImplementationOnce((number) => wait(read(number)))
+      }
+      if (phase === "head") {
+        const read = required(value.github.head.getMockImplementation())
+        value.github.head.mockImplementationOnce(() => wait(read()))
+      }
+      if (phase === "authorization") {
+        const read = required(value.github.permission.getMockImplementation())
+        value.github.permission.mockImplementationOnce((login) => wait(read(login)))
+      }
+      const delivery = value.approve()
+      await entered.promise
+      const stopping = value.orchestrator.stop()
+      release.resolve()
+      await Promise.all([delivery, stopping])
+      expect(value.store.jobs()).toEqual([])
+      expect(value.store.deliveries()).toHaveLength(1)
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expect(value.runtime.verify).not.toHaveBeenCalled()
+      expectNoPublication(value)
+      await value.restart()
+      expect(value.store.jobs()[0].state).toBe("pr_ready")
+      expect(value.runtime.code).toHaveBeenCalledTimes(1)
+      expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  test("shutdown during snapshot preparation does not start triage", async () => {
+    const value = fixture()
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const read = required(value.github.snapshotAt.getMockImplementation())
+    value.github.snapshotAt.mockImplementationOnce(async (...args) => {
+      const snapshot = await read(...args)
+      entered.resolve()
+      await release.promise
+      return snapshot
+    })
+    const delivery = value.deliver()
+    await entered.promise
+    const stopping = value.orchestrator.stop()
+    release.resolve()
+    await Promise.all([delivery, stopping])
+    expect(value.runtime.triage).not.toHaveBeenCalled()
+    expect(value.store.proposals()).toEqual([])
+    expect(value.store.deliveries()).toHaveLength(1)
+    expectNoPublication(value)
+    await value.restart()
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    expect(value.store.proposals()).toHaveLength(1)
+  })
+
+  test("shutdown during recovery setup does not resume publication", async () => {
+    const value = fixture()
+    await value.propose()
+    value.publisher.publish.mockRejectedValueOnce(
+      new GitHubOutcomeUnknown("github_pr_outcome_unknown"),
+    )
+    await value.approve()
+    expect(value.store.jobs()[0].state).toBe("publishing")
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const read = required(value.boundaries.getMockImplementation())
+    value.boundaries.mockImplementationOnce(read).mockImplementationOnce(async () => {
+      const boundaries = await read()
+      entered.resolve()
+      await release.promise
+      return boundaries
+    })
+    value.orchestrator.scan()
+    await entered.promise
+    const stopping = value.orchestrator.stop()
+    release.resolve()
+    await stopping
+    expect(value.store.jobs()[0].state).toBe("publishing")
+    expect(value.publisher.publish).toHaveBeenCalledTimes(1)
+    expect(value.publisher.createDraft).not.toHaveBeenCalled()
+    expect(value.store.deliveries()).toHaveLength(1)
+    await value.restart()
+    expect(value.store.jobs()[0].state).toBe("pr_ready")
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
   })
 
   test("shutdown aborts running work and rejects further intake", async () => {
