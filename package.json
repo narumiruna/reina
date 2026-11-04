@@ -1,16 +1,25 @@
 {
-  "name": "typescript-template",
+  "name": "reina",
   "version": "0.0.0",
+  "private": true,
+  "description": "Approval-gated GitHub issue fixes with isolated Pi Coding Agent jobs",
+  "type": "module",
+  "engines": {
+    "node": ">=26 <27"
+  },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/narumiruna/typescript-template.git"
+    "url": "git+https://github.com/narumiruna/reina.git"
   },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
     "check": "biome ci .",
     "test": "vitest run",
-    "ci": "npm run check && npm test && npm run build",
+    "test:runtime": "npm run build && node --test --test-concurrency=1 tests/runtime/*.test.mjs",
+    "prepare:worker": "npm run build && node scripts/prepare-worker.mjs",
+    "check:changesets": "changeset status",
+    "ci": "npm run check && npm run check:changesets && npm test && npm run build",
     "changeset": "changeset",
     "release": "npm run build && changeset publish",
     "prepare": "husky"
@@ -18,8 +27,18 @@
   "devDependencies": {
     "@biomejs/biome": "^2.6.4",
     "@changesets/cli": "^3.0.3",
+    "@types/node": "26.6.6",
+    "@types/picomatch": "4.0.3",
     "husky": "^9.1.7",
+    "pino": "10.4.0",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"
+  },
+  "dependencies": {
+    "diff": "9.0.0",
+    "picomatch": "4.0.7",
+    "probot": "14.3.7",
+    "tar-stream": "3.2.2",
+    "zod": "4.6.7"
   }
 }
