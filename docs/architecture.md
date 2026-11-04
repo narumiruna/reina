@@ -217,12 +217,15 @@ memory cgroup but do not perform a 2 GiB out-of-memory stress test.
 | `npm run ci`                                  | verified | Biome, 473 Vitest tests, and TypeScript build pass                      |
 | `npm run check:changesets`                    | verified | Changesets metadata is valid for normal pull requests                   |
 | Strict test-source type check                 | verified | All `tests/*.test.ts` pass strict NodeNext TypeScript checks            |
-| `npm run test:runtime`                        | verified | 12 actual Docker/Pi checks pass; none skipped                           |
+| `npm run test:runtime`                        | verified | 13 actual Docker/Pi/Compose checks pass; none skipped                   |
 | `npm audit --audit-level=moderate`            | verified | No reported project dependency vulnerabilities                          |
 | App/provider/deployment end-to-end acceptance | not run  | Account-owner configuration and authorized live test are still required |
 | 2 GiB out-of-memory stress                    | not run  | The enforced cgroup memory limit is inspected, not stress-tested        |
 
 The runtime checks include host-proxy credential exclusion and scoped orphan staging cleanup.
+The Compose check builds the controller image, prepares an isolated worker, exercises the shared
+snapshot and Unix socket mounts with actual Pi triage, and checks SQLite state across controller
+recreation. It uses fake credentials and a local model fixture, not a live App or paid provider.
 Changeset Markdown formatting is disabled at the narrow `.changeset/*.md` scope because the
 current formatter rewrites YAML frontmatter as Markdown. `check:changesets` validates that metadata.
 CI runs this check only for pull requests other than the generated `changeset-release/main` release PR.

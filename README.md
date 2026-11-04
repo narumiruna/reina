@@ -8,9 +8,67 @@ The MVP supports one Node/npm repository, one service instance, and one coding j
 It requires persistent local storage and a prepared Docker worker. Missing isolation prevents
 execution; there is no host subprocess fallback.
 
+## Run with Docker Compose (Linux)
+
+Use a local Linux Docker Engine with cgroup v2, built-in seccomp, and Docker Compose.
+Host Node.js and npm are not required. Remote Docker daemons and Docker Desktop are not supported
+by this layout.
+
+1. Copy the configuration and fill in the App, repository, and model credentials described in
+   [Configure the GitHub App](#configure-the-github-app).
+
+   ```sh
+   cp .env.example .env
+   chmod 600 .env
+   ```
+
+   Single-quote secrets that contain `$` or `#`. Use a single-quoted PEM value with literal
+   `\n` newline escapes for `PRIVATE_KEY`.
+
+2. Obtain a separate checkout of the approved target commit. Set `TARGET_DIR` in `.env` to its
+   path, for example `TARGET_DIR=../my-app`. Relative paths are resolved from `compose.yaml`.
+   This is the repository Reina will fix, not a special Reina directory. Its two npm manifests
+   must match the approved commit. Do not run target scripts on the host.
+
+3. Prepare the worker once through Compose. Run only one preparation at a time.
+
+   ```sh
+   docker compose run --build --rm prepare-worker
+   ```
+
+   This pulls the fixed Node base and runs the existing isolated preparation process. Copy the
+   printed `sha256:...` image ID into `REINA_WORKER_IMAGE` in `.env`, not the mutable
+   `reina-worker:local` tag. Prepare again when target dependencies change.
+
+4. Start the service.
+
+   ```sh
+   docker compose up --build -d
+   docker compose logs -f reina
+   ```
+
+   The service listens on `127.0.0.1:3000` on the host. Configure HTTPS ingress to
+   `/api/github/webhooks`. Check HTTP availability with `curl http://127.0.0.1:3000/healthz`.
+   This check does not establish live App/provider acceptance or continuous worker isolation.
+
+Compose uses host networking to preserve the loopback listener. Only the trusted controller runs
+as root and receives the Docker socket; socket access gives it host-level control. Use a dedicated,
+patched host. Job containers do not receive the socket, credentials, or host networking.
+
+State is stored in the `reina-state` named volume at `/var/lib/reina`; Compose overrides
+`REINA_STATE_DIR` with this container path. Private staging uses the host directory
+`/var/lib/reina-tmp`, mounted at the same absolute path so host Docker can bind snapshot
+directories and Unix sockets into jobs. The entrypoint sets both directories to mode `0700`.
+Do not use the staging directory for another application or change its mount path.
+
+Run only one instance. Stop with `docker compose down`, which keeps state. Do not use
+`docker compose down --volumes` for a normal stop or recovery. Before upgrades, stop the service
+and follow the [state backup and recovery procedure](docs/architecture.md#operator-actions).
+All live deployment restrictions in that document still apply.
+
 ## Development
 
-Use Node.js 26, npm, Docker with Linux containers, and Git.
+Use Node.js 26, npm, Docker with Linux containers, Docker Compose, and Git.
 
 ```sh
 npm ci
@@ -22,7 +80,8 @@ npm run test:runtime
 `npm run check:changesets` on pull requests, except the generated `changeset-release/main` release
 PR, which has already consumed its changesets. Runtime tests use
 the real pinned Pi CLI, Docker, and a local protocol fixture, not a paid model or real GitHub App.
-They prepare a disposable test image and require the pinned Node base image locally:
+They also build the controller image and check Compose worker preparation, shared snapshot/socket
+mounts, and state persistence. They require the pinned Node base image locally:
 
 ```sh
 docker pull node:26.11.1-bookworm-slim@sha256:86f07bc9c5dce4578cf37e5a418b7bfc7f817cda25cde66e2b66e95ed86c4567
@@ -68,6 +127,9 @@ or dependencies requiring lifecycle scripts are not supported.
    Bot branches must use disposable runners without secrets, write tokens, privileged containers,
    or deployment access. Reina does not isolate or control external CI.
 8. Provide a private persistent state directory outside the checkout. Start only one instance.
+   Compose manages this directory in its named volume.
+
+Use the [Compose startup](#run-with-docker-compose-linux) above, or start directly on the host:
 
 ```sh
 npm run build
