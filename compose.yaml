@@ -1,0 +1,67 @@
+services:
+  reina:
+    build: .
+    image: reina:local
+    init: true
+    restart: unless-stopped
+    network_mode: host
+    stop_grace_period: 120s
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    env_file: .env
+    environment:
+      REINA_STATE_DIR: /var/lib/reina
+      TMPDIR: /var/lib/reina-tmp
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - reina-state:/var/lib/reina
+      # Host Docker must see the same snapshot and Unix socket paths as the controller.
+      - type: bind
+        source: /var/lib/reina-tmp
+        target: /var/lib/reina-tmp
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        bind:
+          create_host_path: false
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - --input-type=module
+        - -e
+        - >-
+          const response = await fetch('http://127.0.0.1:' + (process.env.PORT ?? 3000) + '/healthz');
+          process.exit(response.ok ? 0 : 1);
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  prepare-worker:
+    profiles: [setup]
+    build: .
+    image: reina:local
+    init: true
+    entrypoint: [sh, -c]
+    command:
+      - |
+        set -eu
+        docker pull node:26.11.1-bookworm-slim@sha256:86f07bc9c5dce4578cf37e5a418b7bfc7f817cda25cde66e2b66e95ed86c4567
+        exec node scripts/prepare-worker.mjs /snapshot reina-worker:local
+    volumes:
+      - type: bind
+        source: ${TARGET_DIR:-../reina-target}
+        target: /snapshot
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        bind:
+          create_host_path: false
+
+volumes:
+  reina-state:
