@@ -1,5 +1,11 @@
 # reina
 
+## 0.1.1
+
+### Patch Changes
+
+- 513c85d: Add Docker Compose startup and an optional approved-snapshot worker preparation service.
+
 ## 0.1.0
 
 ### Minor Changes
