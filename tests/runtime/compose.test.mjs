@@ -45,11 +45,8 @@ test("Compose prepares a worker, shares runtime binds, and preserves private sta
     await mkdir(path.join(directory, "snapshot"))
     await writeFile(path.join(directory, "snapshot/package.json"), manifest)
     await writeFile(path.join(directory, "snapshot/package-lock.json"), lock)
-    await writeFile(
-      path.join(directory, ".env"),
-      "TARGET_DIR=./snapshot\nWEBHOOK_SECRET='fixture-$not_expanded#secret'\n",
-      { mode: 0o600 },
-    )
+    const environment = "TARGET_DIR=./snapshot\nWEBHOOK_SECRET='fixture-$not_expanded#secret'\n"
+    await writeFile(path.join(directory, ".env"), environment, { mode: 0o600 })
     const image = { image: "reina-controller-fixture:local", build: { context: root } }
     await writeFile(
       path.join(directory, "override.json"),
@@ -91,18 +88,29 @@ test("Compose prepares a worker, shares runtime binds, and preserves private sta
     )
     assert.equal(snapshot.source, path.join(directory, "snapshot"))
     assert.equal(snapshot.read_only, true)
-    assert.equal(snapshot.bind.create_host_path, false)
+    // Compose v2 can omit false values from its normalized JSON output.
+    assert.notEqual(snapshot.bind?.create_host_path, true)
 
     await compose(["build", "reina"])
     const command = config.services["prepare-worker"].command[0]
     assert.ok(command.includes("exec node scripts/prepare-worker.mjs /snapshot reina-worker:local"))
-    const output = await compose([
+    const prepare = [
       "run",
       "--rm",
       "-T",
       "prepare-worker",
       command.replace("reina-worker:local", "reina-compose-worker-fixture:local"),
-    ])
+    ]
+    await writeFile(path.join(directory, ".env"), "TARGET_DIR=./missing-snapshot\n")
+    const missingSnapshot = await dockerCommand([...args, ...prepare], { timeoutMs: 60000 })
+    assert.notEqual(
+      missingSnapshot.exitCode,
+      0,
+      "A missing snapshot must prevent worker preparation",
+    )
+    await writeFile(path.join(directory, ".env"), environment)
+
+    const output = await compose(prepare)
     const worker = output.match(/sha256:[a-f0-9]{64}\s*$/)?.[0].trim()
     assert.ok(worker, "Preparation must print an immutable worker image ID")
 
