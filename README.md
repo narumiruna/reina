@@ -47,8 +47,9 @@ by this layout.
    docker compose logs -f reina
    ```
 
-   The service listens on `127.0.0.1:3000` on the host. Configure HTTPS ingress to
-   `/api/github/webhooks`. Check HTTP availability with `curl http://127.0.0.1:3000/healthz`.
+   The service listens on `127.0.0.1:36816` on the host by default. Set `PORT` in `.env` to
+   use another port. Configure HTTPS ingress to `/api/github/webhooks`. Check HTTP availability
+   with `curl http://127.0.0.1:36816/healthz`.
    This check does not establish live App/provider acceptance or continuous worker isolation.
 
 Compose uses host networking to preserve the loopback listener. Only the trusted controller runs
@@ -117,7 +118,7 @@ or dependencies requiring lifecycle scripts are not supported.
    Do not grant Actions or Workflows write, administration, or organization-member access.
 3. Subscribe to Issues, Issue comment, Pull request, Push, Repository, Installation, and
    Installation repositories events.
-4. Configure HTTPS ingress to `/api/github/webhooks`. The service listens on loopback port 3000.
+4. Configure HTTPS ingress to `/api/github/webhooks`. The default loopback port is 36816.
    Use a strong webhook secret of at least 32 characters and configure the same value in GitHub.
 5. Copy `.env.example` to `.env`, supply credentials through a secret manager or local untracked
    file, and set the repository/installation IDs and the prepared image.

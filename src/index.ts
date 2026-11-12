@@ -43,7 +43,7 @@ async function main(): Promise<void> {
     )
     register(app, config, orchestrator, botId)
     await orchestrator.start()
-    const port = Number(process.env.PORT ?? 3000)
+    const port = Number(process.env.PORT ?? 36816)
     if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) throw new Error("port_invalid")
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject)
