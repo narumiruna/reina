@@ -414,6 +414,12 @@ The following work requires external owners and is not established by credential
   response loss, missed closure/skip events, and same-second replacement after revocation.
   Labels never grant approval; mutable summaries never replace immutable proposal evidence.
 
+The first GitHub runtime run passed 13 cases but failed the Compose case: the non-root runner's
+`0700` host staging directory was not readable by a root controller with all capabilities dropped.
+The fixture now uses its own daemon-owned staging volume and asserts root ownership and `0700`
+mode. It removes only that volume; no permission or capability check was relaxed. See the PR's
+CI checks for verification of the updated fixture.
+
 These checks used dummy identities and local provider responses. They do not establish live
 GitHub permissions/delivery ordering, real provider compatibility or cost, semantic triage quality,
 production backup restoration, or production-host runtime acceptance. Complete the handoff below.

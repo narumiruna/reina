@@ -14,8 +14,17 @@ test("Compose prepares a worker, shares runtime binds, and preserves private sta
   timeout: 290000,
 }, async () => {
   const directory = await realpath(await mkdtemp(path.join(os.tmpdir(), "reina-compose-test-")))
-  // Keep the gateway socket path below Linux's Unix socket path limit.
-  const staging = await realpath(await mkdtemp(path.join(os.tmpdir(), "rc-")))
+  // A daemon-owned directory stays root-owned even when the test runner is not.
+  // A short volume name also keeps Unix socket paths below the Linux limit.
+  const stagingVolume = `rc-${randomUUID().slice(0, 12)}`
+  let staging
+  let stagingCreated = false
+  let overrideWritten = false
+  const volume = async (argv) => {
+    const result = await dockerCommand(["volume", ...argv], { timeoutMs: 30_000, limit: 64 * 1024 })
+    assert.equal(result.exitCode, 0, `Owned fixture volume ${argv[0]} failed`)
+    return result.stdout.toString().trim()
+  }
   const controllerTag = fixtureTag("controller")
   const workerTag = fixtureTag("compose-worker")
   const state = `/var/lib/reina/test-${randomUUID()}`
@@ -46,6 +55,10 @@ test("Compose prepares a worker, shares runtime binds, and preserves private sta
     return result.stdout.toString()
   }
   try {
+    await volume(["create", "--driver=local", "--label=io.reina.fixture=true", stagingVolume])
+    stagingCreated = true
+    staging = await volume(["inspect", "--format", "{{.Mountpoint}}", stagingVolume])
+    assert.ok(path.isAbsolute(staging) && path.normalize(staging) === staging && staging !== "/")
     await mkdir(path.join(directory, "snapshot"))
     await writeFile(path.join(directory, "snapshot/package.json"), manifest)
     await writeFile(path.join(directory, "snapshot/package-lock.json"), lock)
@@ -83,6 +96,7 @@ test("Compose prepares a worker, shares runtime binds, and preserves private sta
     build: ${JSON.stringify({ context: root })}
 `,
     )
+    overrideWritten = true
 
     assert.equal((await compose(["config", "--services"])).trim(), "reina")
     const config = JSON.parse(await compose(["--profile", "setup", "config", "--format", "json"]))
@@ -164,6 +178,7 @@ test("Compose prepares a worker, shares runtime binds, and preserves private sta
       assert.equal(process.env.WEBHOOK_SECRET, 'fixture-$not_expanded#secret');
       for (const directory of [process.env.REINA_STATE_DIR, process.env.TMPDIR]) {
         assert.equal(statSync(directory).mode & 0o777, 0o700);
+        assert.equal(statSync(directory).uid, 0);
       }
       for (const file of ['.env', '.git', 'src', 'node_modules/typescript']) {
         assert.equal(existsSync('/app/' + file), false);
@@ -202,12 +217,13 @@ test("Compose prepares a worker, shares runtime binds, and preserves private sta
   } finally {
     try {
       // Only this randomly named, credential-free test project owns these volumes.
-      await compose(["down", "--volumes", "--remove-orphans"])
+      if (overrideWritten) await compose(["down", "--volumes", "--remove-orphans"])
     } finally {
-      await Promise.all([
-        rm(directory, { recursive: true, force: true }),
-        rm(staging, { recursive: true, force: true }),
-      ])
+      try {
+        if (stagingCreated) await volume(["rm", stagingVolume])
+      } finally {
+        await rm(directory, { recursive: true, force: true })
+      }
     }
   }
 })
