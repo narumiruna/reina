@@ -11,7 +11,7 @@ import {
   sameRepository,
 } from "../github/scanner.js"
 import { fingerprint, makeProposal, policyHash } from "../triage/policy.js"
-import type { ReviewInvalidation } from "../triage/review.js"
+import type { Review, ReviewInvalidation } from "../triage/review.js"
 import type { AgentRuntime, Config, Issue, IssueRef, Job, Logger, Proposal } from "../types.js"
 import type { Store } from "./store.js"
 import { IssueTriage } from "./triage.js"
@@ -175,6 +175,12 @@ export class Orchestrator {
         if (!validated.branch || this.controllerBranches.get(issueKey) === validated.branch)
           invalidations.set(issueKey, { ref, reason })
       }
+    }
+    // A rename may be pending live validation. Revoke the stored reference
+    // without rebinding it from untrusted webhook data.
+    for (const [issueKey, invalidation] of invalidations) {
+      const stored = this.store.reviewForReconciliation(invalidation.ref)
+      if (stored) invalidations.set(issueKey, { ...invalidation, ref: stored.ref })
     }
     if (
       !this.store.acceptDelivery(deliveryId, JSON.parse(JSON.stringify(validated)), revoked, [
@@ -388,15 +394,16 @@ export class Orchestrator {
     try {
       issue = await github.issue(work.ref.number)
     } catch (error) {
+      const stored = this.store.reviewForReconciliation(work.ref)
       if (
-        this.store.review(work.ref) &&
+        stored &&
         (error instanceof GitHubIssueDeferred || [404, 410].includes(errorStatus(error) ?? 0))
       ) {
-        const invalidated = this.reviews.invalidate(work.ref, "unavailable", correlationId)
+        const invalidated = this.reviews.invalidate(stored.ref, "unavailable", correlationId)
         if (invalidated) {
-          const review = {
+          const review: Review = {
             ...invalidated,
-            error:
+            evidenceError:
               error instanceof GitHubIssueDeferred
                 ? "triage_evidence_unavailable"
                 : "triage_issue_unavailable",
@@ -418,8 +425,25 @@ export class Orchestrator {
       throw error
     }
     if (this.stopped) return
-    if (!this.enabled(issue.ref) || issue.ref.issueId !== work.ref.issueId)
+    if (
+      !this.enabled(issue.ref) ||
+      !sameRepository({ ...work.ref, name: issue.ref.name }, issue.ref) ||
+      issue.ref.issueId !== work.ref.issueId ||
+      issue.ref.number !== work.ref.number
+    )
       throw new Error("issue_identity_changed")
+    // GitHub.issue() validates the live installation, repository and issue.
+    // Only this trusted read can authorize a stored review's name change.
+    const previous = this.store.reviewForReconciliation(issue.ref)
+    if (previous && previous.ref.name.toLowerCase() !== issue.ref.name.toLowerCase()) {
+      const rebound = this.store.rebindReview(issue.ref, previous.revision)
+      if (!rebound) throw new Error("job_cancelled")
+      this.event("triage_stale", issue.ref, {
+        correlationId,
+        revision: rebound.revision,
+        reason: "repository_renamed",
+      })
+    }
     this.event("discovered", issue.ref, { correlationId })
     if (issue.state !== "open" || issue.pullRequest || issue.labels.includes("bot:skip")) {
       this.cancel(issue.ref)

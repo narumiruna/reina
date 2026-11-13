@@ -130,7 +130,7 @@ function nearLimitReview(): Review {
   return value
 }
 
-function legacyRecords(store: Store): void {
+function legacyRecords(store: Store, activeJob = false): void {
   const now = Date.now() - 10_000
   const value: Proposal = {
     revision: "d".repeat(64),
@@ -158,7 +158,7 @@ function legacyRecords(store: Store): void {
   store.saveProposal(value)
   const job = store.claim(value, authority)
   if (!job) throw new Error("Fixture claim failed")
-  store.saveJob({ ...job, state: "failed", error: "fixture_failure" })
+  if (!activeJob) store.saveJob({ ...job, state: "failed", error: "fixture_failure" })
   store.rememberAssessment("legacy-attempt-not-success")
   store.acceptDelivery("fixture-delivery", { number: 1 })
   store.deferDelivery("fixture-delivery", 1_000, "issue")
@@ -663,6 +663,294 @@ describe("durable review storage", () => {
     expect(inspect((db) => db.prepare("SELECT json FROM reviews").all())).toEqual([
       { json: JSON.stringify(value) },
     ])
+  })
+})
+
+describe("review rename reconciliation", () => {
+  test.each(["needs_info", "needs_human"] as const)(
+    "reads and rebinds a %s review without a proposal or new authority",
+    (outcome) => {
+      let store = openStore()
+      const value = complete()
+      value.outcome = outcome
+      value.assessment = {
+        ...assessment(),
+        kind: "unknown",
+        missingInfo: outcome === "needs_info" ? ["Provide reproduction steps."] : [],
+        fix: {
+          ...assessment().fix,
+          eligible: false,
+          category: "defer",
+          requiresHumanDecision: outcome === "needs_human",
+        },
+      }
+      value.commentRetryAt = Date.now() + 60_000
+      store.saveReview(value)
+      const liveRef = { ...value.ref, owner: "EXAMPLE", name: "renamed" }
+      const before = inspect((db) => db.prepare("SELECT * FROM reviews").all())
+      expect(store.reviewForReconciliation(liveRef)).toEqual(value)
+      expect(inspect((db) => db.prepare("SELECT * FROM reviews").all())).toEqual(before)
+      expect(() => store.review(liveRef)).toThrow("Inconsistent review identity")
+      expect(() => store.saveReview({ ...value, ref: liveRef }, value.revision)).toThrow(
+        "Invalid review cycle update",
+      )
+      expect(() =>
+        store.acceptDelivery("strict-rename-intake", {}, [], [{ ref: liveRef, reason: "changed" }]),
+      ).toThrow("Inconsistent review identity")
+      expect(store.deliveries()).toEqual([])
+      const rebound = store.rebindReview(liveRef, value.revision)
+      expect(rebound).toEqual({
+        ...value,
+        ref: { ...value.ref, name: liveRef.name },
+        revision: expect.any(String),
+        state: "stale",
+        inactiveReason: "changed",
+        publishedRevision: undefined,
+      })
+      expect(rebound?.revision).not.toBe(value.revision)
+      expect(store.proposal(liveRef)).toBeUndefined()
+      expect(store.proposals()).toEqual([])
+      expect(store.jobs()).toEqual([])
+      expect(store.saveReview(value, value.revision)).toBe(false)
+      expect(() => store.review(value.ref)).toThrow("Inconsistent review identity")
+      expect(store.reviewForReconciliation(value.ref)).toEqual(rebound)
+      store.close()
+      store = openStore()
+      expect(store.review(liveRef)).toEqual(rebound)
+    },
+  )
+
+  test.each([
+    { state: "failed", attempts: 3, error: "runtime_timeout", nextAttemptAt: 0 },
+    { state: "failed", attempts: 1, error: "triage_invalid_output", nextAttemptAt: 0 },
+    { state: "pending", attempts: 2, error: "runtime_timeout", nextAttemptAt: 1_800_000_300_000 },
+  ] as const)("preserves the $state attempt budget and error after rename", (budget) => {
+    const store = openStore()
+    const value: Review = {
+      ...review(),
+      ...budget,
+      commentIntent: true,
+      commentId: 101,
+      commentRetryAt: Date.now() + 60_000,
+      publishedRevision: randomUUID(),
+    }
+    store.saveReview(value)
+    const rebound = store.rebindReview({ ...value.ref, name: "renamed" }, value.revision)
+    expect(rebound).toMatchObject({
+      ...budget,
+      state: "stale",
+      inactiveReason: "changed",
+      binding: value.binding,
+      createdAt: value.createdAt,
+      commentIntent: true,
+      commentId: 101,
+      commentRetryAt: value.commentRetryAt,
+    })
+    expect(rebound?.publishedRevision).toBeUndefined()
+    expect(rebound?.revision).not.toBe(value.revision)
+  })
+
+  test("always changes an already-stale revision and requires a fresh binding cycle", () => {
+    const store = openStore()
+    const value: Review = {
+      ...complete(),
+      state: "stale",
+      inactiveReason: "changed",
+      updatedAt: Date.now() + 1_000,
+    }
+    store.saveReview(value)
+    const liveRef = { ...value.ref, name: "renamed" }
+    const rebound = store.rebindReview(liveRef, value.revision)
+    if (!rebound) throw new Error("Missing rebound review")
+    expect(rebound.revision).not.toBe(value.revision)
+    expect(rebound.publishedRevision).toBeUndefined()
+    expect(rebound.binding).toEqual(value.binding)
+    expect(rebound.updatedAt).toBe(value.updatedAt)
+    expect(store.saveReview({ ...value, ref: liveRef }, value.revision)).toBe(false)
+    const binding = { ...rebound.binding, policyHash: "e".repeat(64) }
+    expect(() => store.saveReview({ ...rebound, binding }, rebound.revision)).toThrow(
+      "Invalid review cycle update",
+    )
+    const fresh = {
+      ...review(),
+      ref: liveRef,
+      revision: randomUUID(),
+      binding,
+      createdAt: rebound.updatedAt,
+      updatedAt: rebound.updatedAt,
+      commentId: rebound.commentId,
+      commentIntent: rebound.commentIntent,
+    }
+    expect(store.saveReview(fresh, rebound.revision)).toBe(true)
+    expect(store.review(liveRef)).toEqual(fresh)
+  })
+
+  test("atomically revokes proposals and cancels active work without rebinding old authority", () => {
+    let store = openStore()
+    legacyRecords(store, true)
+    const value = complete()
+    store.saveReview(value)
+    const oldJob = store.jobs()[0]
+    if (!oldJob) throw new Error("Missing fixture job")
+    const immutable = () =>
+      inspect((db) => ({
+        proposals: db.prepare("SELECT * FROM proposals ORDER BY rowid").all(),
+        heads: db.prepare("SELECT * FROM proposal_heads ORDER BY rowid").all(),
+        approvals: db.prepare("SELECT * FROM approvals ORDER BY rowid").all(),
+      }))
+    const before = immutable()
+    const liveRef = { ...value.ref, owner: "EXAMPLE", name: "renamed" }
+    expect(() => store.proposal(liveRef)).toThrow("Inconsistent proposal identity")
+    const rebound = store.rebindReview(liveRef, value.revision)
+    expect(immutable()).toEqual({
+      ...before,
+      proposals: before.proposals.map((row) => ({ ...row, valid: 0 })),
+    })
+    const cancelled = {
+      ...oldJob,
+      state: "cancelled",
+      error: "authority_revoked",
+    }
+    expect(store.job(oldJob.id)).toEqual(cancelled)
+    expect(store.job(oldJob.id)?.ref).toEqual(value.ref)
+    expect(store.proposal(value.ref)).toBeUndefined()
+    expect(store.proposal(liveRef)).toBeUndefined()
+    expect(() => store.saveJob({ ...oldJob, ref: liveRef })).toThrow("Job authority is immutable")
+    const oldProposal = JSON.parse(String(before.proposals[0]?.json)) as Proposal
+    expect(() => store.saveProposal({ ...oldProposal, ref: liveRef })).toThrow(
+      "Proposal authority is immutable",
+    )
+    expect(
+      store.claim(oldProposal, { ...oldJob.approval, eventId: "late-approval" }),
+    ).toBeUndefined()
+    expect(store.saveReview(complete(assessed(value)), value.revision)).toBe(false)
+    store.close()
+    store = openStore()
+    expect(store.job(oldJob.id)).toEqual(cancelled)
+    expect(store.review(liveRef)).toEqual(rebound)
+  })
+
+  test("rolls back proposal revocation and active job cancellation if the review write fails", () => {
+    const store = openStore()
+    legacyRecords(store, true)
+    const value = complete()
+    store.saveReview(value)
+    const before = preservedRows()
+    inspect((db) =>
+      db.exec(`CREATE TRIGGER reject_review_rebind BEFORE UPDATE ON reviews
+        BEGIN SELECT RAISE(ABORT, 'fixture_rebind_failure'); END;`),
+    )
+    expect(() => store.rebindReview({ ...value.ref, name: "renamed" }, value.revision)).toThrow(
+      "fixture_rebind_failure",
+    )
+    expect(preservedRows()).toEqual(before)
+    expect(store.review(value.ref)).toEqual(value)
+  })
+
+  test("matching names are a read-only no-op, but still require the current revision", () => {
+    const store = openStore()
+    legacyRecords(store, true)
+    const value = complete()
+    store.saveReview(value)
+    const before = preservedRows()
+    const rows = inspect((db) => db.prepare("SELECT * FROM reviews").all())
+    expect(
+      store.rebindReview({ ...value.ref, owner: "EXAMPLE", name: "PROJECT" }, value.revision),
+    ).toEqual(value)
+    expect(store.rebindReview(value.ref, randomUUID())).toBeUndefined()
+    expect(store.rebindReview({ ...value.ref, name: "renamed" }, randomUUID())).toBeUndefined()
+    expect(preservedRows()).toEqual(before)
+    expect(inspect((db) => db.prepare("SELECT * FROM reviews").all())).toEqual(rows)
+    const liveRef = { ...value.ref, name: "renamed" }
+    const rebound = store.rebindReview(liveRef, value.revision)
+    if (!rebound) throw new Error("Missing rebound review")
+    const after = preservedRows()
+    expect(store.rebindReview(liveRef, rebound.revision)).toEqual(rebound)
+    expect(store.rebindReview(liveRef, value.revision)).toBeUndefined()
+    expect(preservedRows()).toEqual(after)
+    expect(store.review(liveRef)).toEqual(rebound)
+  })
+
+  test.each([
+    { owner: "other-owner" },
+    { installationId: 999 },
+    { number: 999 },
+    { id: 999 },
+    { issueId: 999 },
+  ])("rejects a pinned-field mismatch %j without mutations", (mismatch) => {
+    const store = openStore()
+    legacyRecords(store, true)
+    const value = complete()
+    store.saveReview(value)
+    const before = preservedRows()
+    const rows = inspect((db) => db.prepare("SELECT * FROM reviews").all())
+    const liveRef = { ...value.ref, name: "renamed", ...mismatch }
+    if (liveRef.id !== value.ref.id || liveRef.issueId !== value.ref.issueId) {
+      expect(store.reviewForReconciliation(liveRef)).toBeUndefined()
+      expect(store.rebindReview(liveRef, value.revision)).toBeUndefined()
+    } else {
+      expect(() => store.reviewForReconciliation(liveRef)).toThrow("Inconsistent review identity")
+      expect(() => store.rebindReview(liveRef, value.revision)).toThrow(
+        "Inconsistent review identity",
+      )
+    }
+    expect(preservedRows()).toEqual(before)
+    expect(inspect((db) => db.prepare("SELECT * FROM reviews").all())).toEqual(rows)
+  })
+
+  test("validates live references, CAS revisions, and the whole rebound record", () => {
+    const store = openStore()
+    legacyRecords(store, true)
+    const value = complete()
+    store.saveReview(value)
+    const before = preservedRows()
+    for (const ref of [
+      { ...value.ref, name: "" },
+      { ...value.ref, name: "x".repeat(101) },
+      { ...value.ref, installationId: 0 },
+      { ...value.ref, name: "renamed\n" },
+    ]) {
+      expect(() => store.rebindReview(ref, value.revision)).toThrow()
+      expect(store.review(value.ref)).toEqual(value)
+      expect(preservedRows()).toEqual(before)
+    }
+    expect(() => store.rebindReview(value.ref, "invalid-revision")).toThrow(
+      "Invalid review revision record",
+    )
+    inspect((db) => db.prepare("UPDATE reviews SET revision = ?").run(randomUUID()))
+    expect(() => store.reviewForReconciliation(value.ref)).toThrow("Inconsistent review identity")
+    expect(() => store.rebindReview(value.ref, value.revision)).toThrow(
+      "Inconsistent review identity",
+    )
+    expect(preservedRows()).toEqual(before)
+  })
+
+  test("compacts restored large results before adding rename metadata", () => {
+    const store = openStore()
+    const value = nearLimitReview()
+    value.commentRetryAt = Date.now() + 60_000
+    store.saveReview(value)
+    const liveRef = { ...value.ref, name: "r".repeat(100) }
+    const rebound = store.rebindReview(liveRef, value.revision)
+    expect(rebound).toMatchObject({
+      ref: liveRef,
+      state: "stale",
+      inactiveReason: "changed",
+      error: "triage_invalid_output",
+      binding: value.binding,
+      attempts: value.attempts,
+      commentId: value.commentId,
+      commentIntent: value.commentIntent,
+      commentRetryAt: value.commentRetryAt,
+    })
+    expect(rebound?.revision).not.toBe(value.revision)
+    expect(rebound?.assessment).toBeUndefined()
+    expect(rebound?.outcome).toBeUndefined()
+    expect(rebound?.assessedAt).toBeUndefined()
+    expect(rebound?.publishedRevision).toBeUndefined()
+    expect(Buffer.byteLength(JSON.stringify(rebound))).toBeLessThan(REVIEW_RESULT_LIMIT)
+    expect(reviewSchema.safeParse(rebound).success).toBe(true)
+    expect(store.review(liveRef)).toEqual(rebound)
   })
 })
 

@@ -234,6 +234,16 @@ function sameRef(a: IssueRef, b: IssueRef): boolean {
   )
 }
 
+function sameReviewPins(a: IssueRef, b: IssueRef): boolean {
+  return (
+    a.id === b.id &&
+    a.installationId === b.installationId &&
+    a.issueId === b.issueId &&
+    a.number === b.number &&
+    a.owner.toLowerCase() === b.owner.toLowerCase()
+  )
+}
+
 function parseRecord<T>(schema: z.ZodType<T>, value: unknown, kind: string): T {
   try {
     if (typeof value !== "string" || Buffer.byteLength(value) > 16_777_216) throw new Error()
@@ -527,6 +537,45 @@ export class Store {
     const review = this.readReview(row)
     if (!sameRef(review.ref, ref)) throw new Error("Inconsistent review identity")
     return review
+  }
+
+  /** Read the old name for reconciliation only; this does not grant authority. */
+  reviewForReconciliation(ref: IssueRef): Review | undefined {
+    const row = this.database().prepare("SELECT * FROM reviews WHERE issue_key = ?").get(key(ref))
+    if (!row) return undefined
+    const review = this.readReview(row)
+    if (!sameReviewPins(review.ref, ref)) throw new Error("Inconsistent review identity")
+    return review
+  }
+
+  /** Call only after live GitHub repository and issue checks confirm the pinned identity. */
+  rebindReview(liveRef: IssueRef, expectedRevision: string): Review | undefined {
+    const db = this.database()
+    validate(z.uuid(), expectedRevision, "review revision")
+    return this.transaction(() => {
+      const current = this.reviewForReconciliation(liveRef)
+      if (!current || current.revision !== expectedRevision) return undefined
+      if (current.ref.name.toLowerCase() === liveRef.name.toLowerCase()) return current
+      const { publishedRevision: _published, ...previous } = current
+      const rebound = validate(
+        reviewSchema,
+        {
+          ...staleReview({ ...previous, ref: { ...previous.ref, name: liveRef.name } }, "changed"),
+          // Even an already-stale record must reject work from the old name.
+          revision: randomUUID(),
+          updatedAt: Math.max(Date.now(), current.updatedAt),
+        },
+        "review",
+      )
+      this.invalidateRecords(current.ref)
+      db.prepare("UPDATE reviews SET revision = ?, state = ?, json = ? WHERE issue_key = ?").run(
+        rebound.revision,
+        rebound.state,
+        JSON.stringify(rebound),
+        key(current.ref),
+      )
+      return rebound
+    })
   }
 
   saveReview(review: Review, expectedRevision?: string): boolean {

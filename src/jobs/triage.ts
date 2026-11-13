@@ -226,6 +226,7 @@ export class IssueTriage {
     if (review.state === "stale") {
       const {
         inactiveReason: _inactive,
+        evidenceError: _evidenceError,
         error,
         publishedRevision: _published,
         ...previous

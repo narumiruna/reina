@@ -61,10 +61,20 @@ class MockAPI {
       get: vi.fn(async () =>
         response({ ...this.issue, comments: this.hidden ? 0 : this.comments.length }),
       ),
-      listComments: vi.fn(async () => ({
-        ...response(this.hidden ? [] : this.comments),
-        headers: { link: this.commentLink },
-      })),
+      listComments: vi.fn(async ({ page = 1, per_page = 100 } = {}) => {
+        const comments = this.hidden ? [] : this.comments
+        const end = page * per_page
+        return {
+          ...response(comments.slice(end - per_page, end)),
+          headers: {
+            link:
+              this.commentLink ??
+              (end < comments.length
+                ? `<https://api.github.test/comments?page=${page + 1}>; rel="next"`
+                : undefined),
+          },
+        }
+      }),
       getComment: vi.fn(async (params: { comment_id: number; owner: string; repo: string }) => {
         this.scoped(params)
         const comment = this.comments.find((item) => item.id === params.comment_id)
@@ -188,6 +198,7 @@ function setup() {
   }
   const save = vi.fn((review: Review) => {
     reviewSchema.parse(review)
+    expect(review.updatedAt).toBeGreaterThanOrEqual(durable.updatedAt)
     durable = clone(review)
   })
   return {
@@ -243,6 +254,38 @@ describe("triage summary publication", () => {
     expect(op.api.rest.issues.createComment).toHaveBeenCalledTimes(1)
   })
 
+  test.each(["count", "context-bytes"])(
+    "publishes and reconciles a summary with 100 ordinary comments at the %s limit",
+    async (limit) => {
+      const op = setup()
+      const budget =
+        128 * 1024 - Buffer.byteLength(op.api.issue.title) - Buffer.byteLength(op.api.issue.body)
+      const size = Math.floor(budget / 100)
+      for (let index = 0; index < 100; index++) {
+        const content =
+          limit === "context-bytes"
+            ? "x".repeat(size + (index < budget % 100 ? 1 : 0))
+            : `Evidence ${index}`
+        op.api.comment(content, { ...bot, id: 101, type: "User" })
+      }
+      op.review.binding.fingerprint = fingerprint(op.api.evidence(), bot.id)
+      await op.run()
+      const id = op.review.commentId
+      expect(op.review).toMatchObject({ state: "complete", publishedRevision: revision })
+      expect(op.api.comments).toHaveLength(101)
+      expect(op.api.issue.labels).toContain("bot:triaged")
+      expect(op.api.rest.issues.listComments).toHaveBeenCalledWith(
+        expect.objectContaining({ page: 2, per_page: 100, issue_number: 12 }),
+      )
+      const writes = clone(op.api.writes)
+      await op.run()
+      expect(op.review).toMatchObject({ state: "complete", commentId: id })
+      expect(op.api.writes).toEqual(writes)
+      expect(op.api.rest.issues.createComment).toHaveBeenCalledTimes(1)
+      expect(op.api.rest.issues.updateComment).not.toHaveBeenCalled()
+    },
+  )
+
   test("updates the same comment for a new revision and outcome", async () => {
     const op = setup()
     await op.run()
@@ -263,6 +306,17 @@ describe("triage summary publication", () => {
     expect(op.api.issue.labels).not.toContain("bot:needs-info")
     expect(op.api.issue.labels).toContain("bot:needs-human")
     expect(op.review.publishedRevision).toBe(nextRevision)
+  })
+
+  test("publication timestamps stay monotonic after clock rollback", async () => {
+    const op = setup()
+    vi.setSystemTime(now - 60_000)
+    await op.run()
+    expect(op.review).toMatchObject({ state: "complete", updatedAt: now })
+    vi.setSystemTime(now - 120_000)
+    await op.run()
+    expect(op.review.updatedAt).toBe(now)
+    expect(op.api.rest.issues.createComment).toHaveBeenCalledTimes(1)
   })
 
   test("a fix candidate does not publish fix_available or grant approval", async () => {
@@ -477,6 +531,39 @@ describe("durable comment delivery", () => {
     expect(op.api.rest.issues.createComment).toHaveBeenCalledTimes(1)
   })
 
+  test.each(["wrong-marker", "missing-marker", "owned-duplicate"])(
+    "a confirmed %s conflict revokes a previous completion without changing comments or other labels",
+    async (variant) => {
+      const op = setup()
+      await op.run()
+      const identity = {
+        commentId: op.review.commentId,
+        commentIntent: op.review.commentIntent,
+        assessment: clone(op.review.assessment),
+      }
+      op.api.issue.labels.push("bot:needs-human", "bot:triage-failed")
+      if (variant === "wrong-marker")
+        op.api.comments[0].body = "<!-- reina:triage:77:456 -->\nOther issue"
+      if (variant === "missing-marker") op.api.comments[0].body = "Summary without a marker"
+      if (variant === "owned-duplicate") op.api.comment(`${marker}\nDuplicate owned summary`)
+      const comments = clone(op.api.comments)
+      const labels = op.api.issue.labels.filter((name) => name !== "bot:triaged")
+      op.api.writes = []
+      await expect(op.run()).rejects.toMatchObject({ code: "publication_comment_conflict" })
+      expect(op.review).toMatchObject({ ...identity, state: "assessed" })
+      expect(op.review.publishedRevision).toBeUndefined()
+      expect(op.api.issue.labels).toEqual(labels)
+      expect(op.api.writes).toEqual(["remove:bot:triaged"])
+      expect(op.api.comments).toEqual(comments)
+      expect(op.api.rest.issues.createComment).toHaveBeenCalledTimes(1)
+      expect(op.api.rest.issues.updateComment).not.toHaveBeenCalled()
+      if (variant === "missing-marker")
+        expect(op.api.rest.issues.getComment).toHaveBeenCalledWith(
+          expect.objectContaining({ comment_id: identity.commentId }),
+        )
+    },
+  )
+
   test("incomplete comment reads do not authorize recreation", async () => {
     const op = setup()
     await op.run()
@@ -598,6 +685,10 @@ describe("label projection and failure recovery", () => {
     await expect(op.run()).rejects.toMatchObject({ code: "publication_comment_conflict" })
     expect(op.review.state).toBe("assessed")
     expect(op.review.publishedRevision).toBeUndefined()
+    expect(op.api.issue.labels).not.toContain("bot:triaged")
+    expect(op.api.issue.labels).toContain("bot:needs-info")
+    expect(op.api.writes.at(-1)).toBe("remove:bot:triaged")
+    expect(op.api.rest.issues.updateComment).not.toHaveBeenCalled()
   })
 
   test("rate-limited labels keep the confirmed summary ID for retry", async () => {
@@ -611,6 +702,67 @@ describe("label projection and failure recovery", () => {
     expect(op.review.state).toBe("complete")
     expect(op.api.rest.issues.createComment).toHaveBeenCalledTimes(1)
   })
+
+  test.each(["read", "write"])(
+    "cleanup %s rate limits follow durable revocation and stop later requests",
+    async (operation) => {
+      const op = setup()
+      await op.run()
+      const id = op.review.commentId
+      op.api.comments[0].body = "Summary without a marker"
+      const reads = () => [
+        op.api.rest.repos.get.mock.calls.length,
+        op.api.rest.issues.get.mock.calls.length,
+        op.api.rest.issues.listComments.mock.calls.length,
+        op.api.rest.issues.getComment.mock.calls.length,
+        op.api.rest.issues.getLabel.mock.calls.length,
+        op.api.rest.git.getRef.mock.calls.length,
+      ]
+      let atDeferral: number[] = []
+      const defer = async () => {
+        expect(op.review).toMatchObject({ state: "assessed", commentId: id, commentIntent: true })
+        expect(op.review.publishedRevision).toBeUndefined()
+        atDeferral = reads()
+        throw apiError(429, { "retry-after": "3600" })
+      }
+      if (operation === "write") {
+        op.api.rest.issues.removeLabel.mockImplementationOnce(defer)
+      } else {
+        const get = op.api.rest.issues.getComment.getMockImplementation()
+        if (!get) throw new Error("missing test implementation")
+        op.api.rest.issues.getComment.mockImplementationOnce(async (params) => {
+          const comment = await get(params)
+          op.api.rest.issues.get.mockImplementationOnce(defer)
+          return comment
+        })
+      }
+      op.api.writes = []
+      await expect(op.run()).rejects.toMatchObject({ retryAt: now + 3_600_000 })
+      expect(op.review).toMatchObject({ state: "assessed", commentId: id, commentIntent: true })
+      expect(op.review.publishedRevision).toBeUndefined()
+      expect(reads()).toEqual(atDeferral)
+      expect(op.api.writes).toEqual([])
+      expect(op.api.rest.issues.createComment).toHaveBeenCalledTimes(1)
+      expect(op.api.rest.issues.updateComment).not.toHaveBeenCalled()
+    },
+  )
+
+  test.each([401, 403, 429])(
+    "an uncertain %s read after completion does not trigger conflict cleanup",
+    async (status) => {
+      const op = setup()
+      await op.run()
+      const durable = clone(op.review)
+      const writes = clone(op.api.writes)
+      op.api.rest.issues.listComments.mockRejectedValueOnce(
+        apiError(status, status === 429 ? { "retry-after": "3600" } : {}),
+      )
+      await expect(op.run()).rejects.toThrow()
+      expect(op.review).toEqual(durable)
+      expect(op.api.writes).toEqual(writes)
+      expect(op.api.rest.issues.removeLabel).not.toHaveBeenCalled()
+    },
+  )
 
   test("read cooldowns retain an unused rejection grant", async () => {
     const op = setup()
@@ -845,6 +997,78 @@ describe("publication cancellation and revision CAS", () => {
     }
     await expect(op.publisher.review(op.review, save)).rejects.toMatchObject({ status: 404 })
     expect(op.api.writes).toEqual([])
+  })
+
+  test("a failed conflict-revocation CAS prevents cleanup writes", async () => {
+    const op = setup()
+    await op.run()
+    op.api.comments[0].body = "Summary without a marker"
+    op.api.writes = []
+    const save = (review: Review) => {
+      if (review.state === "assessed") throw new Error("CAS revoked")
+      op.save(review)
+    }
+    await expect(op.publisher.review(op.review, save)).rejects.toThrow("CAS revoked")
+    expect(op.api.writes).toEqual([])
+    expect(op.api.rest.issues.removeLabel).not.toHaveBeenCalled()
+    expect(op.review.state).toBe("complete")
+  })
+
+  test("a cleanup-write CAS with status 404 is not treated as a missing label", async () => {
+    const op = setup()
+    await op.run()
+    op.api.comments[0].body = "Summary without a marker"
+    op.api.writes = []
+    let revocations = 0
+    const save = (review: Review) => {
+      if (review.state === "assessed" && ++revocations === 2) throw apiError(404)
+      op.save(review)
+    }
+    await expect(op.publisher.review(op.review, save)).rejects.toMatchObject({ status: 404 })
+    expect(op.api.writes).toEqual([])
+    expect(op.api.rest.issues.removeLabel).not.toHaveBeenCalled()
+    expect(op.review.state).toBe("assessed")
+    expect(op.review.publishedRevision).toBeUndefined()
+  })
+
+  test("abort during conflict cleanup prevents the remote label write", async () => {
+    const op = setup()
+    await op.run()
+    op.api.comments[0].body = "Summary without a marker"
+    op.api.writes = []
+    const controller = new AbortController()
+    const read = op.api.rest.issues.get.getMockImplementation()
+    if (!read) throw new Error("missing test implementation")
+    op.api.rest.issues.get.mockImplementation(async () => {
+      if (op.review.state === "assessed") controller.abort(new Error("cleanup cancelled"))
+      return read()
+    })
+    await expect(op.run(controller.signal)).rejects.toThrow("cleanup cancelled")
+    expect(op.api.writes).toEqual([])
+    expect(op.api.rest.issues.removeLabel).not.toHaveBeenCalled()
+    expect(op.review.state).toBe("assessed")
+    expect(op.review.publishedRevision).toBeUndefined()
+  })
+
+  test("abort during the cleanup-write CAS prevents the remote label write", async () => {
+    const op = setup()
+    await op.run()
+    op.api.comments[0].body = "Summary without a marker"
+    op.api.writes = []
+    const controller = new AbortController()
+    let revocations = 0
+    const save = (review: Review) => {
+      op.save(review)
+      if (review.state === "assessed" && ++revocations === 2)
+        controller.abort(new Error("cleanup CAS cancelled"))
+    }
+    await expect(op.publisher.review(op.review, save, controller.signal)).rejects.toThrow(
+      "cleanup CAS cancelled",
+    )
+    expect(op.api.writes).toEqual([])
+    expect(op.api.rest.issues.removeLabel).not.toHaveBeenCalled()
+    expect(op.review.state).toBe("assessed")
+    expect(op.review.publishedRevision).toBeUndefined()
   })
 
   test("pre-aborted publication has no reads or writes", async () => {

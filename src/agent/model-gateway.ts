@@ -120,6 +120,7 @@ export class ModelGateway {
   }
 
   private deny(res: ServerResponse, status: number): void {
+    if (res.writableEnded || res.destroyed) return
     if (res.headersSent) {
       res.destroy()
       return
@@ -131,7 +132,7 @@ export class ModelGateway {
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     try {
       req.on("error", () => {
-        res.destroy()
+        if (!res.writableEnded && !res.destroyed) res.destroy()
       })
       req.setTimeout(30_000, () => {
         req.destroy()
@@ -178,15 +179,23 @@ export class ModelGateway {
       }
       const chunks: Buffer[] = []
       let size = 0
-      for await (const chunk of req) {
-        size += chunk.length
-        if (size > BODY_LIMIT) {
-          this.deny(res, 413)
-          req.destroy()
-          return
+      const bodyTimer = setTimeout(() => req.destroy(), 30_000)
+      bodyTimer.unref()
+      try {
+        for await (const chunk of req) {
+          size += chunk.length
+          if (size > BODY_LIMIT) {
+            this.deny(res, 413)
+            req.destroy()
+            return
+          }
+          chunks.push(Buffer.from(chunk))
         }
-        chunks.push(Buffer.from(chunk))
+      } finally {
+        clearTimeout(bodyTimer)
       }
+      // The body is complete. Only the provider deadline bounds the response wait.
+      req.setTimeout(0)
       if (this.revoked || Date.now() >= this.expiresAt) {
         this.deny(res, 401)
         return
@@ -258,7 +267,6 @@ export class ModelGateway {
       const upstream = (this.endpoint.protocol === "https:" ? https : http).request(this.endpoint, {
         method: "POST",
         ...(this.config.modelApi ? { lookup: publicLookup, agent: false } : {}),
-        timeout: timeoutMs,
         headers: {
           authorization: `Bearer ${this.config.modelKey}`,
           "content-type": "application/json",
@@ -270,21 +278,31 @@ export class ModelGateway {
       let stopped = false
       const stop = () => {
         stopped = true
+        clearTimeout(timer)
+        res.off("close", stop)
         upstream.destroy()
         this.active.delete(upstream)
       }
-      res.once("close", stop)
-      upstream.once("timeout", () => {
+      const timer = setTimeout(() => {
         if (!stopped && timeoutMs === 60_000) setFailure(true)
         stop()
+        this.deny(res, 502)
+      }, timeoutMs)
+      timer.unref()
+      res.once("close", stop)
+      upstream.once("close", () => {
+        clearTimeout(timer)
+        this.active.delete(upstream)
       })
       upstream.once("error", (error) => {
-        if (!stopped && retryableTransport(error)) setFailure(true)
-        this.active.delete(upstream)
+        if (stopped) return
+        if (retryableTransport(error)) setFailure(true)
+        stop()
         this.deny(res, 502)
       })
       upstream.once("response", (response) => {
-        if (!stopped && retryableStatus(response.statusCode ?? 0)) setFailure(true)
+        if (stopped) return
+        if (retryableStatus(response.statusCode ?? 0)) setFailure(true)
         if (
           response.statusCode !== 200 ||
           !response.headers["content-type"]?.startsWith("text/event-stream")
@@ -309,13 +327,15 @@ export class ModelGateway {
           response.resume()
         })
         response.once("error", (error) => {
-          if (!stopped && retryableTransport(error)) setFailure(true)
+          if (stopped) return
+          if (retryableTransport(error)) setFailure(true)
           stop()
           res.destroy()
         })
         response.once("end", () => {
-          if (!stopped) setFailure(false)
-          this.active.delete(upstream)
+          if (stopped) return
+          setFailure(false)
+          stop()
           res.end()
         })
       })
@@ -337,8 +357,18 @@ export class ModelGateway {
     const timer = setTimeout(() => {
       if (!controller.signal.aborted && timeoutMs === 60_000) setFailure(true)
       stop()
+      this.deny(res, 502)
     }, timeoutMs)
     timer.unref()
+    controller.signal.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer)
+        res.off("close", stop)
+        this.controllers.delete(controller)
+      },
+      { once: true },
+    )
     res.once("close", stop)
     try {
       for await (const chunk of piChatStream(
@@ -381,10 +411,7 @@ export class ModelGateway {
     } catch {
       this.deny(res, 502)
     } finally {
-      controller.abort()
-      clearTimeout(timer)
-      res.off("close", stop)
-      this.controllers.delete(controller)
+      stop()
     }
   }
 

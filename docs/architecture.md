@@ -161,22 +161,22 @@ external security prerequisite is verified.
 
 ## Limits and supported targets
 
-| Control                       | MVP limit                                                                        |
-| ----------------------------- | -------------------------------------------------------------------------------- |
-| Deployment                    | One service instance, enabled repository, and coding job                         |
-| Scan                          | Default 15 minutes; at most ten candidate issues per pass                        |
-| Issue context                 | 100 comments and 128 KiB; excess causes deferral                                 |
-| Source                        | 2,000 regular files, 1 MiB per file, 16 MiB total                                |
-| CPU / memory / processes      | One CPU / 2 GiB with no extra swap / 128 processes                               |
-| Workspace / temporary storage | 256 MiB quota volume / 64 MiB tmpfs                                              |
-| Time                          | Triage 120 s; coding at most 600 s; validation 180 s                             |
-| Model requests                | Eight triage or 24 coding requests; 1 MiB/request; 4 MiB response; 60 s/request  |
-| Model output                  | At most 4,096 tokens with supported non-Codex SDK caps; no exact Codex token cap |
-| Pi output                     | 1 MiB/JSONL record; 8 MiB stdout; 64 KiB stderr                                  |
-| Patch                         | Ten files and 64 KiB unified diff; configured limits can be lower                |
-| Approval                      | Exact revision and base; expires after 24 hours; one coding invocation           |
-| GitHub reads                  | Initial read plus at most three transient retries; rate-limit deferral           |
-| Persistent inbox              | Delivery deduplication; at most eight deferred attempts                          |
+| Control                       | MVP limit                                                                            |
+| ----------------------------- | ------------------------------------------------------------------------------------ |
+| Deployment                    | One service instance, enabled repository, and coding job                             |
+| Scan                          | Default 15 minutes; at most ten candidate issues per pass                            |
+| Issue context                 | 100 ordinary comments and 128 KiB; one owned triage summary has a separate allowance |
+| Source                        | 2,000 regular files, 1 MiB per file, 16 MiB total                                    |
+| CPU / memory / processes      | One CPU / 2 GiB with no extra swap / 128 processes                                   |
+| Workspace / temporary storage | 256 MiB quota volume / 64 MiB tmpfs                                                  |
+| Time                          | Triage 120 s; coding at most 600 s; validation 180 s                                 |
+| Model requests                | Eight triage or 24 coding requests; 1 MiB/request; 4 MiB response; 60 s/request      |
+| Model output                  | At most 4,096 tokens with supported non-Codex SDK caps; no exact Codex token cap     |
+| Pi output                     | 1 MiB/JSONL record; 8 MiB stdout; 64 KiB stderr                                      |
+| Patch                         | Ten files and 64 KiB unified diff; configured limits can be lower                    |
+| Approval                      | Exact revision and base; expires after 24 hours; one coding invocation               |
+| GitHub reads                  | Initial read plus at most three transient retries; rate-limit deferral               |
+| Persistent inbox              | Delivery deduplication; at most eight deferred attempts                              |
 
 Only Node/npm regular-file Git trees are supported. Symlinks, submodules, workspaces, external
 package sources, binary patches, mode changes, and dependencies that need lifecycle scripts are
@@ -193,6 +193,13 @@ renewal after 24 hours. Failed cycles do not renew on a timer. See [issue triage
 Discovery scans use a durable page cursor so skipped or previously assessed issues do not
 permanently hide older issues. Stored-review reconciliation has its own rotating cursor and the
 same per-scan issue limit; it does not depend on open-issue discovery.
+One trusted triage summary can use a separate allowance of one comment and 64 KiB. It must have
+the configured bot ID and Bot type, the exact leading repository/issue marker, no repeated marker,
+and no proposal or job marker. A second bot-owned triage marker makes the allowance ambiguous.
+Foreign markers and all other comments remain ordinary evidence. The reader fetches the complete
+raw list within 101 comments, 192 KiB, and two numbered pages. It rejects duplicate IDs, incomplete
+pages, and metadata count mismatches. Approval still requires the exact immutable proposal comment.
+
 Oversized or changing issue evidence is deferred for that issue only. The scan can process other
 issues and advance its cursor. No incomplete evidence is sent to triage. Real GitHub rate limits
 and exhausted transient reads still apply a persistent global cooldown. Before a job is claimed,
@@ -364,7 +371,16 @@ issues. Confirmed closure or skip stops pending work, removes all four active tr
 marks an existing summary inactive. Deleted/unavailable or incomplete evidence invalidates the
 stored review with a safe reason; failed reads/writes are not reported as successful cleanup.
 Excluded or incompletely read issues do not start inference. Recovery does not require their return
-in open-issue discovery.
+in open-issue discovery. Evidence-read diagnostics are separate from the model-attempt failure.
+A temporary read failure preserves the consumed attempts and retry deadline. Complete evidence
+clears that diagnostic, but does not reopen a permanent or exhausted failure.
+
+After a same-owner repository rename, the operator must update the configured name. A stored
+review can retain its old name during intake invalidation. Only a successful live GitHub read
+with unchanged repository ID, installation ID, owner, issue ID, and issue number can rebind that
+name. Rebinding uses revision CAS, invalidates old proposal/job authority in the same transaction,
+and requires a fresh policy-bound assessment. Old approval and job references remain immutable.
+Owner transfers and cross-repository moves are not supported.
 
 ### Attempts and publication recovery
 
@@ -383,6 +399,9 @@ Each cycle permits at most three model attempts. Host-observed HTTP 408/429/5xx,
 transport failures, and request deadlines can use one-minute then five-minute delays. The gateway
 passes only safe transient classification to the triage controller; generic Pi errors, authentication
 rejections, invalid output, local limits, and unavailable isolation do not grant retries.
+Request intake has a 30-second bound. After intake, an absolute 60-second provider deadline closes
+the worker response and records trusted timeout evidence, even if streaming heartbeats continue.
+Cancellation, gateway expiry, and revocation do not grant a timeout retry.
 An interrupted attempt consumes the persisted budget. Duplicate delivery, restart, and manual
 label changes cannot reset attempts. A failed cycle stays suppressed until evidence or policy
 changes. Successful non-fix results do not expire daily. A successful `fix_candidate` can start a
@@ -397,8 +416,11 @@ Publication retries use the saved assessment, not another model call. The publis
 repository, issue, installation, bot authorship, stable issue marker, and stored comment ID before
 updates. Only the configured bot's ID and Bot type establish summary ownership; copied markers
 in other users' comments cannot claim ownership or block reconciliation. Unknown create responses
-must be reconciled before another create. Conflicting bot-owned markers fail closed; a missing
-stored comment requires confirmed absence before recreation. Explicit
+must be reconciled before another create. Conflicting bot-owned markers fail closed. A confirmed summary conflict revokes stored completion
+and removes `bot:triaged` through scoped, CAS-guarded cleanup. Other labels and the saved assessment
+remain intact during that cleanup. A cleanup rate limit leaves completion revoked and defers more
+requests. An uncertain read alone does not authorize cleanup. A missing stored comment requires
+confirmed absence before recreation. Explicit
 rate-limit rejection uses the existing bounded, one-use retry authorization. Unrelated labels are
 preserved; Reina never replaces the whole label set or changes maintainer-owned type/priority labels.
 

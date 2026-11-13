@@ -1215,6 +1215,145 @@ describe("durable general issue triage", () => {
   )
 
   test.each(["runtime_timeout", "model_request_transient"])(
+    "%s keeps its retry budget when issue evidence is temporarily unavailable",
+    async (code) => {
+      const value = fixture()
+      value.runtime.triage.mockRejectedValueOnce(new Error(code))
+      await value.deliver()
+      const first = required(value.store.review(value.github.currentIssue.ref))
+      value.github.issue.mockRejectedValueOnce(
+        new GitHubIssueDeferred("github_issue_changed_during_read", now + 15_000),
+      )
+      await value.deliver(value.work({ action: "scan" }), "temporary-evidence-failure")
+      expect(value.store.review(first.ref)).toMatchObject({
+        state: "stale",
+        attempts: 1,
+        error: code,
+        nextAttemptAt: first.nextAttemptAt,
+        evidenceError: "triage_evidence_unavailable",
+      })
+      expect(value.store.blockedUntil()).toBe(0)
+      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+      now += 15_000
+      await value.orchestrator.drain()
+      expect(value.store.review(first.ref)).toMatchObject({
+        state: "pending",
+        attempts: 1,
+        error: code,
+        nextAttemptAt: first.nextAttemptAt,
+      })
+      expect(value.store.review(first.ref)?.evidenceError).toBeUndefined()
+      const previousRuntime = value.runtime
+      await value.restart()
+      value.runtime.triage.mockResolvedValue(nonFix("needs_info"))
+      expect(value.runtime.triage).not.toHaveBeenCalled()
+      now = first.nextAttemptAt
+      await value.orchestrator.drain()
+      expect(previousRuntime.triage).toHaveBeenCalledTimes(1)
+      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+      expect(value.store.review(first.ref)).toMatchObject({ state: "complete", attempts: 2 })
+      expect(value.github.currentIssue.labels).not.toContain("bot:triage-failed")
+      expect(value.runtime.code).not.toHaveBeenCalled()
+    },
+  )
+
+  test("read recovery does not reopen a permanent assessment failure", async () => {
+    const value = fixture()
+    value.runtime.triage.mockRejectedValue(new Error("pi_agent_error"))
+    await value.deliver()
+    const failed = required(value.store.review(value.github.currentIssue.ref))
+    value.github.issue.mockRejectedValueOnce(new GitHubIssueDeferred("github_comments_limit"))
+    await value.deliver(value.work({ action: "scan" }))
+    expect(value.store.review(failed.ref)).toMatchObject({
+      state: "stale",
+      error: "pi_agent_error",
+      attempts: 1,
+      evidenceError: "triage_evidence_unavailable",
+    })
+    await reconcile(value)
+    expect(value.store.review(failed.ref)).toMatchObject({
+      state: "failed",
+      error: "pi_agent_error",
+      attempts: 1,
+    })
+    expect(value.store.review(failed.ref)?.evidenceError).toBeUndefined()
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    expect(value.runtime.code).not.toHaveBeenCalled()
+  })
+
+  test("a validated same-owner rename repairs a non-fix review and old cursor work", async () => {
+    const value = fixture()
+    value.runtime.triage.mockResolvedValue(nonFix("needs_info"))
+    await value.deliver()
+    const previous = required(value.store.review(value.github.currentIssue.ref))
+    value.config.repository.name = "renamed-project"
+    value.github.currentIssue.ref.name = "renamed-project"
+    value.github.discovered = []
+    await reconcile(value)
+    const current = required(value.store.review(value.github.currentIssue.ref))
+    expect(current).toMatchObject({ state: "complete", attempts: 1, commentId: previous.commentId })
+    expect(current.ref.name).toBe("renamed-project")
+    expect(current.revision).not.toBe(previous.revision)
+    expect(current.binding.policyHash).not.toBe(previous.binding.policyHash)
+    expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+    expect(() => value.store.review(previous.ref)).toThrow("Inconsistent review identity")
+    value.orchestrator.accept("old-cursor-reference", { kind: "review", ref: previous.ref })
+    await value.orchestrator.drain()
+    expect(value.store.review(current.ref)?.revision).toBe(current.revision)
+    expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+    expect(triageComments(value)).toHaveLength(1)
+    expect(value.runtime.code).not.toHaveBeenCalled()
+  })
+
+  test("rename intake revokes old authority but cannot rebind before the live read", async () => {
+    const value = fixture()
+    await value.propose()
+    const previous = required(value.store.review(value.github.currentIssue.ref))
+    value.config.repository.name = "renamed-project"
+    value.github.currentIssue.ref.name = "renamed-project"
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const read = required(value.github.issue.getMockImplementation())
+    value.github.issue.mockImplementationOnce(async (number) => {
+      entered.resolve()
+      await release.promise
+      return read(number)
+    })
+    const delivery = value.deliver(value.work({ action: "edited", material: true }))
+    await entered.promise
+    expect(value.store.reviewForReconciliation(value.github.currentIssue.ref)?.ref.name).toBe(
+      previous.ref.name,
+    )
+    expect(value.store.review(previous.ref)?.state).toBe("stale")
+    expect(value.store.proposal(previous.ref)).toBeUndefined()
+    release.resolve()
+    await delivery
+    expect(value.store.review(value.github.currentIssue.ref)?.ref.name).toBe("renamed-project")
+    expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+    expect(value.runtime.code).not.toHaveBeenCalled()
+  })
+
+  test("a rename never converts an old approval into authority for its new proposal", async () => {
+    const value = fixture()
+    const previous = await value.propose()
+    value.config.repository.name = "renamed-project"
+    value.github.currentIssue.ref.name = "renamed-project"
+    value.github.currentIssue.labels.push("bot:approved")
+    await value.deliver(value.work({ action: "labeled", label: "bot:approved", actor: maintainer }))
+    const current = required(value.store.proposal(value.github.currentIssue.ref))
+    expect(current.revision).not.toBe(previous.revision)
+    expect(current.ref.name).toBe("renamed-project")
+    expect(value.github.currentIssue.labels).not.toContain("bot:approved")
+    expect(value.store.jobs()).toEqual([])
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(() => value.store.saveProposal(previous)).toThrow(/immutable/)
+    now += 2_000
+    await value.approve()
+    expect(value.runtime.code).toHaveBeenCalledTimes(1)
+    expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+  })
+
+  test.each(["runtime_timeout", "model_request_transient"])(
     "%s uses three persisted attempts with one-minute and five-minute backoff across restart",
     async (code) => {
       const value = fixture()

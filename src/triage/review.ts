@@ -26,6 +26,7 @@ export interface Review {
   outcome?: TriageOutcome
   assessedAt?: number
   error?: string
+  evidenceError?: "triage_evidence_unavailable" | "triage_issue_unavailable"
   inactiveReason?: "changed" | "closed" | "skipped" | "unavailable"
   commentId?: number
   commentIntent?: boolean
@@ -133,6 +134,7 @@ const reviewRecordSchema = z
       .string()
       .regex(/^[a-z][a-z0-9_]{0,63}$/)
       .optional(),
+    evidenceError: z.enum(["triage_evidence_unavailable", "triage_issue_unavailable"]).optional(),
     inactiveReason: z.enum(["changed", "closed", "skipped", "unavailable"]).optional(),
     commentId: positiveId.optional(),
     commentIntent: z.boolean().optional(),

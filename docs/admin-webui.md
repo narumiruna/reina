@@ -445,9 +445,15 @@ Current issue-triage test evidence must be recorded separately from the historic
    - Expected: stale-state removal, one updated summary, and no own-comment/label inference loop.
      Closure/skip makes the summary inactive and removes all four triage labels without inference.
      Unavailable/incomplete evidence invalidates the review without claimed successful writes.
+     Read recovery preserves the saved model error, attempt count, and retry deadline. A summary
+     conflict clears the reviewed claim without editing foreign comments. One trusted, scoped
+     triage summary does not consume the ordinary 100-comment/128-KiB evidence budget.
      Publication recovery reuses the saved result. At most three attempts use allowed one-minute/
      five-minute retries; invalid output/isolation failure stops the cycle. Exhausted failures
      remain suppressed after restart or label removal, separate from successful 24-hour renewal.
+   - For a same-owner rename, update the configured repository name. Confirm that live numeric
+     identity checks permit recovery, the summary is reused, and any replacement proposal needs
+     fresh approval. Do not use this path for owner transfers or cross-repository moves.
 3. **Provider account owner**
    - Prerequisites: supported entitled account, explicit usage/cost authorization, and acceptance
      of the Codex cap limitation where applicable.
