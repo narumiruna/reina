@@ -5,6 +5,7 @@ import os from "node:os"
 import path from "node:path"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { httpServer } from "../src/app.js"
+import type { DispatchStatus } from "../src/settings/dispatch.js"
 import type { SavedProvider } from "../src/settings/schema.js"
 import { SettingsStore } from "../src/settings/store.js"
 import { AdminWeb } from "../src/web/admin.js"
@@ -26,6 +27,22 @@ const model = {
   name: "Example model",
   contextWindow: 128000,
   maxTokens: 4096,
+}
+const webhookSecret = "fixture-webhook-secret-never-returned"
+const runtimeSettings = {
+  appId: 123,
+  webhookSecret,
+  repository: { owner: "example", name: "project", id: 456, installationId: 789 },
+  image: `sha256:${"d".repeat(64)}`,
+  allowedPaths: ["README.md", "docs/**", "src/**", "tests/**"],
+  forbiddenPaths: ["src/security/**", "src/deployment/**"],
+  commands: [["npm", "run", "ci"]],
+  scanIntervalMs: 900_000,
+  maxIssuesPerScan: 10,
+  maxConcurrentJobs: 1,
+  agentTimeoutMs: 600_000,
+  maxChangedFiles: 10,
+  maxPatchBytes: 65_536,
 }
 let directory: string
 let store: SettingsStore
@@ -54,6 +71,7 @@ async function request(
       selectedModelId: string | null
       providers: SavedProvider[]
       github: { configured: boolean; fingerprint: string }
+      runtimeSettings: DispatchStatus | null
     }
   }>((resolve, reject) => {
     const req = http.request(
@@ -129,6 +147,133 @@ afterEach(async () => {
   vi.restoreAllMocks()
   store.close()
   rmSync(directory, { recursive: true, force: true })
+})
+
+describe("runtime settings API", () => {
+  it("starts unconfigured and returns safe settings after an explicit save", async () => {
+    expect((await request("/api/settings")).json().runtimeSettings).toBeNull()
+    const saved = await request("/api/runtime/settings", "POST", runtimeSettings)
+    expect(saved.status).toBe(200)
+    expect(saved.text).not.toContain(webhookSecret)
+    expect(changed).toHaveBeenCalledExactlyOnceWith()
+    const response = await request("/api/settings")
+    const { webhookSecret: _secret, ...publicSettings } = runtimeSettings
+    expect(response.json().runtimeSettings).toEqual({
+      ...publicSettings,
+      webhookSecretConfigured: true,
+    })
+    expect(response.text).not.toContain(webhookSecret)
+    expect(response.text).not.toContain('"webhookSecret":')
+    expect(response.headers["cache-control"]).toBe("no-store")
+    expect(store.dispatchSettings()?.webhookSecret).toBe(webhookSecret)
+  })
+
+  it("accepts legacy-sized verification argv with the runtime record overhead", async () => {
+    const commands = [["npm", ...Array.from({ length: 16 }, () => "x".repeat(4090))]]
+    expect(JSON.stringify(commands).length).toBeLessThanOrEqual(65_536)
+    const input = { ...runtimeSettings, commands }
+    expect(Buffer.byteLength(JSON.stringify(input))).toBeGreaterThan(65_536)
+    const response = await request("/api/runtime/settings", "POST", input)
+    expect(response.status).toBe(200)
+    expect(store.dispatchSettings()?.commands).toEqual(commands)
+    expect(changed).toHaveBeenCalledExactlyOnceWith()
+  })
+
+  it("preserves a saved webhook secret when the update omits it", async () => {
+    await request("/api/runtime/settings", "POST", runtimeSettings)
+    const { webhookSecret: _secret, ...update } = runtimeSettings
+    const saved = await request("/api/runtime/settings", "POST", {
+      ...update,
+      scanIntervalMs: 60_000,
+    })
+    expect(saved.status).toBe(200)
+    expect(store.dispatchSettings()).toMatchObject({ webhookSecret, scanIntervalMs: 60_000 })
+    expect(changed).toHaveBeenCalledTimes(2)
+  })
+
+  it("requires a webhook secret on the first save without starting dispatch", async () => {
+    const { webhookSecret: _secret, ...input } = runtimeSettings
+    const response = await request("/api/runtime/settings", "POST", input)
+    expect(response.status).toBe(400)
+    expect(response.json()).toMatchObject({ error: "invalid_input", fields: ["webhookSecret"] })
+    expect(store.dispatchStatus()).toBeUndefined()
+    expect(changed).not.toHaveBeenCalled()
+  })
+
+  it("requires an allowed session, exact Origin, and CSRF for runtime changes", async () => {
+    for (const options of [
+      { anonymous: true },
+      { headers: { origin: "https://evil.example" } },
+      { headers: { "x-csrf-token": "wrong" } },
+    ]) {
+      const response = await request("/api/runtime/settings", "POST", runtimeSettings, options)
+      expect(response.status).toBe(options.anonymous ? 401 : 403)
+    }
+    const denied = store.createSession("denied-subject", "Denied", ["user"])
+    token = denied.token
+    csrf = denied.csrfToken
+    expect((await request("/api/runtime/settings", "POST", runtimeSettings)).status).toBe(401)
+    expect(store.dispatchStatus()).toBeUndefined()
+    expect(changed).not.toHaveBeenCalled()
+  })
+
+  it("rejects unsafe settings with dotted field names and preserves the saved snapshot", async () => {
+    await request("/api/runtime/settings", "POST", runtimeSettings)
+    changed.mockClear()
+    const response = await request("/api/runtime/settings", "POST", {
+      ...runtimeSettings,
+      repository: { ...runtimeSettings.repository, id: 0 },
+      image: "worker:latest",
+      forbiddenPaths: [],
+      commands: [["npm\nprivate-input"]],
+    })
+    expect(response.status).toBe(400)
+    expect(response.json()).toMatchObject({
+      error: "invalid_input",
+      fields: expect.arrayContaining(["repository.id", "image", "forbiddenPaths", "commands.0.0"]),
+    })
+    expect(response.text).not.toContain(webhookSecret)
+    expect(response.text).not.toContain("private-input")
+    expect(store.dispatchSettings()).toEqual(runtimeSettings)
+    expect(changed).not.toHaveBeenCalled()
+  })
+
+  it("rejects unsupported requests and logs storage failures without secrets", async () => {
+    expect((await request("/api/runtime/settings", "PUT", runtimeSettings)).status).toBe(404)
+    expect(
+      (
+        await request("/api/runtime/settings", "POST", runtimeSettings, {
+          headers: { "content-type": "text/plain" },
+        })
+      ).status,
+    ).toBe(415)
+    expect((await request("/api/runtime/settings", "POST", "{broken", { raw: true })).status).toBe(
+      400,
+    )
+    expect(
+      (
+        await request("/api/runtime/settings", "POST", {
+          ...runtimeSettings,
+          webhookSecret: "x".repeat(512 * 1024),
+        })
+      ).status,
+    ).toBe(413)
+    vi.spyOn(store, "saveDispatchSettings").mockImplementation(() => {
+      throw new Error(webhookSecret)
+    })
+    const failed = await request("/api/runtime/settings", "POST", runtimeSettings)
+    expect(failed.status).toBe(500)
+    expect(failed.text).not.toContain(webhookSecret)
+    expect(JSON.stringify(log.error.mock.calls)).not.toContain(webhookSecret)
+    expect(log.error).toHaveBeenCalledWith({
+      event: "http_request_failed",
+      reason: "settings_unavailable",
+      method: "POST",
+      route: "/api/runtime/settings",
+      status: 500,
+    })
+    expect(changed).not.toHaveBeenCalled()
+  })
 })
 
 describe("admin web boundary", () => {

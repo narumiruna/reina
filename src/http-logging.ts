@@ -8,6 +8,8 @@ const routes = new Set([
   "/login",
   "/auth/login",
   "/auth/callback",
+  "/auth/github/callback",
+  "/auth/github/setup",
   "/auth/logout",
   "/assets/style.css",
   "/assets/app.js",
@@ -18,7 +20,14 @@ const routes = new Set([
   "/api/provider-setups",
   "/api/selection",
   "/api/github/private-key",
+  "/api/github/app",
+  "/api/github/connect",
+  "/api/github/connect/install",
+  "/api/github/connect/refresh",
+  "/api/github/connect/select",
+  "/api/github/connect/cancel",
   "/api/runtime/reload",
+  "/api/runtime/settings",
 ])
 const routeTemplates = [
   [/^\/api\/providers\/[a-f0-9-]{36}$/, "/api/providers/:id"],

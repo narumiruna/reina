@@ -28,10 +28,11 @@ test("Compose prepares a worker, shares runtime binds, and preserves private sta
   const controllerTag = fixtureTag("controller")
   const workerTag = fixtureTag("compose-worker")
   const state = `/var/lib/reina/test-${randomUUID()}`
+  const project = `reina-test-${randomUUID()}`
   const args = [
     "compose",
     "--project-name",
-    `reina-test-${randomUUID()}`,
+    project,
     "--project-directory",
     directory,
     "--env-file",
@@ -217,7 +218,19 @@ test("Compose prepares a worker, shares runtime binds, and preserves private sta
   } finally {
     try {
       // Only this randomly named, credential-free test project owns these volumes.
-      if (overrideWritten) await compose(["down", "--volumes", "--remove-orphans"])
+      if (overrideWritten) {
+        // Include setup so Compose also removes its default network.
+        await compose(["--profile", "setup", "down", "--volumes", "--remove-orphans"])
+        const networks = await dockerCommand([
+          "network",
+          "ls",
+          "--quiet",
+          "--filter",
+          `label=com.docker.compose.project=${project}`,
+        ])
+        assert.equal(networks.exitCode, 0)
+        assert.equal(networks.stdout.length, 0, "Fixture networks must be removed")
+      }
     } finally {
       try {
         if (stagingCreated) await volume(["rm", stagingVolume])

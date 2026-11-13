@@ -1,9 +1,9 @@
 # Admin Web UI
 
-Use `https://reina.narumi.dev` to manage the GitHub App private key, providers, saved models, and
-selected model preference. See the retained [terminology reference](architecture.md#terminology)
-for SDK concepts and Reina records. Bootstrap identity and runtime policy remain in the private
-environment file.
+Use `https://reina.narumi.dev` to manage runtime policy, GitHub App settings, providers, saved models,
+and the selected model preference. See the retained [terminology reference](architecture.md#terminology)
+for SDK concepts and Reina records. Only encryption, login, listener, and persistent storage
+bootstrap settings remain in the private environment file.
 The UI can start without GitHub credentials, repository IDs, a model, or a ready worker.
 Dispatch stays disabled and webhooks return HTTP 503 until the controller is ready.
 
@@ -125,6 +125,139 @@ Missing definitions can leave publication pending. Do not remove maintainer labe
 proposal comments to repair triage. Follow [triage recovery](architecture.md#attempts-and-publication-recovery)
 rather than clearing saved results, attempts, or publication intents.
 
+## Connect GitHub
+
+Use **GitHub App → Connect GitHub** to authorize the existing service App on GitHub. Reina reuses
+installations that the signed-in GitHub user can access. Choose a repository and select **Use
+repository**; the server verifies access again and records its owner, name, repository ID, and
+installation ID. Users do not enter these IDs, upload an App key, or create another App.
+
+If the App needs access to another repository, use **Install or manage App**. GitHub's official
+installation page returns through the Setup URL. A forged callback `installation_id` is not
+sufficient: Reina verifies both App ownership and the GitHub user's installation/repository access.
+Pending organization installation requests do not create a verified connection.
+
+The flow uses same-tab navigation, one-use state bound to the active Pocket ID session, and
+OAuth PKCE S256. The GitHub user token remains in bounded server memory during selection and is
+never returned to the browser or stored in SQLite. Completion, cancellation, expiry, logout,
+service shutdown, or stale App/key settings invalidate the flow. Local token discard does not
+claim provider-side revocation. GitHub user authorization is separate from both Pocket ID login
+and model-provider authentication.
+
+Connection metadata does not establish worker readiness or grant approval. Selecting a repository
+reloads the controller. If it matches a complete saved Runtime configuration, readiness checks can
+pass and scans can resume, including model use. Saved Runtime authority remains valid on reconnect;
+selection does not grant new coding approval.
+
+A different selected repository stops dispatch until the Runtime binding matches. Review its worker
+and policy before applying. The UI clears the previous target's image and forbidden-path draft when
+the connection identity changes, including changes from another tab. Ordinary status refresh keeps
+same-target drafts and validation errors. If the connection is removed, advanced identity controls
+become editable again.
+
+### One-time service operator setup
+
+The service operator opens **GitHub App → Service operator setup**, uploads the existing App RSA
+PEM, and saves the App ID, OAuth client secret, and webhook secret. The server authenticates as
+the App to discover its client ID and slug. Only presence flags are returned for secrets. Omitted
+secrets retain matching App settings; a matching legacy webhook secret can be imported on the
+first save. Changing App identity does not reuse the previous App's secrets or verified connection.
+Saving a client secret does not prove that GitHub has accepted it; the OAuth callback does that.
+Client-secret input removes accidental surrounding whitespace before validation. Empty values and
+embedded control characters are rejected. Webhook-secret whitespace is not changed because it must
+match GitHub exactly. Before setup is complete, **Connect GitHub** opens the setup section and
+focuses its first missing field instead of remaining disabled.
+
+Register the exact URLs shown in the form with the existing GitHub App:
+
+- **User authorization callback URL:** `https://reina.narumi.dev/auth/github/callback`.
+- **Setup URL:** `https://reina.narumi.dev/auth/github/setup`.
+- Enable **Redirect on update**, so installation repository changes return to Reina.
+- Leave **Request user authorization (OAuth) during installation** disabled. Reina explicitly
+  starts OAuth with its callback, state, and PKCE challenge before installation.
+
+Use the UI's URLs when `PUBLIC_URL` differs. The GitHub App owner must perform registration,
+client-secret creation, MFA, and consent on GitHub. Do not put secrets in chat, URLs, or proxy logs.
+The service App settings and verified connection use the existing encrypted secrets table;
+settings schema 3 and existing model credentials remain unchanged. Legacy dispatch settings are
+not automatically deleted or used to override saved App settings.
+
+GitHub's [setup URL documentation](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/about-the-setup-url)
+explains the untrusted installation ID. The [user-token documentation](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app)
+defines the OAuth client secret, PKCE, and user installation access checks.
+
+### GitHub connection verification on 2026-11-13
+
+- `npm run ci`: 1,482 credential-free tests passed, including App/connection storage,
+  controller binding, fixed-host transport, PKCE/state, callback replay/ownership, cancellation,
+  credential rewrite/ABA, and late-completion checks. Build, Biome, Changesets, and whitespace
+  checks passed.
+- A real HTTPS/SQLite/administrative API browser fixture passed at 320, 390, and 1440 pixels.
+  GitHub authorization/installation pages and transport were isolated fixtures, not live accounts.
+  The fixture verified one-time legacy webhook migration, existing installation reuse, OAuth and
+  Setup callbacks, repository selection without typed IDs, live access refresh, secret redaction,
+  Runtime identity inheritance, different-target policy separation, draft preservation, and cancel.
+- Thirty-four separate mock-browser scenarios covered strict CSP/Trusted Types, origin validation
+  with and without the Origin API, malformed navigation targets, pending-action serialization,
+  callback errors, missing/expired installations, and one-time operator setup.
+- The Compose fixture passed. All 13 runtime cases passed in the new controller image on the
+  Linux daemon with private identical-path staging and a local model protocol fixture. The
+  macOS-host Unix-socket limitation remains. The target's initial Biome blocker used the older
+  preparation limits; the owner subsequently authorized the capacity increase described below.
+- Source review identified cached-only repository refresh. Explicit **Refresh repositories** now
+  performs a CSRF-protected POST and rechecks live user access; lazy view/status GETs remain local
+  and do not make GitHub requests. Revoked choices cannot be selected from the old cache.
+
+At that initial deployment, the management image was healthy. Existing model credentials,
+selected model, App PEM, settings schema 3, and job schema 5 were preserved. Public connection
+APIs denied anonymous requests with HTTP 401, unauthenticated callbacks redirected to login,
+and incomplete dispatch returned HTTP 503. No coding job, review, or live provider request was
+created during that deployment check.
+The pre-deployment private backup is
+`/Users/narumi/.local/state/reina/backups/20261113T144706Z-github-connect`; it includes both database
+backups, the private environment, and the previous immutable controller image ID. Keep its
+permissions private and retain the original encryption key.
+
+**Initial App owner handoff:** configure the OAuth client secret and exact GitHub callback/Setup
+URLs in **Service operator setup** and GitHub, then perform real consent and installation.
+Fixture success alone does not establish GitHub consent, organization approval, or a working
+production callback. The owner subsequently completed real authorization and selected this
+repository. Worker preparation was a separate blocker resolved by the capacity change below.
+Do not send secrets through chat.
+
+## Runtime settings
+
+Use **Runtime** for the immutable worker image, allowed paths, forbidden paths, and verification
+commands. **Connect GitHub** fills App and repository identity automatically. Legacy manual identity
+fields remain under **Advanced GitHub identity** for existing operator workflows.
+The advanced section exposes the existing scan, time, file, and patch-size limits. Concurrency
+remains fixed at one coding job. No dispatch environment variable is required.
+
+Enter one path pattern per line. Forbidden paths must name the target's security and deployment
+source domains; Reina cannot infer a complete safe policy. Enter verification commands as JSON
+argv arrays, for example `[["npm","run","ci"]]`, not shell command strings. Prepare the worker
+before entering its immutable image ID; the form does not build images or weaken runtime controls.
+
+Select **Save and apply configuration** to persist and apply an immutable configuration snapshot.
+Saving complete settings can start scans and use model quota. Coding still requires an exact,
+fresh human approval. A successful save is not proof that dispatch is running; inspect runtime
+status. Refreshing status does not replace unsaved form edits.
+
+The complete runtime record is AES-256-GCM encrypted in the existing settings schema 3. Responses
+omit the webhook secret and report only its presence. Without matching service App settings, the first save requires a webhook secret of at least
+32 characters. With a configured service App, Runtime inherits its matching secret. Leave the
+secret field blank on later saves to keep the saved value. The browser
+never receives the stored secret. Requests require an allowed session, exact Origin, and CSRF.
+Runtime save requests are bounded at 512 KiB to include the permitted path lists, verification
+argv, UTF-8 expansion, and JSON overhead; individual schema limits still apply.
+
+Existing dispatch environment configuration remains a fallback only when no runtime record exists.
+A saved record is authoritative, including when stale environment variables are present. Invalid
+or undecryptable saved state fails closed; it does not reactivate the legacy configuration. After
+saving the existing App ID and webhook secret in **Runtime**, remove their legacy environment
+settings and the other dispatch variables. Keep the original encryption key and login bootstrap.
+No settings schema migration or credential reset is required.
+
 ## Onboarding
 
 Obtain authorization for paid provider use and test-repository changes before completing dispatch
@@ -132,10 +265,11 @@ configuration. Once all settings are ready, the controller can start scans and p
 A saved setting is not proof of successful remote authentication or provider compatibility.
 
 1. Sign in with a Pocket ID account that belongs to an allowed group.
-2. Open **GitHub App** and upload the App's unencrypted RSA private key in PEM format.
-   - The key must be at least 2048 bits and no larger than 32 KiB.
-   - The UI shows configured status, upload time, and a SHA-256 public-key fingerprint.
-   - The saved PEM is never returned. Replacement and deletion are supported.
+2. Open **GitHub App** and select **Connect GitHub**. Authorize the service App and choose an
+   accessible repository; use **Install or manage App** if repository access is missing.
+   - The service operator must first complete the one-time App setup above.
+   - Ordinary connecting users do not upload PEM files or enter App/repository/installation IDs.
+   - Connection does not start coding or replace the separate worker/policy review.
 3. Open **Models**, select **Configure provider**, then use **Select authentication method** to
    choose **Sign in with an account** or **Sign in with an API key**. In **Select provider**, search
    providers for that method and select **Continue**.
@@ -165,11 +299,11 @@ A saved setting is not proof of successful remote authentication or provider com
    - Non-Codex SDK output caps are at most 4,096 tokens, or the lower saved limit. Codex does
      not enforce that upstream token cap; see [provider methods and limits](#provider-methods-and-limits).
    - The catalog is static SDK metadata, not a live account entitlement check.
-6. Complete the App, repository, policy, and immutable worker settings in the environment file.
+6. Complete the App, repository, policy, and immutable worker settings under **Runtime**.
    Follow [GitHub App configuration](../README.md#configure-the-github-app) and
-   [worker preparation](../README.md#prepare-a-target-worker), then restart for environment changes.
-   `APP_ID` and `WEBHOOK_SECRET` remain environment settings. Remove legacy model environment
-   variables; `loadConfig` rejects them. Model credentials are managed only in the UI.
+   [worker preparation](../README.md#prepare-a-target-worker), then save and apply the configuration.
+   App ID and webhook secret are Web UI settings, not required bootstrap variables. Model
+   credentials are managed only in the UI.
 7. Select **Refresh status** to inspect runtime status. Use **Apply configuration** to retry after
    fixing an external dependency. This is not a provider connection test.
 
@@ -244,17 +378,127 @@ provider-side token revocation and does not log out of Reina or Pocket ID.
 Deleting a selected model or provider also clears selection and stops dispatch. Deleting a
 provider deletes its models and credential. Deleting the App key disables dispatch.
 
+### Runtime settings verification on 2026-11-13
+
+The Runtime form, encrypted storage, write-only webhook secret, legacy fallback, and saved-setting
+priority passed 1,299 credential-free tests and the TypeScript build. An isolated HTTPS browser
+check used the real SQLite and administrative API at 320, 390, and 1440 pixels. It verified
+login/group/CSRF checks, native and server-side validation, error focus, secret retention,
+refresh draft preservation, and reload persistence. A separate mock-browser check covered pending
+request locking and duplicate-submit prevention. No live model request was made.
+
+The host runtime command passed the Compose fixture but could not run its 13 runtime cases because
+macOS-host Unix sockets were unavailable to Linux workers. Running the same 13 cases in the current
+controller image on the Linux daemon with short, identically mounted private staging paths passed
+all cases. This includes real Pi with a local protocol fixture, not a paid provider. This evidence
+does not establish acceptance on a different production Linux host.
+
+The management image was deployed with existing settings, key, and selected model preserved.
+In that initial run, all ten label definitions were created, but dispatch was unconfigured and
+issue #16 had no bot summary or reviewed labels. Its approved target commit was
+`16ea0177d9dfb524d921500624299388db77258d`. Worker preparation stopped at
+`dependency_download_limit`: the preparation script downloads incompatible optional platform
+packages. All 308 unique tarballs total 652.054 MiB, above the unchanged 128 MiB download budget.
+Filtering to the actual Linux arm64/glibc platform would reduce downloads to 69.612 MiB, but does
+not resolve the next boundary: the integrity-verified Linux Biome 2.6.4 binary is 80,354,976 bytes
+(76.632 MiB), above the unchanged 32 MiB per-export-file limit.
+
+This initial run could not start live triage with the old limits. The owner subsequently
+explicitly authorized increased preparation capacity; the current bounds are documented below.
+Do not omit required dev dependencies, change the approved lockfile, relabel an incompatible image,
+or reset review state to force a retry. No coding approval,
+coding job, or pull request was created. Both databases and the private environment were backed up
+before deployment. Keep their original encryption key and restrict access to the backups.
+
+### Dependency preparation capacity
+
+The owner authorized raising the fixed dependency-preparation limits to support this repository's
+native tooling. Each tarball/import is bounded at 64 MiB; cumulative downloads at 1 GiB; each
+exported dependency file at 128 MiB; and total exported dependency content at 512 MiB. The raw
+Docker dependency archive read is bounded at 576 MiB and dependency JSON input at 96 MiB. The
+preparation-only workspace is 2 GiB. No environment variable or operator toggle is added.
+
+Ordinary coding workspaces remain 256 MiB. Temporary files remain 64 MiB, memory 2 GiB, CPU one,
+and process count 128. SHA512, registry-only downloads, approved manifest/lock fingerprints,
+lifecycle-disabled offline installation, read-only root, no network, no capabilities, seccomp,
+path/symlink validation, deadlines, and cleanup remain required. The preparation probe validates
+its separate workspace size; it does not accept the larger quota for ordinary coding jobs.
+
+### Worker activation verification on 2026-11-13
+
+The actual target worker prepared successfully from commit
+`16ea0177d9dfb524d921500624299388db77258d` with immutable image ID
+`sha256:8c0047d1e0013c144519355a4123e9d6689db666ed1903874d856eeecfce99ae`.
+Its manifest and lock SHA-256 labels match the approved source. Current main
+`0340693712ca6dae983cb7ffd17ed32903a29563` changes only `scripts/pre-commit.sh`;
+its dependency fingerprints are identical. An offline, read-only container verified Biome 2.6.4,
+its 80,354,976-byte Linux arm64 binary, and TypeScript 7.0.2. Preparation resources were removed.
+
+Capacity changes passed 67 boundary tests, the complete CI suite, the Compose fixture, and all
+13 Linux runtime cases. A subsequent live scan exposed SDK token classification: the token-only
+SDK labels a JWT-shaped installation token as an App token. The boundary now uses exact token
+identity and trusted installation-issuance metadata instead of the syntax guess. Installation ID,
+single repository, expiry, and issuance permission checks remain required. Regression tests use
+the real installed SDK and deny missing or different-token proof.
+
+The live Codex endpoint returned HTTP 200 and valid SSE without a `Content-Type` header. Only
+the Codex adapter accepts that omitted header; explicit incorrect MIME types and missing MIME
+for other APIs are rejected. SDK event validation, origin/DNS restrictions, response-byte limits,
+deadlines, and completion checks remain required. A bounded live diagnostic completed. CI passes
+1,566 tests. The Compose fixture and all 13 Linux runtime cases passed after these corrections.
+Compose cleanup now includes its setup profile and asserts that its own networks are removed.
+Twelve empty, label-verified old Reina test networks were removed after they exhausted the daemon's
+address pool. No unrelated network or active resource was removed.
+
+The private pre-activation backup is
+`/Users/narumi/.local/state/reina/backups/20261113T152928Z-worker-capacity`.
+It contains both SQLite backups, the private environment, and the prior controller image ID.
+Keep its directory at `0700`, files at `0600`, and the original encryption key. Stop the single
+controller before restoring compatible state and image together; reconcile remote GitHub state.
+Never clear delivery, review, attempt, approval, or publication records to force a retry.
+
+The single controller uses encrypted Runtime settings and reports `runtime_ready` for repository
+1444545958 and installation 181493531. Deployed controller image:
+`sha256:41356fa222c5a23088b9ca4f5f2607b1251a86a63a5b202990d77aa54e606d08`.
+No new environment variables were added. Policy protects application, worker, script, frontend,
+GitHub, and agent-instruction source paths.
+
+### Live issue verification on 2026-11-13
+
+The owner authorized capacity changes, bounded model use, and a read-only test. After correcting
+both transport failures, a new [test comment](https://github.com/narumiruna/reina/issues/16#issuecomment-6858020178)
+clarified the expected assessment and labels. It used normal webhook intake with changed issue
+evidence. No delivery, review, attempt, or approval state was manually deleted or reset.
+
+At 15:57 UTC, `gpt-6.1-sol` completed the assessment and `reinabot[bot]` published
+[one triage summary](https://github.com/narumiruna/reina/issues/16#issuecomment-6858080755).
+The App classified the issue as a test without an actionable code defect and returned
+`needs_human`. GitHub confirms `bot:triaged` and `bot:needs-human`; numeric bot author 355975874
+made both label changes and removed the previous `bot:triage-failed`. No label was applied
+manually to claim success.
+
+Durable review revision `8dc1483c-c321-4181-b24a-d134fc4c5bb3` is `complete`, with one attempt
+for the new evidence, matching published revision, comment ID 6858080755, and no saved error.
+The controller is healthy. Jobs, approvals, and proposals remain at zero; no issue-16 PR exists.
+No owned job staging, worker containers, preparation resources, or test networks remain.
+
+The initial background scan also encountered issue #12 before the model-stream correction.
+Its permanent `pi_agent_error` and attempt record remain unchanged; it was not retried by resetting
+state. This verification covers #16, not all open issues. Coding approval, useful fixes, PR creation,
+provider billing, restore acceptance, and deployment on a different host remain outside this test.
+
 ## Applying settings and failures
 
 Every successful settings mutation requests a controller reload. The controller first disables
 webhook dispatch and stops current jobs. It then creates a new immutable runtime configuration
-snapshot from the environment and saved selection. Workers cannot change that snapshot.
+snapshot from saved runtime settings, bootstrap storage, and the selected model. Legacy dispatch
+environment values apply only before the first runtime save. Workers cannot change that snapshot.
 Schedule configuration changes for a maintenance period; they can cancel current work.
 
 | Runtime state    | Operator action                                                                        |
 | ---------------- | -------------------------------------------------------------------------------------- |
 | `starting`       | Wait for application, then refresh settings. Webhooks return HTTP 503.                 |
-| `not_configured` | Complete the model, App key, or environment settings indicated by the reason.          |
+| `not_configured` | Complete the model, App key, or Runtime settings indicated by the reason.              |
 | `running`        | Configuration is applied; still complete authorized external acceptance.               |
 | `failed`         | Check the reason, GitHub authentication, and sandbox controls. Do not relax isolation. |
 
@@ -265,8 +509,8 @@ records to force a retry. Missing runtime controls never enable host execution.
 
 ## Secret storage and recovery
 
-The App PEM and typed provider credentials are encrypted with AES-256-GCM in private
-`settings.sqlite` next to the job database. OAuth envelopes retain the complete SDK access/refresh
+The runtime settings, webhook secret, App PEM, and typed provider credentials are encrypted with
+AES-256-GCM in private `settings.sqlite` next to the job database. OAuth envelopes retain the complete SDK access/refresh
 tokens and provider-specific fields. The encryption key comes from `ENCRYPTION_KEY`, not the
 database. Settings responses return metadata and credential-presence flags only; setup responses
 contain bounded prompts, verification links/user codes, progress, and result metadata, never tokens.
@@ -483,5 +727,7 @@ For incident checks, distinguish `triage_started` from `triage_decision` (valida
 correlation metadata, not issue bodies, questions, raw model text, or secrets. `bot:triage-failed`
 is separate from execution `bot:failed`; label writes can remain pending during GitHub outages.
 
-No live acceptance is claimed. See [architecture and operations](architecture.md) for isolation
-limits and publication recovery.
+The historical fixture results alone do not establish live acceptance. The narrow
+[live issue verification](#live-issue-verification-on-2026-11-13) above records #16's real result;
+it does not establish acceptance of the separate coding and approval scenarios. See
+[architecture and operations](architecture.md) for isolation limits and publication recovery.

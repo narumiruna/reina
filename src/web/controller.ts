@@ -1,7 +1,7 @@
 import { Probot } from "probot"
 import { DockerRuntime } from "../agent/sandbox.js"
 import { register } from "../app.js"
-import { loadConfig } from "../config.js"
+import { loadRuntimeConfig, stateDirectorySchema } from "../config.js"
 import { boundaryFactory, installationClient, LimitedOctokit } from "../github/clients.js"
 import { numericId } from "../github/scanner.js"
 import { Orchestrator } from "../jobs/orchestrator.js"
@@ -111,11 +111,30 @@ export class Controller {
       this.currentStatus = { state: "not_configured", reason: "upload_private_key" }
       return
     }
-    let environment: ReturnType<typeof loadConfig>
+    // Read saved settings outside the legacy-validation catch. Corrupt saved data fails closed.
+    const saved = this.settings.dispatchSettings()
+    const appSettings = this.settings.githubAppSettings()
+    const connection = this.settings.githubConnection()
+    let configured: ReturnType<typeof loadRuntimeConfig>
     try {
-      environment = loadConfig(this.env)
+      configured = saved
+        ? { ...saved, stateDir: stateDirectorySchema.parse(this.env.REINA_STATE_DIR) }
+        : loadRuntimeConfig(this.env)
     } catch {
-      this.currentStatus = { state: "not_configured", reason: "configure_environment" }
+      this.currentStatus = { state: "not_configured", reason: "configure_runtime" }
+      return
+    }
+    const { appId, webhookSecret, ...environment } = configured
+    if (
+      (appSettings && appSettings.appId !== appId) ||
+      (connection &&
+        (connection.appId !== appId ||
+          connection.repository.id !== environment.repository.id ||
+          connection.repository.installationId !== environment.repository.installationId ||
+          connection.repository.owner !== environment.repository.owner ||
+          connection.repository.name !== environment.repository.name))
+    ) {
+      this.currentStatus = { state: "not_configured", reason: "configure_runtime" }
       return
     }
     const config = { ...environment, ...selection }
@@ -125,9 +144,9 @@ export class Controller {
     const stale = () => this.stopping || generation !== this.generation
     try {
       const app = new Probot({
-        appId: this.env.APP_ID,
+        appId,
         privateKey,
-        secret: this.env.WEBHOOK_SECRET,
+        secret: appSettings?.webhookSecret ?? webhookSecret,
         Octokit: LimitedOctokit,
         logLevel: "info",
         logFormat: "json",

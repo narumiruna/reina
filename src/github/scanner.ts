@@ -280,9 +280,9 @@ export class GitHub {
       (typeof current !== "object" ||
         current === null ||
         !("token" in current) ||
+        // The token-only SDK guesses tokenType from token syntax. Installation
+        // issuance metadata, not that guess, proves the exact token's authority.
         current.token !== this.installation.token ||
-        !("tokenType" in current) ||
-        current.tokenType !== "installation" ||
         this.installation.repositoryIds.length !== 1 ||
         numericId(this.installation.repositoryIds[0]) !== this.repository.id ||
         !Number.isFinite(Date.parse(this.installation.expiresAt)) ||

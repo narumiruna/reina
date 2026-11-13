@@ -19,6 +19,29 @@ if (document.body.dataset.page === "login") {
 
 function initializeAdmin() {
   let settings = null
+  let runtimeFormInitialized = false
+  let runtimeConnectionBinding
+  let runtimeServiceAppId
+  let runtimeSecretAppId
+  let githubAppFormInitialized = false
+  let githubView = null
+  let githubViewRequested = false
+  let githubNavigating = false
+  const callbackUrl = new URL(location.href)
+  const githubCallback = callbackUrl.searchParams.get("github_connect")
+  let githubCallbackError =
+    githubCallback && githubCallback !== "ready"
+      ? callbackUrl.searchParams.get("error") || githubCallback
+      : null
+  if (githubCallback) {
+    callbackUrl.searchParams.delete("github_connect")
+    callbackUrl.searchParams.delete("error")
+    history.replaceState(
+      null,
+      "",
+      `${callbackUrl.pathname}${callbackUrl.search}${callbackUrl.hash}`,
+    )
+  }
   let catalog = null
   let catalogRequest = null
   let busy = false
@@ -36,6 +59,22 @@ function initializeAdmin() {
     "openai-responses": "OpenAI Responses",
     "anthropic-messages": "Anthropic Messages",
     "google-generative-ai": "Google Generative AI",
+  }
+  const runtimeFields = {
+    appId: "runtime-app-id",
+    "repository.owner": "runtime-repository-owner",
+    "repository.name": "runtime-repository-name",
+    "repository.id": "runtime-repository-id",
+    "repository.installationId": "runtime-installation-id",
+    image: "runtime-image",
+    allowedPaths: "runtime-allowed-paths",
+    forbiddenPaths: "runtime-forbidden-paths",
+    commands: "runtime-commands",
+    scanIntervalMs: "runtime-scan-interval",
+    maxIssuesPerScan: "runtime-max-issues",
+    agentTimeoutMs: "runtime-agent-timeout",
+    maxChangedFiles: "runtime-max-files",
+    maxPatchBytes: "runtime-max-bytes",
   }
   const errorMessages = {
     invalid_request: "The request could not be processed. Reload the page and try again.",
@@ -85,8 +124,22 @@ function initializeAdmin() {
     file_read_failed: "The file could not be read. Select the PEM file again.",
     invalid_private_key:
       "Select an unencrypted RSA private key in PEM format (at least 2048 bits).",
+    github_connect_not_configured:
+      "GitHub connection is not configured for this service. Ask the service operator to complete App setup.",
+    github_connect_expired:
+      "This GitHub connection attempt expired. Choose Connect GitHub to start again.",
+    github_connect_failed:
+      "GitHub connection could not be completed. Choose Connect GitHub to try again. Your saved repository is unchanged.",
+    github_connect_access_denied:
+      "GitHub authorization was denied. Your saved repository is unchanged. You can connect again when ready.",
+    github_connect_stale:
+      "This GitHub connection attempt is no longer current. Choose Connect GitHub to start again.",
+    github_connect_limit:
+      "Too many GitHub connection attempts are active. Cancel an unused attempt or try again later.",
+    unsafe_github_url:
+      "GitHub returned an unsupported navigation URL. Navigation was stopped. Start a new connection.",
     payload_too_large:
-      "The request is too large. Keep PEM files within 32 KiB and API keys within 8,192 characters.",
+      "The request is too large. Keep runtime settings within 512 KiB, PEM files within 32 KiB, and API keys within 8,192 characters.",
     not_found: "This item no longer exists. Refresh settings and try again.",
     provider_not_found: "This provider no longer exists. Refresh settings and try again.",
     model_not_found: "This model no longer exists. Refresh settings and try again.",
@@ -181,10 +234,9 @@ function initializeAdmin() {
   async function loadSettings() {
     if (busy) return
     busy = true
-    const controls = [...document.querySelectorAll("button")].map((control) => [
-      control,
-      control.disabled,
-    ])
+    const controls = [...document.querySelectorAll("button, input, select, textarea")].map(
+      (control) => [control, control.disabled],
+    )
     controls.forEach(([control]) => {
       control.disabled = true
     })
@@ -211,6 +263,7 @@ function initializeAdmin() {
       $("settings-content").removeAttribute("aria-busy")
       if (settings) updateControls()
     }
+    if (settings && !$("github-page").hidden) await loadGithubView()
   }
 
   // Mutations are serialized. Inputs and close controls stay fixed while a request is pending.
@@ -227,10 +280,9 @@ function initializeAdmin() {
   }) {
     if (busy) return
     busy = true
-    const controls = [...document.querySelectorAll("button, input, select")].map((control) => [
-      control,
-      control.disabled,
-    ])
+    const controls = [...document.querySelectorAll("button, input, select, textarea")].map(
+      (control) => [control, control.disabled],
+    )
     controls.forEach(([control]) => {
       control.disabled = true
     })
@@ -238,6 +290,7 @@ function initializeAdmin() {
     ;(dialog || $("settings-content")).setAttribute("aria-busy", "true")
     status(target, "Saving changes…", "pending")
     let saved = false
+    const invalidControls = []
     try {
       let pem
       if (file) {
@@ -251,44 +304,87 @@ function initializeAdmin() {
       // Only the in-flight request retains a serialized secret.
       pem = undefined
       if (data?.apiKey) delete data.apiKey
-      await response
+      if (data?.webhookSecret) delete data.webhookSecret
+      if (data?.clientSecret) delete data.clientSecret
+      const result = await response
       saved = true
-      onSaved?.()
+      await onSaved?.(result)
       if (refresh) await refreshSettings()
       if (dialog?.open) dialog.close("saved")
-      status($("page-status"), success)
+      if (success !== undefined) status(dialog ? $("page-status") : target, success)
     } catch (error) {
       if (error.code !== "unauthorized") {
-        const message = saved
-          ? "Changes were saved, but settings could not be refreshed. Retry loading settings before making more changes."
-          : errorMessage(error)
+        if (
+          target === $("github-connect-status") &&
+          ["github_connect_expired", "github_connect_stale"].includes(error.code)
+        ) {
+          githubView = null
+          renderGithubView()
+        }
+        const message =
+          saved && error.code !== "unsafe_github_url"
+            ? "Changes were saved, but settings could not be refreshed. Retry loading settings before making more changes."
+            : errorMessage(error)
         if (saved && dialog?.open) dialog.close("saved")
-        status(saved ? $("page-status") : target, message, "error")
+        status(saved && dialog ? $("page-status") : target, message, "error")
         if (saved) {
           $("retry-settings").hidden = false
         } else if (form && error.fields?.length) {
-          let first
           for (const name of error.fields) {
-            const control = form.elements.namedItem(name)
-            if (!(control instanceof HTMLInputElement || control instanceof HTMLSelectElement))
-              continue
-            if (control.closest("details")) control.closest("details").open = true
-            control.setCustomValidity("Check this value and try again.")
-            syncValidation(control, true)
-            first ||= control
+            const names =
+              form.id === "runtime-form"
+                ? [...Object.keys(runtimeFields), "webhookSecret"].filter(
+                    (field) =>
+                      field === name ||
+                      field.startsWith(`${name}.`) ||
+                      name.startsWith(`${field}.`),
+                  )
+                : [name]
+            for (const field of names) {
+              const control = form.elements.namedItem(field)
+              if (
+                !(
+                  control instanceof HTMLInputElement ||
+                  control instanceof HTMLSelectElement ||
+                  control instanceof HTMLTextAreaElement
+                )
+              )
+                continue
+              if (control.closest("details")) control.closest("details").open = true
+              control.setCustomValidity("Check this value and try again.")
+              invalidControls.push(control)
+            }
           }
-          first?.focus()
         }
       }
     } finally {
-      busy = false
+      busy = githubNavigating
       controls.forEach(([control, disabled]) => {
-        if (control.isConnected) control.disabled = disabled
+        if (control.isConnected && !githubNavigating) control.disabled = disabled
       })
       ;(dialog || $("settings-content")).removeAttribute("aria-busy")
       // Freshly rendered controls did not exist when the pending state started.
       if (settings) updateControls()
+      for (const control of invalidControls) syncValidation(control, true)
+      invalidControls[0]?.focus()
       if (saved) focusAfterRemoval()
+      if (githubNavigating) {
+        // Browser Back can restore this disabled page from the back/forward cache.
+        window.addEventListener(
+          "pageshow",
+          () => {
+            githubNavigating = false
+            busy = false
+            controls.forEach(([control, disabled]) => {
+              if (control.isConnected) control.disabled = disabled
+            })
+            updateControls()
+            if (!$("github-page").hidden) void loadGithubView()
+          },
+          { once: true },
+        )
+      }
+      if (githubViewRequested && !busy) void loadGithubView()
     }
   }
 
@@ -328,9 +424,76 @@ function initializeAdmin() {
     $("logout-form").querySelector("button").disabled = !settings || busy
     $("clear-selection").hidden = !settings.selectedModelId
     $("delete-key").hidden = !settings.github.configured
+    const configured = settings.githubApp?.configured === true
+    $("github-connect").disabled = busy
+    const authorized =
+      ["select_repository", "install_required"].includes(githubView?.state) &&
+      (!Number.isFinite(githubView?.expiresAt) || githubView.expiresAt > Date.now())
+    $("github-refresh").disabled = busy || !configured || !authorized
+    $("github-install").disabled = busy || !configured
+    $("github-cancel").disabled = busy
+    $("github-repository-select").disabled = busy
+    $("github-use-repository").disabled = busy
+    $("github-save-app").disabled = busy || !settings.githubApp
+    const repositoryReview = !$("runtime-repository-review").hidden
+    $("reload-runtime").disabled = busy || repositoryReview
+    if (repositoryReview) $("runtime-settings-link").hidden = false
+  }
+
+  function populateRuntimeSettings(runtime) {
+    if (runtime) {
+      for (const [name, id] of Object.entries(runtimeFields)) {
+        const value = name.startsWith("repository.")
+          ? runtime.repository[name.slice("repository.".length)]
+          : runtime[name]
+        $(id).value =
+          name === "commands"
+            ? JSON.stringify(value, null, 2)
+            : Array.isArray(value)
+              ? value.join("\n")
+              : String(value)
+      }
+    }
+    // The safe settings view never supplies a secret to this write-only control.
+    $("runtime-webhook-secret").value = ""
+    resetValidation($("runtime-form"))
+    renderRuntimeSecretStatus(runtime)
+  }
+
+  function renderRuntimeSecretStatus(runtime = settings.runtimeSettings) {
+    const app = settings.githubApp
+    const appId = Number($("runtime-app-id").value)
+    if (runtimeSecretAppId !== undefined && runtimeSecretAppId !== appId) {
+      $("runtime-webhook-secret").value = ""
+      resetValidation($("runtime-webhook-secret").closest(".field"))
+    }
+    runtimeSecretAppId = appId
+    const inherited =
+      app?.webhookSecretConfigured === true &&
+      (app.clientSecretConfigured === true || app.configured === true) &&
+      positiveId(app.appId) &&
+      app.appId === appId
+    const configured =
+      inherited || (runtime?.webhookSecretConfigured === true && runtime.appId === appId)
+    const secret = $("runtime-webhook-secret")
+    secret.closest(".field").hidden = inherited
+    secret.required = !configured
+    if (inherited) secret.value = ""
+    $("runtime-secret-label").textContent = configured
+      ? "Webhook secret (optional replacement)"
+      : "Webhook secret (required for first save)"
+    $("runtime-secret-hint").textContent = configured
+      ? "Secret configured. Leave blank to keep it, or enter at least 32 characters to replace it. Use the same secret in your GitHub App webhook configuration. The saved secret is never displayed."
+      : "Write-only. Enter at least 32 characters for the first save. Use the same secret in your GitHub App webhook configuration. Saved secrets are never displayed."
   }
 
   function renderSettings() {
+    if (!runtimeFormInitialized) {
+      populateRuntimeSettings(settings.runtimeSettings)
+      runtimeFormInitialized = true
+    }
+    syncRuntimeConnection()
+    renderRuntimeSecretStatus()
     const providers = settings.providers
     const models = providers.flatMap((provider) =>
       provider.models.map((model) => ({ ...model, provider })),
@@ -353,7 +516,8 @@ function initializeAdmin() {
     }
     const reasons = {
       configure_model: "Choose a saved model to continue.",
-      upload_private_key: "Upload your GitHub App private key.",
+      upload_private_key: "Ask the service operator to complete GitHub App setup.",
+      configure_runtime: "Complete Runtime settings to continue.",
       configure_environment:
         "Server environment settings are incomplete. Contact your administrator.",
       cleanup_requires_operator_check:
@@ -365,6 +529,7 @@ function initializeAdmin() {
     const runtimeText = states[runtime.state] || "Runtime configuration"
     $("runtime-status").textContent =
       `${runtimeText}. ${reasons[runtime.reason] || (selected ? `Selected model: ${selected.name}.` : "No model selected.")}`
+    $("runtime-settings-link").hidden = runtime.reason !== "configure_runtime"
     $("github-badge").textContent = settings.github.configured ? "Key configured" : "Not configured"
     $("github-badge").classList.toggle("good", settings.github.configured)
     $("github-fingerprint").textContent = settings.github.configured
@@ -383,7 +548,269 @@ function initializeAdmin() {
     $("upload-key").textContent = settings.github.configured
       ? "Replace private key"
       : "Upload private key"
+    renderGithubSettings()
     updateControls()
+  }
+
+  function positiveId(value) {
+    return Number.isSafeInteger(value) && value > 0
+  }
+
+  function syncRuntimeConnection() {
+    const names = [
+      "appId",
+      "repository.owner",
+      "repository.name",
+      "repository.id",
+      "repository.installationId",
+    ]
+    const binding = (values) =>
+      values.every((value) => value !== "") ? JSON.stringify(values) : null
+    const connection = settings.githubConnection
+    const values = connection
+      ? names.map((name) =>
+          String(name === "appId" ? connection.appId : connection.repository[name.slice(11)]),
+        )
+      : null
+    const nextBinding = values ? binding(values) : null
+    const formBinding = binding(names.map((name) => $(runtimeFields[name]).value))
+    const previousBinding = runtimeConnectionBinding || formBinding
+    const serviceAppId = positiveId(settings.githubApp?.appId) ? settings.githubApp.appId : null
+    const appChanged = runtimeServiceAppId !== undefined && runtimeServiceAppId !== serviceAppId
+    const disconnected = Boolean(runtimeConnectionBinding && !connection)
+    const appId = connection?.appId ?? serviceAppId
+    const initialAppMismatch =
+      runtimeServiceAppId === undefined &&
+      previousBinding &&
+      positiveId(appId) &&
+      Number($("runtime-app-id").value) !== appId
+    const targetChanged =
+      (connection && previousBinding && previousBinding !== nextBinding) ||
+      disconnected ||
+      (appChanged && (runtimeServiceAppId !== null || previousBinding)) ||
+      initialAppMismatch
+    if (targetChanged) {
+      $("runtime-image").value = ""
+      $("runtime-forbidden-paths").value = ""
+      $("runtime-repository-review").hidden = false
+      $("runtime-repository-review").textContent =
+        "Repository or App identity changed. Stored Runtime settings were not changed. The worker image and forbidden paths were cleared in this form. Review the allowed paths, verification commands, and limits for this target before saving and applying."
+    }
+    if (appChanged) {
+      githubAppFormInitialized = false
+      $("github-app-id").value = serviceAppId === null ? "" : String(serviceAppId)
+      $("github-client-secret").value = ""
+      $("github-webhook-secret").value = ""
+      resetValidation($("github-app-form"))
+    }
+    for (const [index, name] of names.entries()) {
+      const control = $(runtimeFields[name])
+      control.readOnly = Boolean(connection)
+      if (values) control.value = values[index]
+    }
+    if (!connection && (runtimeServiceAppId === undefined || appChanged || disconnected)) {
+      if (positiveId(appId)) $("runtime-app-id").value = String(appId)
+      else if (appChanged) $("runtime-app-id").value = ""
+    }
+    $("runtime-connection-status").textContent = connection
+      ? `Connected repository: ${connection.repository.owner}/${connection.repository.name}. Identity is supplied by Connect GitHub. An exact match to the complete saved Runtime configuration can restart scans and use model quota. New or changed worker settings and policy require Runtime Save and apply. Coding still requires explicit approval.`
+      : "No connected repository. Connect GitHub to select a verified repository, or use Advanced GitHub identity to enter a manual target."
+    runtimeConnectionBinding = nextBinding
+    runtimeServiceAppId = serviceAppId
+  }
+
+  function updateGithubSecretRequirements() {
+    const app = settings?.githubApp
+    // A legacy webhook can exist before the first service App save.
+    const sameApp = !positiveId(app?.appId) || Number($("github-app-id").value) === app.appId
+    for (const [id, configured, label] of [
+      ["github-client-secret", app?.clientSecretConfigured, "Client secret"],
+      ["github-webhook-secret", app?.webhookSecretConfigured, "Webhook secret"],
+    ]) {
+      const required = !sameApp || !configured
+      $(id).required = required
+      $(`${id}-label`).textContent = `${label} (${required ? "required" : "optional replacement"})`
+    }
+  }
+
+  function missingGithubSetupFields() {
+    const app = settings?.githubApp
+    if (!app) return []
+    return [
+      ["GitHub App ID", "github-app-id", positiveId(app.appId)],
+      ["App private key", "private-key", app.privateKeyConfigured],
+      ["OAuth client secret", "github-client-secret", app.clientSecretConfigured],
+      ["Webhook secret", "github-webhook-secret", app.webhookSecretConfigured],
+    ].filter(([, , configured]) => !configured)
+  }
+
+  function renderGithubSettings() {
+    const app = settings.githubApp
+    const connection = settings.githubConnection
+    $("github-service-notice").hidden = app?.configured === true
+    $("github-connection-badge").textContent = connection ? "Repository connected" : "Not connected"
+    $("github-connection-badge").classList.toggle("good", Boolean(connection))
+    $("github-connection-metadata").hidden = !connection
+    if (connection) {
+      const repository = connection.repository
+      $("github-current-repository").textContent =
+        `${repository.owner}/${repository.name} · Repository ID ${repository.id} · Installation ID ${repository.installationId} · App ID ${connection.appId}`
+      $("github-current-user").textContent =
+        `${connection.user.login} · User ID ${connection.user.id}`
+      const connectedAt = new Date(connection.connectedAt)
+      $("github-connected-at").textContent = Number.isFinite(connectedAt.getTime())
+        ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(
+            connectedAt,
+          )
+        : "Date unavailable"
+    }
+    $("github-connect").textContent = connection
+      ? "Connect GitHub / change repository"
+      : "Connect GitHub"
+    if (app?.configured !== true) {
+      $("github-connect").setAttribute("aria-controls", "github-service-setup")
+      $("github-connect").setAttribute("aria-expanded", String($("github-service-setup").open))
+    } else {
+      $("github-connect").removeAttribute("aria-controls")
+      $("github-connect").removeAttribute("aria-expanded")
+    }
+    $("github-callback-url").textContent = app?.callbackUrl || "Unavailable in this service version"
+    $("github-setup-url").textContent = app?.setupUrl || "Unavailable in this service version"
+    $("github-service-status").textContent = app
+      ? `Client secret: ${app.clientSecretConfigured ? "configured" : "not configured"}. Webhook secret: ${app.webhookSecretConfigured ? "configured" : "not configured"}. Private key: ${app.privateKeyConfigured ? "configured" : "not configured"}.`
+      : "Service App status is unavailable. Ask the service operator to update Reina before using Connect GitHub."
+    if (!githubAppFormInitialized) {
+      if (positiveId(app?.appId)) $("github-app-id").value = String(app.appId)
+      githubAppFormInitialized = true
+    }
+    updateGithubSecretRequirements()
+  }
+
+  function renderGithubView() {
+    const expired = Number.isFinite(githubView?.expiresAt) && githubView.expiresAt <= Date.now()
+    const state = expired ? "idle" : githubView?.state || "idle"
+    const repositories = githubView?.repositories || []
+    const canSelect = state === "select_repository" && repositories.length > 0
+    const authorized = ["select_repository", "install_required"].includes(state)
+    const select = $("github-repository-select")
+    const previous = select.value
+    select.replaceChildren(
+      new Option("Choose a repository", ""),
+      ...repositories.map((repository) => new Option(repository.fullName, String(repository.id))),
+    )
+    select.value = previous
+    if (select.selectedIndex < 0) select.value = ""
+    $("github-repository-form").hidden = !canSelect
+    $("github-install").hidden = !authorized
+    $("github-install-help").hidden = !authorized
+    $("github-cancel").hidden = state === "idle"
+    const user = githubView?.user?.login ? ` as ${githubView.user.login}` : ""
+    const missing = missingGithubSetupFields().map(([label]) => label)
+    const messages = {
+      idle:
+        settings.githubApp?.configured === true
+          ? "Choose Connect GitHub to authorize an account and select a repository. Your saved repository, if any, stays unchanged until you choose Use repository."
+          : missing.length
+            ? `Missing service settings: ${missing.join(", ")}. Choose Connect GitHub to open the required setup fields.`
+            : "GitHub service status is unavailable. Refresh settings or contact the service operator.",
+      connecting:
+        "GitHub authorization has started. Complete authorization on GitHub, or cancel this attempt and connect again.",
+      select_repository: canSelect
+        ? `GitHub authorized${user}. Choose a repository, then choose Use repository to save it. Use Install / manage App to add repositories.`
+        : `GitHub authorized${user}, but no repositories are available. Install the App or request organization approval, then refresh repositories.`,
+      install_required: `GitHub authorized${user}. No App installation with an available repository was found. Install the App or request organization approval, then refresh repositories.`,
+    }
+    const code = githubCallbackError || (expired ? "github_connect_expired" : null)
+    status(
+      $("github-connect-status"),
+      code
+        ? Object.hasOwn(errorMessages, code) && code.startsWith("github_connect_")
+          ? errorMessages[code]
+          : errorMessages.github_connect_failed
+        : messages[state],
+      code ? "error" : state === "idle" && settings.githubApp?.configured !== true ? "pending" : "",
+    )
+    githubCallbackError = null
+  }
+
+  async function loadGithubView() {
+    if (!settings || busy || $("github-page").hidden) return
+    githubViewRequested = false
+    if (settings.githubApp?.configured !== true) {
+      githubView = null
+      renderGithubView()
+      return
+    }
+    busy = true
+    const controls = [...document.querySelectorAll("button, input, select, textarea")].map(
+      (control) => [control, control.disabled],
+    )
+    controls.forEach(([control]) => {
+      control.disabled = true
+    })
+    $("github-page").setAttribute("aria-busy", "true")
+    status($("github-connect-status"), "Checking GitHub connection…", "pending")
+    try {
+      applyGithubView(await request("/api/github/connect"))
+    } catch (error) {
+      githubView = null
+      renderGithubView()
+      if (error.code !== "unauthorized")
+        status($("github-connect-status"), errorMessage(error), "error")
+    } finally {
+      busy = false
+      controls.forEach(([control, disabled]) => {
+        if (control.isConnected) control.disabled = disabled
+      })
+      $("github-page").removeAttribute("aria-busy")
+      updateControls()
+    }
+  }
+
+  function applyGithubView(view) {
+    if (
+      !["idle", "connecting", "select_repository", "install_required"].includes(view.state) ||
+      !Array.isArray(view.repositories) ||
+      !view.repositories.every(
+        (repository) =>
+          positiveId(repository.id) &&
+          positiveId(repository.installationId) &&
+          [repository.owner, repository.name, repository.fullName].every(
+            (value) => typeof value === "string" && value.length > 0,
+          ),
+      )
+    )
+      throw { code: "invalid_response" }
+    githubView = view
+    renderGithubView()
+  }
+
+  function navigateGithub(result, installation = false) {
+    try {
+      const url = new URL(result.url)
+      const trusted = "https://github.com"
+      const sameOrigin =
+        "Origin" in globalThis
+          ? Origin.from(url).isSameOrigin(Origin.from(trusted))
+          : url.origin !== "null" && url.origin === new URL(trusted).origin
+      const allowedPath = installation
+        ? /^\/apps\/[a-z0-9](?:[a-z0-9-]{0,98}[a-z0-9])?\/installations\/new$/.test(url.pathname)
+        : url.pathname === "/login/oauth/authorize"
+      if (
+        !sameOrigin ||
+        url.protocol !== "https:" ||
+        url.username ||
+        url.password ||
+        url.hash ||
+        !allowedPath
+      )
+        throw { code: "unsafe_github_url" }
+      githubNavigating = true
+      location.assign(url.href)
+    } catch {
+      githubNavigating = false
+      throw { code: "unsafe_github_url" }
+    }
   }
 
   function credentialStatus(provider) {
@@ -514,19 +941,26 @@ function initializeAdmin() {
   }
 
   function showPage({ focus = false } = {}) {
-    const github = location.hash === "#github"
-    $("models-page").hidden = github
-    $("github-page").hidden = !github
-    $("add-provider").hidden = github
-    $("page-title").textContent = github ? "GitHub App" : "Models"
-    $("page-description").textContent = github
-      ? "Give Reina a secure connection to your GitHub App."
-      : "Configure a provider. Select a model for Reina."
-    document.title = `${github ? "GitHub App" : "Models"} · Reina`
-    $("nav-models").toggleAttribute("aria-current", !github)
-    $("nav-github").toggleAttribute("aria-current", github)
-    ;(github ? $("nav-github") : $("nav-models")).setAttribute("aria-current", "page")
+    const pages = {
+      models: ["Models", "Configure a provider. Select a model for Reina."],
+      github: ["GitHub App", "Connect your GitHub account and choose a repository."],
+      runtime: ["Runtime", "Configure the repository, worker image, and runtime policy."],
+    }
+    const page = Object.hasOwn(pages, location.hash.slice(1)) ? location.hash.slice(1) : "models"
+    for (const name of Object.keys(pages)) {
+      $(`${name}-page`).hidden = name !== page
+      $(`nav-${name}`).removeAttribute("aria-current")
+    }
+    $("add-provider").hidden = page !== "models"
+    $("page-title").textContent = pages[page][0]
+    $("page-description").textContent = pages[page][1]
+    document.title = `${pages[page][0]} · Reina`
+    $(`nav-${page}`).setAttribute("aria-current", "page")
     if (focus) $("page-title").focus()
+    if (page === "github") {
+      githubViewRequested = true
+      if (settings && !busy) void loadGithubView()
+    }
   }
 
   function populateApiOptions(preferred = "") {
@@ -1050,7 +1484,7 @@ function initializeAdmin() {
   let validationAnnouncement
   let validationField
   function syncValidation(control, force = false, announce = false) {
-    if (!control.matches?.("input, select") || !control.dataset.error) return
+    if (!control.matches?.("input, select, textarea") || !control.dataset.error) return
     const invalid =
       force ||
       control.matches(":user-invalid") ||
@@ -1088,7 +1522,7 @@ function initializeAdmin() {
   }
 
   function resetValidation(form) {
-    for (const control of form.querySelectorAll("input, select")) {
+    for (const control of form.querySelectorAll("input, select, textarea")) {
       control.setCustomValidity("")
       control.setAttribute("aria-invalid", "false")
       const errorId = control.dataset.error
@@ -1104,7 +1538,7 @@ function initializeAdmin() {
     }
   }
 
-  for (const control of document.querySelectorAll("form input, form select")) {
+  for (const control of document.querySelectorAll("form input, form select, form textarea")) {
     const error = node("span", "field-error")
     error.id = `${control.id}-error`
     control.dataset.error = error.id
@@ -1268,6 +1702,259 @@ function initializeAdmin() {
     })
   })
 
+  function readRuntimePaths(id) {
+    const control = $(id)
+    const paths = control.value
+      .split(/\r?\n/)
+      .map((path) => path.trim())
+      .filter(Boolean)
+    if (
+      paths.length < 1 ||
+      paths.length > 64 ||
+      paths.some((path) => path.length > 256) ||
+      new Set(paths.map((path) => path.toLowerCase())).size !== paths.length
+    )
+      control.setCustomValidity(
+        "Enter 1–64 unique repository-relative patterns, one per line, with up to 256 characters each.",
+      )
+    return paths
+  }
+
+  function readRuntimeCommands() {
+    try {
+      const commands = JSON.parse($("runtime-commands").value)
+      if (
+        Array.isArray(commands) &&
+        commands.length >= 1 &&
+        commands.length <= 8 &&
+        commands.every(
+          (argv) =>
+            Array.isArray(argv) &&
+            argv.length >= 1 &&
+            argv.length <= 32 &&
+            argv.every(
+              (arg) =>
+                typeof arg === "string" &&
+                arg.length >= 1 &&
+                arg.length <= 4096 &&
+                !/[\0\r\n]/.test(arg),
+            ),
+        )
+      )
+        return commands
+    } catch {
+      // Parser messages can include input. Use a fixed, actionable message instead.
+    }
+    $("runtime-commands").setCustomValidity(
+      'Enter a JSON array of 1–8 argv arrays, such as [["npm","run","ci"]]. Each command needs 1–32 non-empty string arguments, up to 4,096 characters each, without line breaks or null characters.',
+    )
+    return []
+  }
+
+  $("runtime-form").addEventListener("submit", (event) => {
+    event.preventDefault()
+    if (busy) return
+    for (const id of ["runtime-app-id", "runtime-repository-id", "runtime-installation-id"]) {
+      if (!Number.isSafeInteger(Number($(id).value)) || Number($(id).value) < 1)
+        $(id).setCustomValidity("Enter a whole number from 1 to 9,007,199,254,740,991.")
+    }
+    const allowedPaths = readRuntimePaths("runtime-allowed-paths")
+    const forbiddenPaths = readRuntimePaths("runtime-forbidden-paths")
+    const commands = readRuntimeCommands()
+    const secret = $("runtime-webhook-secret")
+    if (secret.value && (secret.value.trim() !== secret.value || /[\p{Cc}]/u.test(secret.value)))
+      secret.setCustomValidity(
+        "Use at least 32 characters without leading or trailing spaces or control characters.",
+      )
+    if (!event.currentTarget.reportValidity()) return
+    const data = {
+      appId: Number($("runtime-app-id").value),
+      repository: {
+        owner: $("runtime-repository-owner").value.trim(),
+        name: $("runtime-repository-name").value.trim(),
+        id: Number($("runtime-repository-id").value),
+        installationId: Number($("runtime-installation-id").value),
+      },
+      image: $("runtime-image").value.trim(),
+      allowedPaths,
+      forbiddenPaths,
+      commands,
+      scanIntervalMs: Number($("runtime-scan-interval").value),
+      maxIssuesPerScan: Number($("runtime-max-issues").value),
+      maxConcurrentJobs: 1,
+      agentTimeoutMs: Number($("runtime-agent-timeout").value),
+      maxChangedFiles: Number($("runtime-max-files").value),
+      maxPatchBytes: Number($("runtime-max-bytes").value),
+    }
+    if (secret.value) data.webhookSecret = secret.value
+    secret.value = ""
+    void mutate({
+      path: "/api/runtime/settings",
+      method: "POST",
+      data,
+      form: $("runtime-form"),
+      target: $("runtime-form-status"),
+      success:
+        "Runtime settings saved and reload requested. Refresh status to check the applied state.",
+      onSaved: () => {
+        // Without saved service App settings, status derives its App ID from
+        // this Runtime save. That expected change must not clear the new policy.
+        if (settings.githubApp && !settings.githubApp.clientSecretConfigured) {
+          if (runtimeServiceAppId !== data.appId) {
+            githubAppFormInitialized = true
+            $("github-app-id").value = String(data.appId)
+            $("github-client-secret").value = ""
+            $("github-webhook-secret").value = ""
+            resetValidation($("github-app-form"))
+          }
+          runtimeServiceAppId = data.appId
+        }
+        populateRuntimeSettings({ ...data, webhookSecretConfigured: true })
+        $("runtime-repository-review").hidden = true
+      },
+    })
+  })
+
+  $("runtime-app-id").addEventListener("input", () => renderRuntimeSecretStatus())
+  $("runtime-app-id").addEventListener("change", () => renderRuntimeSecretStatus())
+
+  $("github-service-setup").addEventListener("toggle", () => {
+    if (settings && settings.githubApp?.configured !== true)
+      $("github-connect").setAttribute("aria-expanded", String($("github-service-setup").open))
+  })
+  $("github-connect").addEventListener("click", () => {
+    if (busy) return
+    if (!settings.githubApp?.configured) {
+      const missing = missingGithubSetupFields()
+      $("github-service-setup").open = true
+      status(
+        $("github-app-status"),
+        missing.length
+          ? `Complete the one-time service setup. Missing: ${missing.map(([label]) => label).join(", ")}.`
+          : "Service App status is unavailable. Refresh settings before continuing.",
+        "pending",
+      )
+      const control = missing[0]
+        ? $(missing[0][1])
+        : $("github-service-setup").querySelector("summary")
+      control.focus()
+      return
+    }
+    githubCallbackError = null
+    void mutate({
+      path: "/api/github/connect",
+      method: "POST",
+      target: $("github-connect-status"),
+      refresh: false,
+      success: "Opening official GitHub authorization in this tab…",
+      onSaved: (result) => navigateGithub(result),
+    })
+  })
+  $("github-install").addEventListener("click", () => {
+    void mutate({
+      path: "/api/github/connect/install",
+      method: "POST",
+      target: $("github-connect-status"),
+      refresh: false,
+      success: "Opening the official GitHub App installation page in this tab…",
+      onSaved: (result) => navigateGithub(result, true),
+    })
+  })
+  $("github-refresh").addEventListener("click", () => {
+    void mutate({
+      path: "/api/github/connect/refresh",
+      method: "POST",
+      target: $("github-connect-status"),
+      refresh: false,
+      onSaved: applyGithubView,
+    })
+  })
+  $("github-cancel").addEventListener("click", () => {
+    void mutate({
+      path: "/api/github/connect/cancel",
+      method: "POST",
+      target: $("github-connect-status"),
+      refresh: false,
+      success:
+        "GitHub connection attempt cancelled. Your saved repository and Runtime settings are unchanged.",
+      onSaved: () => {
+        githubView = null
+        renderGithubView()
+      },
+    })
+  })
+  $("github-repository-form").addEventListener("submit", (event) => {
+    event.preventDefault()
+    const repositoryId = Number($("github-repository-select").value)
+    if (
+      !positiveId(repositoryId) ||
+      !githubView?.repositories.some((repository) => repository.id === repositoryId)
+    )
+      return
+    void mutate({
+      path: "/api/github/connect/select",
+      method: "POST",
+      data: { repositoryId },
+      form: event.currentTarget,
+      target: $("github-connect-status"),
+      refresh: false,
+      success:
+        "Repository connected. An exact match to the complete saved Runtime configuration can restart scans and use model quota. New or changed worker settings and policy require Runtime Save and apply. Coding still requires explicit approval.",
+      onSaved: async () => {
+        await refreshSettings()
+        if (!settings.githubConnection) throw { code: "invalid_response" }
+        githubView = null
+        renderGithubView()
+      },
+    })
+  })
+  $("github-app-id").addEventListener("input", updateGithubSecretRequirements)
+  $("github-app-id").addEventListener("change", updateGithubSecretRequirements)
+  $("github-app-form").addEventListener("submit", (event) => {
+    event.preventDefault()
+    if (busy) return
+    const appId = Number($("github-app-id").value)
+    if (!positiveId(appId))
+      $("github-app-id").setCustomValidity("Enter a whole number from 1 to 9,007,199,254,740,991.")
+    updateGithubSecretRequirements()
+    const data = { appId }
+    for (const [id, name, minimum] of [
+      ["github-client-secret", "clientSecret", 1],
+      ["github-webhook-secret", "webhookSecret", 32],
+    ]) {
+      const control = $(id)
+      const value = name === "clientSecret" ? control.value.trim() : control.value
+      if (
+        control.value &&
+        (value.length < minimum ||
+          value.length > 4096 ||
+          value.trim() !== value ||
+          /[\p{Cc}]/u.test(value))
+      )
+        control.setCustomValidity(
+          name === "clientSecret"
+            ? "Paste only the client secret value from GitHub (1–4,096 characters, without embedded control characters)."
+            : `Use ${minimum}–4,096 characters without leading or trailing spaces or control characters.`,
+        )
+      if (value) data[name] = value
+    }
+    if (!event.currentTarget.reportValidity()) return
+    $("github-client-secret").value = ""
+    $("github-webhook-secret").value = ""
+    void mutate({
+      path: "/api/github/app",
+      method: "POST",
+      data,
+      form: event.currentTarget,
+      target: $("github-app-status"),
+      success:
+        "Service App settings saved. Complete any missing service credentials, then use Connect GitHub. Runtime configuration and coding approval remain separate.",
+      onSaved: () => {
+        githubAppFormInitialized = false
+      },
+    })
+  })
+
   $("github-form").addEventListener("submit", (event) => {
     event.preventDefault()
     if (busy) return
@@ -1405,6 +2092,9 @@ function initializeAdmin() {
   window.addEventListener("pagehide", () => {
     abandonSetup()
     $("provider-key").value = ""
+    $("runtime-webhook-secret").value = ""
+    $("github-client-secret").value = ""
+    $("github-webhook-secret").value = ""
     $("private-key").value = ""
   })
   populateApiOptions()

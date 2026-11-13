@@ -3,7 +3,8 @@ import { rm } from "node:fs/promises"
 
 const mode = process.argv[2]
 if (!["cache", "install"].includes(mode)) process.exit(1)
-const args = mode === "cache" ? ["cache", "add", "/tmp/dependency.tgz"] : ["ci", "--include=dev"]
+const args =
+  mode === "cache" ? ["cache", "add", "/workspace/dependency.tgz"] : ["ci", "--include=dev"]
 args.push(
   "--ignore-scripts",
   "--offline",
@@ -23,7 +24,7 @@ child.on("error", () => process.exit(1))
 const exit = await new Promise((resolve) => child.on("close", resolve))
 clearTimeout(timer)
 if (exit !== 0) process.exit(1)
-if (mode === "cache") await rm("/tmp/dependency.tgz")
+if (mode === "cache") await rm("/workspace/dependency.tgz")
 else {
   await rm("/workspace/.npm-cache", { recursive: true, force: true })
   // npm does not create this directory for an empty dependency graph.

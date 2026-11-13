@@ -620,6 +620,52 @@ describe("bounded GitHub reads", () => {
     expect(fetch).toHaveBeenCalledTimes(1)
   })
 
+  test.each(["valid", "missing", "different-token"])(
+    "requires exact issuance proof for JWT-shaped installation tokens: %s",
+    async (proof) => {
+      const token = "eyJhbGciOiJIUzI1NiJ9.eyJmaXh0dXJlIjp0cnVlfQ.fixture"
+      const metadata = new MockAPI().metadata
+      const fetch = vi.fn<typeof globalThis.fetch>(async () =>
+        Response.json(metadata, { headers: { "content-type": "application/json" } }),
+      )
+      const client = new ProbotOctokit({
+        auth: { token },
+        throttle: { enabled: false },
+        retry: { enabled: false },
+        request: { fetch },
+      })
+      // The token-only SDK classifies any JWT as an App token, even when
+      // installation issuance already verified its scopes and repository.
+      expect(await client.auth({ type: "installation" })).toMatchObject({ tokenType: "app" })
+      const github = new GitHub(
+        client,
+        repository,
+        bot.id,
+        proof === "missing"
+          ? undefined
+          : {
+              token: proof === "different-token" ? "ghs_other_fixture" : token,
+              tokenType: "installation",
+              installationId: repository.installationId,
+              repositoryIds: [repository.id],
+              expiresAt: new Date(now + 3_600_000).toISOString(),
+            },
+      )
+      if (proof === "valid") {
+        expect(await github.check()).toEqual(metadata)
+        expect(fetch).toHaveBeenCalledTimes(1)
+        expect(fetch.mock.calls[0]?.[0]).toBe(
+          `https://api.github.com/repos/${repository.owner}/${repository.name}`,
+        )
+      } else {
+        await expect(github.check()).rejects.toMatchObject({
+          code: "github_installation_not_allowed",
+        })
+        expect(fetch).not.toHaveBeenCalled()
+      }
+    },
+  )
+
   test("checks deterministic branch and exact head PRs in all states", async () => {
     const { api, github } = setup()
     expect(await github.conflicts(12)).toBe(false)

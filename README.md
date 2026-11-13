@@ -54,7 +54,7 @@ by this layout. OrbStack is unverified.
 
 4. Open the HTTPS entrypoint and follow [Admin Web UI onboarding](docs/admin-webui.md).
    Upload the GitHub App PEM there; provider accounts, API keys, and models are also managed there.
-   Complete [GitHub App configuration](#configure-the-github-app) and
+   Complete **Runtime** settings, [GitHub App configuration](#configure-the-github-app), and
    [worker preparation](#prepare-a-target-worker) before dispatch. Incomplete configuration
    keeps dispatch disabled and returns HTTP 503 for webhooks. Applying complete settings can
    start work; obtain live-test and paid-provider authorization first.
@@ -118,15 +118,33 @@ worker. For direct host operation, use:
 npm run prepare:worker -- /absolute/path/to/approved-snapshot reina-worker:local
 ```
 
-Save the printed immutable image ID as `REINA_WORKER_IMAGE`. The worker contains Pi 1.5.0 and
-immutable target dependencies. At runtime, both package files must match its fingerprints.
+Enter the printed immutable image ID in **Runtime → Immutable worker image ID**. The worker
+contains Pi 1.5.0 and immutable target dependencies. At runtime, both package files must match its fingerprints.
 Prepare another image when dependencies change; changing the image invalidates old proposals.
+Preparation has a separate 2 GiB workspace, 64 MiB tarball limit, 1 GiB download budget, and
+512 MiB dependency export budget (128 MiB per file). These are fixed preparation limits, not
+new environment settings. Ordinary job workspace, memory, process, and network controls are
+unchanged.
 Git trees with symlinks/submodules, workspaces, non-registry dependencies, missing integrity,
 or dependencies requiring lifecycle scripts are not supported.
 
+## Connect GitHub
+
+After the service operator completes the one-time App setup below, open **GitHub App** and select
+**Connect GitHub**. Authorize the existing Reina App on GitHub, then choose a repository from its
+verified installations and select **Use repository**. Repository and installation IDs are filled
+automatically. Use **Install or manage App** to add access when necessary; existing installations
+are reused. GitHub authorization is separate from Pocket ID login and model-provider login.
+
+Selecting a repository reloads Runtime. If it matches a complete saved configuration, scans can
+resume and use model quota after readiness checks. A different target still needs its own worker
+and policy under **Runtime**. Connection does not prepare a worker or grant coding approval.
+
 ## Configure the GitHub App
 
-1. Register a GitHub App and install it only on the target repository.
+These steps are for the service operator, not each connecting user.
+
+1. Register the service GitHub App and install it only on approved repositories.
    - Create the label definitions `fix_available`, `bot:approved`, `bot:working`, `bot:pr_ready`,
      `bot:failed`, and `bot:skip`, plus `bot:triaged`, `bot:needs-info`, `bot:needs-human`, and
      `bot:triage-failed`. See [label meanings](docs/architecture.md#approval-and-state).
@@ -137,12 +155,19 @@ or dependencies requiring lifecycle scripts are not supported.
    Installation repositories events.
 4. Set the webhook URL to `https://reina.narumi.dev/api/github/webhooks`.
    Use a strong webhook secret of at least 32 characters and configure the same value in GitHub.
-5. Set `APP_ID`, `WEBHOOK_SECRET`, the repository/installation IDs, and the prepared image in
-   the private environment file. Upload an unencrypted RSA PEM key (at least 2048 bits, at most
-   32 KiB) through the authenticated Web UI. It returns status and fingerprint metadata, never
-   the saved key.
-6. Review the allowed paths, domain-specific forbidden paths, and trusted verification argv for
-   the target. An App installation is not a repository allowlist.
+5. Open **GitHub App → Service operator setup** in the authenticated Web UI. Upload an
+   unencrypted RSA PEM key (at least 2048 bits, at most 32 KiB). Save the App ID, OAuth client
+   secret, and webhook secret there. The server discovers the App client ID and slug; secrets
+   remain write-only. Matching legacy webhook settings can be imported without retyping.
+   - Register `https://reina.narumi.dev/auth/github/callback` as the App's user authorization
+     callback URL and `https://reina.narumi.dev/auth/github/setup` as its Setup URL.
+   - Enable **Redirect on update**. Leave **Request user authorization (OAuth) during
+     installation** disabled; Reina runs its own session-bound OAuth PKCE flow.
+   - Use the exact URLs shown in the UI if the public origin differs.
+6. In **Runtime**, review allowed paths, domain-specific forbidden paths, and trusted verification
+   argv. Identify this repository's credential, authentication, GitHub, worker, dispatch, and policy
+   code as forbidden. An App installation is not a repository allowlist. Saving and applying complete
+   settings can start scans and use model quota; coding still needs a separate human approval.
 7. Check target CI before enabling publication. Draft PRs and App branch pushes can run workflows.
    Bot branches must use disposable runners without secrets, write tokens, privileged containers,
    or deployment access. Reina does not isolate or control external CI.
@@ -180,7 +205,10 @@ for Codex. Request-count, body-size, response-byte, and time budgets still apply
 must authorize bounded live acceptance, including billing and this limit, before production use.
 Saving a credential is local configuration, not proof of remote authentication or entitlement.
 See [provider setup and limits](docs/admin-webui.md#provider-methods-and-limits).
-Legacy model environment variables are rejected by `loadConfig`; configure models in the UI.
+Configure models and all dispatch parameters in the Web UI. Only encryption, OIDC login, listener,
+and persistent storage bootstrap settings need environment variables. Saved runtime settings are
+encrypted in SQLite and take priority over legacy dispatch environment settings. Legacy dispatch
+settings remain a fallback only until the first runtime save; remove them after migration.
 
 ## Issue workflow
 

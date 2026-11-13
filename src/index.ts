@@ -8,6 +8,7 @@ import { AdminWeb } from "./web/admin.js"
 import { Auth } from "./web/auth.js"
 import { loadWebConfig } from "./web/config.js"
 import { Controller } from "./web/controller.js"
+import { GitHubConnect } from "./web/github-connect.js"
 
 async function main(): Promise<void> {
   const config = loadWebConfig()
@@ -39,6 +40,8 @@ async function main(): Promise<void> {
     () => controller.status(),
     () => controller.reload(),
     log,
+    undefined,
+    new GitHubConnect(settings, auth, config.auth.origin, process.env),
   )
   const server = httpServer(() => controller.app(), log, admin)
   try {
