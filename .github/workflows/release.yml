@@ -30,4 +30,5 @@ jobs:
       - uses: changesets/action@v2
         with:
           github-token: ${{ secrets.PAT_TOKEN }}
+          version-script: npm run version-packages
           publish-script: npm run release
