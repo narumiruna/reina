@@ -241,7 +241,9 @@ pending work. This flow neither changes provider credentials nor grants executio
 A selected connection that differs from the effective dispatch App/repository binding keeps
 runtime unconfigured. Matching saved service App credentials override stale webhook secrets in
 legacy runtime snapshots; the controller never passes App secrets to Docker workers. Repository
-selection does not infer a safe path policy, build a worker, or bypass runtime controls.
+selection does not infer a safe path policy, build a worker, or bypass runtime controls. Selection
+reloads Runtime. An exact match with a complete saved configuration can resume scans and model use
+after readiness checks. Reconnecting does not expire saved Runtime authority or grant coding approval.
 
 Authenticated **Runtime** settings store the App ID, webhook secret, repository/installation
 identity, immutable worker image, path policy, verification argv, and existing operational limits.

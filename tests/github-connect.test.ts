@@ -32,6 +32,35 @@ const app = {
   webhookSecret,
 }
 const user = { id: 789, login: "operator" }
+const repositoryNames = [
+  ".github",
+  "..repo",
+  ".repo.name",
+  "...",
+  "-repo",
+  "_repo",
+  "repo.-_name",
+  "a",
+  "a".repeat(100),
+]
+const invalidRepositoryNames = [
+  "",
+  ".",
+  "..",
+  "repo/name",
+  "repo\\name",
+  "repo name",
+  " repo",
+  "repo ",
+  "repo\tname",
+  "repo\n",
+  "repo\0name",
+  "repo\u007fname",
+  "repo\u200bname",
+  "repo\u00a0name",
+  "répo",
+  "a".repeat(101),
+]
 const installation = { id: 321, appId: app.appId, suspended: false }
 const repository: GitHubConnectRepository = {
   id: 456,
@@ -350,6 +379,137 @@ describe("session-bound OAuth and repository selection", () => {
     await expect(service.select(owner, repository.id)).rejects.toMatchObject({
       code: "github_connect_expired",
     })
+  })
+
+  it.each(
+    repositoryNames.flatMap((name) =>
+      ["operator", "mona-cat_octo", `${"a".repeat(35)}_org`].map((login) => ({ name, login })),
+    ),
+  )(
+    "connects, refreshes, selects, and reopens Runtime through real transport for $name / $login",
+    async ({ name, login }) => {
+      const selectedRepository = { ...repository, name, fullName: `${repository.owner}/${name}` }
+      const selectedUser = { ...user, login }
+      const unrelated = { ...repository, id: repository.id + 1 }
+      const fetch = vi.mocked(globalThis.fetch)
+      fetch.mockImplementation(async (target) => {
+        switch (String(target)) {
+          case "https://github.com/login/oauth/access_token":
+            return json({ access_token: token, token_type: "bearer" })
+          case "https://api.github.com/user":
+            return json(selectedUser)
+          case "https://api.github.com/user/installations?per_page=100&page=1":
+            return json({
+              installations: [{ id: installation.id, app_id: app.appId, suspended_at: null }],
+            })
+          case "https://api.github.com/user/installations/321/repositories?per_page=100&page=1":
+            return json({
+              repositories: [selectedRepository, unrelated].map((value) => ({
+                ...value,
+                full_name: value.fullName,
+                owner: { login: value.owner },
+              })),
+            })
+          case "https://api.github.com/app/installations/321":
+            return json({ id: installation.id, app_id: app.appId, suspended_at: null })
+          default:
+            throw new Error("unexpected fixture request")
+        }
+      })
+      service = new GitHubConnect(
+        store,
+        { ownerActive: (value) => active.has(value) },
+        origin,
+        {},
+        new FixedGitHubConnectTransport(),
+      )
+      services.push(service)
+      await authorize()
+      const expectedChoice = { ...choice, name, fullName: selectedRepository.fullName }
+      expect(service.view(owner)).toMatchObject({
+        state: "select_repository",
+        repositories: [expectedChoice, { ...choice, id: unrelated.id }],
+        user: selectedUser,
+      })
+      expect((await service.refresh(owner)).repositories[0]).toEqual(expectedChoice)
+      await service.select(owner, selectedRepository.id)
+      const verified = store.githubConnection()
+      if (!verified) throw new Error("github_fixture_missing")
+      expect(verified.repository).toEqual({
+        id: repository.id,
+        owner: repository.owner,
+        name,
+        installationId: installation.id,
+      })
+      expect(verified.user).toEqual(selectedUser)
+      store.saveDispatchSettings({
+        appId: app.appId,
+        repository: verified.repository,
+        image: `sha256:${"b".repeat(64)}`,
+        forbiddenPaths: ["security/**"],
+      })
+      const runtime = store.dispatchSettings()
+      store.close()
+      store = new SettingsStore(directory, "a".repeat(64))
+      expect(store.githubConnection()).toEqual(verified)
+      expect(store.dispatchSettings()).toEqual(runtime)
+      expect(store.dispatchStatus()?.repository).toEqual(verified.repository)
+      expect(fetch.mock.calls.filter(([target]) => String(target).endsWith("/user"))).toHaveLength(
+        3,
+      )
+    },
+  )
+
+  it.each([
+    ["owner", "mona-cat_octo"],
+    ["name", "."],
+    ["name", ".."],
+    ["name", "bad/name"],
+    ["name", "a".repeat(101)],
+    ["fullName", "other/project"],
+    ["id", Number.MAX_SAFE_INTEGER + 1],
+  ])(
+    "rejects malformed flow repository %s without changing the saved connection",
+    async (field, value) => {
+      const previous = previousConnection()
+      transport.repositories.mockResolvedValue([{ ...repository, [field]: value }])
+      const start = await service.start(owner)
+      await expect(service.oauthCallback(owner, callback(start.url))).rejects.toMatchObject({
+        code: "github_connect_failed",
+      })
+      expect(service.view(owner).state).toBe("idle")
+      expect(store.githubConnection()).toEqual(previous)
+    },
+  )
+
+  it.each(["refresh", "select"])(
+    "rejects a changed managed login on %s with the same user ID",
+    async (operation) => {
+      const previous = previousConnection()
+      transport.user.mockResolvedValue({ ...user, login: "mona-cat_octo" })
+      await authorize()
+      transport.user.mockResolvedValue({ ...user, login: "mona-cat_other" })
+      const pending =
+        operation === "refresh" ? service.refresh(owner) : service.select(owner, repository.id)
+      await expect(pending).rejects.toMatchObject({ code: "github_connect_access_denied" })
+      expect(store.githubConnection()).toEqual(previous)
+      expect(service.view(owner).state).toBe("idle")
+    },
+  )
+
+  it("rejects a changed leading-dot repository tuple at selection", async () => {
+    const previous = previousConnection()
+    transport.repositories.mockResolvedValue([
+      { ...repository, name: ".github", fullName: "example/.github" },
+    ])
+    await authorize()
+    transport.repositories.mockResolvedValue([
+      { ...repository, name: ".other", fullName: "example/.other" },
+    ])
+    await expect(service.select(owner, repository.id)).rejects.toMatchObject({
+      code: "github_connect_access_denied",
+    })
+    expect(store.githubConnection()).toEqual(previous)
   })
 
   it("requires both user-token repository membership and a writable permission; excludes archived/disabled repos", async () => {
@@ -781,6 +941,103 @@ describe("fixed-host bounded GitHub transport", () => {
     ])
     for (const [, options] of fetch.mock.calls.slice(0, 3))
       expect(new Headers(options?.headers).get("authorization")).toBe(`Bearer ${token}`)
+  })
+
+  it.each(["mona-cat_octo", "a", "a".repeat(39), `${"a".repeat(35)}_org`])(
+    "accepts bounded user login %s from the real user endpoint",
+    async (login) => {
+      vi.mocked(globalThis.fetch).mockResolvedValueOnce(json({ ...user, login }))
+      expect(await new FixedGitHubConnectTransport().user(token, signal())).toEqual({
+        ...user,
+        login,
+      })
+    },
+  )
+
+  it.each([
+    "",
+    "a".repeat(40),
+    "_operator",
+    "operator_",
+    "bad/name",
+    "bad\\name",
+    "bad name",
+    "operator\n",
+    "op\0erator",
+    "op\u007ferator",
+    "op\u200berator",
+  ])("rejects malformed user login %j from the real user endpoint", async (login) => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(json({ ...user, login }))
+    await expect(new FixedGitHubConnectTransport().user(token, signal())).rejects.toThrow(
+      "github_connect_transport_failed",
+    )
+  })
+
+  it.each(invalidRepositoryNames)(
+    "rejects an entire repository page containing malformed name %j even without write access",
+    async (name) => {
+      vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+        json({
+          repositories: [
+            { ...repository, full_name: repository.fullName, owner: { login: repository.owner } },
+            {
+              ...repository,
+              id: 457,
+              name,
+              full_name: `example/${name}`,
+              owner: { login: repository.owner },
+              archived: true,
+              permissions: {},
+            },
+          ],
+        }),
+      )
+      await expect(
+        new FixedGitHubConnectTransport().repositories(token, installation.id, signal()),
+      ).rejects.toThrow("github_connect_transport_failed")
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  it("keeps managed underscores out of repository owners at the transport boundary", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      json({
+        repositories: [
+          {
+            ...repository,
+            full_name: `mona-cat_octo/${repository.name}`,
+            owner: { login: "mona-cat_octo" },
+          },
+        ],
+      }),
+    )
+    await expect(
+      new FixedGitHubConnectTransport().repositories(token, installation.id, signal()),
+    ).rejects.toThrow("github_connect_transport_failed")
+  })
+
+  it("discovers a writable repository beside a readonly .github repository without dropping either record", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      json({
+        repositories: [
+          { ...repository, full_name: repository.fullName, owner: { login: repository.owner } },
+          {
+            ...repository,
+            id: 457,
+            name: ".github",
+            full_name: "example/.github",
+            owner: { login: repository.owner },
+            permissions: {},
+          },
+        ],
+      }),
+    )
+    expect(
+      await new FixedGitHubConnectTransport().repositories(token, installation.id, signal()),
+    ).toEqual([
+      repository,
+      { ...repository, id: 457, name: ".github", fullName: "example/.github", permissions: {} },
+    ])
   })
 
   it("paginates using only fixed paths, never untrusted Link headers", async () => {

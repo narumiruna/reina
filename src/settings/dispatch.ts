@@ -45,7 +45,12 @@ const commands = z
   .refine((value) => JSON.stringify(value).length <= 65_536)
 const numericId = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER)
 const owner = z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/)
-const name = z.string().regex(/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$/)
+export const repositoryNameSchema = z
+  .string()
+  .min(1)
+  .max(100)
+  .regex(/^[A-Za-z0-9_.-]+$/)
+  .refine((value) => value !== "." && value !== ".." && value.trim() === value)
 
 export const repositorySlugSchema = z
   .string()
@@ -53,7 +58,9 @@ export const repositorySlugSchema = z
   .refine((value) => {
     const parts = value.split("/")
     return (
-      parts.length === 2 && owner.safeParse(parts[0]).success && name.safeParse(parts[1]).success
+      parts.length === 2 &&
+      owner.safeParse(parts[0]).success &&
+      repositoryNameSchema.safeParse(parts[1]).success
     )
   })
 
@@ -65,7 +72,12 @@ export const dispatchSettingsSchema = z.strictObject({
     .min(32)
     .max(4_096)
     .refine((value) => value.trim() === value && !/[\p{Cc}]/u.test(value)),
-  repository: z.strictObject({ owner, name, id: numericId, installationId: numericId }),
+  repository: z.strictObject({
+    owner,
+    name: repositoryNameSchema,
+    id: numericId,
+    installationId: numericId,
+  }),
   image: z.string().max(512).regex(pinnedImage),
   allowedPaths: patterns,
   // Operators must include the repository's security and deployment domains.

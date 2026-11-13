@@ -20,6 +20,9 @@ if (document.body.dataset.page === "login") {
 function initializeAdmin() {
   let settings = null
   let runtimeFormInitialized = false
+  let runtimeConnectionBinding
+  let runtimeServiceAppId
+  let runtimeSecretAppId
   let githubAppFormInitialized = false
   let githubView = null
   let githubViewRequested = false
@@ -460,6 +463,11 @@ function initializeAdmin() {
   function renderRuntimeSecretStatus(runtime = settings.runtimeSettings) {
     const app = settings.githubApp
     const appId = Number($("runtime-app-id").value)
+    if (runtimeSecretAppId !== undefined && runtimeSecretAppId !== appId) {
+      $("runtime-webhook-secret").value = ""
+      resetValidation($("runtime-webhook-secret").closest(".field"))
+    }
+    runtimeSecretAppId = appId
     const inherited =
       app?.webhookSecretConfigured === true &&
       (app.clientSecretConfigured === true || app.configured === true) &&
@@ -482,9 +490,9 @@ function initializeAdmin() {
   function renderSettings() {
     if (!runtimeFormInitialized) {
       populateRuntimeSettings(settings.runtimeSettings)
-      syncRuntimeConnection()
       runtimeFormInitialized = true
     }
+    syncRuntimeConnection()
     renderRuntimeSecretStatus()
     const providers = settings.providers
     const models = providers.flatMap((provider) =>
@@ -548,35 +556,67 @@ function initializeAdmin() {
     return Number.isSafeInteger(value) && value > 0
   }
 
-  function syncRuntimeConnection(explicit = false) {
-    const connection = settings.githubConnection
-    const appId = connection?.appId ?? settings.githubApp?.appId
-    if (positiveId(appId)) $("runtime-app-id").value = String(appId)
-    if (!connection) return
-    const repository = connection.repository
-    const previousId = Number($("runtime-repository-id").value)
-    if (previousId !== repository.id && (explicit || settings.runtimeSettings)) {
-      $("runtime-image").value = ""
-      $("runtime-forbidden-paths").value = ""
-      $("runtime-repository-review").hidden = false
-      $("runtime-repository-review").textContent =
-        "Repository changed. Stored Runtime settings were not changed. The worker image and forbidden paths were cleared in this form. Review the allowed paths, verification commands, and limits for this repository before saving and applying."
-    }
-    for (const name of [
+  function syncRuntimeConnection() {
+    const names = [
       "appId",
       "repository.owner",
       "repository.name",
       "repository.id",
       "repository.installationId",
-    ]) {
-      const control = $(runtimeFields[name])
-      control.value = String(name === "appId" ? connection.appId : repository[name.slice(11)])
-      control.readOnly = true
+    ]
+    const binding = (values) =>
+      values.every((value) => value !== "") ? JSON.stringify(values) : null
+    const connection = settings.githubConnection
+    const values = connection
+      ? names.map((name) =>
+          String(name === "appId" ? connection.appId : connection.repository[name.slice(11)]),
+        )
+      : null
+    const nextBinding = values ? binding(values) : null
+    const formBinding = binding(names.map((name) => $(runtimeFields[name]).value))
+    const previousBinding = runtimeConnectionBinding || formBinding
+    const serviceAppId = positiveId(settings.githubApp?.appId) ? settings.githubApp.appId : null
+    const appChanged = runtimeServiceAppId !== undefined && runtimeServiceAppId !== serviceAppId
+    const disconnected = Boolean(runtimeConnectionBinding && !connection)
+    const appId = connection?.appId ?? serviceAppId
+    const initialAppMismatch =
+      runtimeServiceAppId === undefined &&
+      previousBinding &&
+      positiveId(appId) &&
+      Number($("runtime-app-id").value) !== appId
+    const targetChanged =
+      (connection && previousBinding && previousBinding !== nextBinding) ||
+      disconnected ||
+      (appChanged && (runtimeServiceAppId !== null || previousBinding)) ||
+      initialAppMismatch
+    if (targetChanged) {
+      $("runtime-image").value = ""
+      $("runtime-forbidden-paths").value = ""
+      $("runtime-repository-review").hidden = false
+      $("runtime-repository-review").textContent =
+        "Repository or App identity changed. Stored Runtime settings were not changed. The worker image and forbidden paths were cleared in this form. Review the allowed paths, verification commands, and limits for this target before saving and applying."
     }
-    $("runtime-connection-status").textContent =
-      `Connected repository: ${repository.owner}/${repository.name}. Identity is supplied by Connect GitHub. The worker image and policy still require review and a separate Save and apply action.`
-    resetValidation($("runtime-form"))
-    renderRuntimeSecretStatus()
+    if (appChanged) {
+      githubAppFormInitialized = false
+      $("github-app-id").value = serviceAppId === null ? "" : String(serviceAppId)
+      $("github-client-secret").value = ""
+      $("github-webhook-secret").value = ""
+      resetValidation($("github-app-form"))
+    }
+    for (const [index, name] of names.entries()) {
+      const control = $(runtimeFields[name])
+      control.readOnly = Boolean(connection)
+      if (values) control.value = values[index]
+    }
+    if (!connection && (runtimeServiceAppId === undefined || appChanged || disconnected)) {
+      if (positiveId(appId)) $("runtime-app-id").value = String(appId)
+      else if (appChanged) $("runtime-app-id").value = ""
+    }
+    $("runtime-connection-status").textContent = connection
+      ? `Connected repository: ${connection.repository.owner}/${connection.repository.name}. Identity is supplied by Connect GitHub. An exact match to the complete saved Runtime configuration can restart scans and use model quota. New or changed worker settings and policy require Runtime Save and apply. Coding still requires explicit approval.`
+      : "No connected repository. Connect GitHub to select a verified repository, or use Advanced GitHub identity to enter a manual target."
+    runtimeConnectionBinding = nextBinding
+    runtimeServiceAppId = serviceAppId
   }
 
   function updateGithubSecretRequirements() {
@@ -1757,6 +1797,18 @@ function initializeAdmin() {
       success:
         "Runtime settings saved and reload requested. Refresh status to check the applied state.",
       onSaved: () => {
+        // Without saved service App settings, status derives its App ID from
+        // this Runtime save. That expected change must not clear the new policy.
+        if (settings.githubApp && !settings.githubApp.clientSecretConfigured) {
+          if (runtimeServiceAppId !== data.appId) {
+            githubAppFormInitialized = true
+            $("github-app-id").value = String(data.appId)
+            $("github-client-secret").value = ""
+            $("github-webhook-secret").value = ""
+            resetValidation($("github-app-form"))
+          }
+          runtimeServiceAppId = data.appId
+        }
         populateRuntimeSettings({ ...data, webhookSecretConfigured: true })
         $("runtime-repository-review").hidden = true
       },
@@ -1847,11 +1899,10 @@ function initializeAdmin() {
       target: $("github-connect-status"),
       refresh: false,
       success:
-        "Repository connected. Review the worker image and repository policy in Runtime settings before saving and applying. Connecting does not start the runtime or approve coding.",
+        "Repository connected. An exact match to the complete saved Runtime configuration can restart scans and use model quota. New or changed worker settings and policy require Runtime Save and apply. Coding still requires explicit approval.",
       onSaved: async () => {
         await refreshSettings()
         if (!settings.githubConnection) throw { code: "invalid_response" }
-        syncRuntimeConnection(true)
         githubView = null
         renderGithubView()
       },

@@ -6,9 +6,10 @@ import http from "node:http"
 import os from "node:os"
 import path from "node:path"
 import { after, before, test } from "node:test"
+import { gzipSync } from "node:zlib"
 import tar from "tar-stream"
 import { ModelGateway } from "../../dist/agent/model-gateway.js"
-import { DockerRuntime, dockerCommand } from "../../dist/agent/sandbox.js"
+import { containerArguments, DockerRuntime, dockerCommand } from "../../dist/agent/sandbox.js"
 import { artifactHash, validateArtifact } from "../../dist/agent/validate.js"
 import { baseline, fixtureTag, lock, manifest, prepareFixture } from "./fixture.mjs"
 import { fakeModel } from "./model.mjs"
@@ -269,6 +270,177 @@ test("prepared images reject non-registry dependencies and wrong tarball integri
       )
     } finally {
       await rm(source, { recursive: true, force: true })
+    }
+  }
+})
+
+test("preparation stages dependency imports in the workspace with the original quotas", {
+  timeout: 180000,
+}, async (t) => {
+  const name = `reina-import-fixture-${randomUUID()}`
+  const volume = `${name}-workspace`
+  const exec = (script) => checked(["exec", name, "node", "-e", script])
+  const importFiles = (kind, files) =>
+    dockerCommand(["exec", "--interactive", name, "node", "/opt/reina/import.mjs", kind], {
+      input: Buffer.from(
+        JSON.stringify(
+          files.map(([file, content]) => ({
+            path: file,
+            mode: "100644",
+            content: content.toString("base64"),
+          })),
+        ),
+      ),
+      timeoutMs: 60000,
+    })
+  const marker = "process.stdout.write(require('node:fs').readFileSync('/tmp/reina-ready'))"
+  await checked([
+    "volume",
+    "create",
+    "--driver=local",
+    `--label=io.reina.owner=${owned()}`,
+    "--label=io.reina.fixture=true",
+    "--opt=type=tmpfs",
+    "--opt=device=tmpfs",
+    "--opt=o=size=2147483648,uid=1000,gid=1000,mode=0700,nosuid,nodev",
+    volume,
+  ])
+  try {
+    await checked(containerArguments(config.image, name, owned(), "prepare"))
+    await checked(["start", name])
+    await checked(["exec", name, "node", "/opt/reina/ready.mjs"])
+    assert.equal(
+      (await checked(["exec", name, "node", "/opt/reina/probe.mjs"])).stdout.toString(),
+      "controls_verified\n",
+    )
+    const ready = (await exec(marker)).stdout
+    assert.equal(ready.toString(), "ready")
+
+    await t.test(
+      "accepts exactly 64 MiB and rejects one more decoded byte without changing readiness",
+      async () => {
+        for (const size of [64 * 1024 * 1024, 64 * 1024 * 1024 + 1]) {
+          const content = Buffer.alloc(size, 0x61)
+          const digest = createHash("sha512").update(content).digest("hex")
+          const errors = []
+          // Send the actual JSON/base64 input to the worker, not just the size guards.
+          const result = await dockerCommand(
+            ["exec", "--interactive", name, "node", "/opt/reina/import.mjs", "dependency"],
+            {
+              input: Buffer.from(
+                JSON.stringify([
+                  { path: "dependency.tgz", mode: "100644", content: content.toString("base64") },
+                ]),
+              ),
+              stderr: (chunk) => errors.push(chunk),
+              timeoutMs: 60000,
+            },
+          )
+          if (size === 64 * 1024 * 1024) {
+            assert.equal(result.exitCode, 0, Buffer.concat(errors).toString())
+            await exec(`const a=require('node:assert/strict'),fs=require('node:fs'),crypto=require('node:crypto');
+            a.equal(fs.statSync('/workspace/dependency.tgz').size,67108864);
+            a.equal(crypto.createHash('sha512').update(fs.readFileSync('/workspace/dependency.tgz')).digest('hex'),${JSON.stringify(digest)});
+            a.equal(fs.existsSync('/tmp/dependency.tgz'),false);
+            fs.unlinkSync('/workspace/dependency.tgz');`)
+          } else {
+            assert.notEqual(result.exitCode, 0)
+            assert.match(Buffer.concat(errors).toString(), /dependency_download_limit/)
+            await exec(`const a=require('node:assert/strict'),fs=require('node:fs');
+            a.equal(fs.existsSync('/workspace/dependency.tgz'),false);
+            a.equal(fs.existsSync('/tmp/dependency.tgz'),false);`)
+          }
+          assert.deepEqual((await exec(marker)).stdout, ready)
+        }
+      },
+    )
+
+    await t.test(
+      "caches a local package twice and installs offline with staging and cache cleanup",
+      async () => {
+        const packageName = "reina-local-cache-fixture"
+        const lifecycle =
+          "node -e \"require('node:fs').writeFileSync('/workspace/lifecycle-ran','unsafe')\""
+        const content = gzipSync(
+          await context([
+            [
+              "package/package.json",
+              Buffer.from(
+                JSON.stringify({
+                  name: packageName,
+                  version: "1.0.0",
+                  main: "index.js",
+                  scripts: { preinstall: lifecycle, install: lifecycle, postinstall: lifecycle },
+                }),
+              ),
+            ],
+            ["package/index.js", Buffer.from("module.exports = 'local-cache-fixture'\n")],
+          ]),
+        )
+        const integrity = `sha512-${createHash("sha512").update(content).digest("base64")}`
+        const packageManifest = {
+          name: "reina-local-cache-consumer",
+          version: "1.0.0",
+          private: true,
+          dependencies: { [packageName]: "1.0.0" },
+          scripts: { preinstall: lifecycle, install: lifecycle, postinstall: lifecycle },
+        }
+        const packageLock = {
+          name: packageManifest.name,
+          version: "1.0.0",
+          lockfileVersion: 3,
+          requires: true,
+          packages: {
+            "": packageManifest,
+            [`node_modules/${packageName}`]: {
+              version: "1.0.0",
+              resolved: `https://registry.npmjs.org/${packageName}/-/${packageName}-1.0.0.tgz`,
+              integrity,
+              hasInstallScript: true,
+            },
+          },
+        }
+        assert.equal(
+          (
+            await importFiles("workspace", [
+              ["package.json", Buffer.from(JSON.stringify(packageManifest))],
+              ["package-lock.json", Buffer.from(JSON.stringify(packageLock))],
+            ])
+          ).exitCode,
+          0,
+        )
+        for (let attempt = 0; attempt < 2; attempt++) {
+          assert.equal((await importFiles("dependency", [["dependency.tgz", content]])).exitCode, 0)
+          await exec(`const a=require('node:assert/strict'),fs=require('node:fs'),crypto=require('node:crypto');
+          a.equal(fs.statSync('/workspace/dependency.tgz').size,${content.length});
+          a.equal('sha512-'+crypto.createHash('sha512').update(fs.readFileSync('/workspace/dependency.tgz')).digest('base64'),${JSON.stringify(integrity)});`)
+          await checked(["exec", name, "node", "/opt/reina/prepare.mjs", "cache"], {
+            timeoutMs: 130000,
+          })
+          await exec(`const a=require('node:assert/strict'),fs=require('node:fs');
+          a.equal(fs.existsSync('/workspace/dependency.tgz'),false);
+          a.equal(fs.existsSync('/tmp/dependency.tgz'),false);
+          a.equal(fs.existsSync('/workspace/.npm-cache/_cacache'),true);
+          a.equal(fs.existsSync('/workspace/lifecycle-ran'),false);`)
+          assert.deepEqual((await exec(marker)).stdout, ready)
+        }
+        await checked(["exec", name, "node", "/opt/reina/prepare.mjs", "install"], {
+          timeoutMs: 130000,
+        })
+        await exec(`const a=require('node:assert/strict'),fs=require('node:fs');
+        a.equal(require('/workspace/node_modules/${packageName}'),'local-cache-fixture');
+        a.equal(fs.existsSync('/workspace/.npm-cache'),false);
+        a.equal(fs.existsSync('/workspace/dependency.tgz'),false);
+        a.equal(fs.existsSync('/tmp/dependency.tgz'),false);
+        a.equal(fs.existsSync('/workspace/lifecycle-ran'),false);`)
+        assert.deepEqual((await exec(marker)).stdout, ready)
+      },
+    )
+  } finally {
+    try {
+      await checked(["rm", "--force", "--volumes", name])
+    } finally {
+      await checked(["volume", "rm", volume])
     }
   }
 })

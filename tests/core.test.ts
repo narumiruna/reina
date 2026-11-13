@@ -304,6 +304,80 @@ describe("strict configuration", () => {
   })
 
   test.each([
+    ".github",
+    "..repo",
+    ".repo.name",
+    "...",
+    "-repo",
+    "_repo",
+    "repo.-_name",
+    "a",
+    "a".repeat(100),
+  ])("loads repository %s identically through legacy and saved Runtime schemas", (name) => {
+    const env = environment({ REINA_REPOSITORY: `example/${name}` })
+    const { stateDir, ...legacy } = loadRuntimeConfig(env)
+    const saved = dispatchSettingsSchema.parse(
+      dispatchInputSchema.parse({
+        appId: 123,
+        webhookSecret: env.WEBHOOK_SECRET,
+        repository: { owner: "example", name, id: 456, installationId: 789 },
+        image,
+        forbiddenPaths: JSON.parse(env.REINA_FORBIDDEN_PATHS ?? "[]"),
+      }),
+    )
+    expect(saved).toEqual(legacy)
+    expect(saved.repository.name).toBe(name)
+    const { appId: _appId, webhookSecret: _secret, ...runtime } = saved
+    expect(loadConfig(env)).toEqual({ ...runtime, stateDir })
+  })
+
+  test.each([
+    "",
+    ".",
+    "..",
+    "repo/name",
+    "repo\\name",
+    "repo name",
+    " repo",
+    "repo ",
+    "repo\tname",
+    "repo\n",
+    "repo\0name",
+    "repo\u007fname",
+    "repo\u200bname",
+    "repo\u00a0name",
+    "répo",
+    "a".repeat(101),
+  ])("rejects repository name %j in both legacy and saved Runtime schemas", (name) => {
+    const { stateDir: _stateDir, ...input } = loadRuntimeConfig(environment())
+    expect(() => loadRuntimeConfig(environment({ REINA_REPOSITORY: `example/${name}` }))).toThrow(
+      "Invalid configuration fields: REINA_REPOSITORY",
+    )
+    expect(
+      dispatchInputSchema.safeParse({
+        ...input,
+        repository: { ...input.repository, name },
+      }).success,
+    ).toBe(false)
+  })
+
+  test.each(["mona-cat_octo", "-owner", "owner-", "a".repeat(40)])(
+    "keeps repository owner %s invalid in both legacy and saved Runtime schemas",
+    (owner) => {
+      const { stateDir: _stateDir, ...input } = loadRuntimeConfig(environment())
+      expect(() =>
+        loadRuntimeConfig(environment({ REINA_REPOSITORY: `${owner}/.github` })),
+      ).toThrow("Invalid configuration fields: REINA_REPOSITORY")
+      expect(
+        dispatchInputSchema.safeParse({
+          ...input,
+          repository: { ...input.repository, owner, name: ".github" },
+        }).success,
+      ).toBe(false)
+    },
+  )
+
+  test.each([
     ["REINA_SCAN_INTERVAL_MS", "scanIntervalMs", 60_000, 86_400_000],
     ["REINA_MAX_ISSUES_PER_SCAN", "maxIssuesPerScan", 1, 10],
     ["REINA_MAX_CONCURRENT_JOBS", "maxConcurrentJobs", 1, 1],

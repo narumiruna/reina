@@ -1,6 +1,7 @@
 import { sign } from "node:crypto"
 import { z } from "zod"
-import { gitHubAppSettingsSchema } from "../settings/github.js"
+import { dispatchSettingsSchema, repositoryNameSchema } from "../settings/dispatch.js"
+import { gitHubAppSettingsSchema, gitHubUserLoginSchema } from "../settings/github.js"
 
 export interface GitHubAppCredentials {
   appId: number
@@ -54,7 +55,7 @@ export interface GitHubConnectTransport {
 }
 
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
-const owner = z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/)
+const owner = dispatchSettingsSchema.shape.repository.shape.owner
 const installationSchema = z.object({
   id,
   app_id: id,
@@ -62,7 +63,7 @@ const installationSchema = z.object({
 })
 const repositorySchema = z.object({
   id,
-  name: z.string().regex(/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$/),
+  name: repositoryNameSchema,
   full_name: z.string().max(140),
   owner: z.object({ login: owner }),
   archived: z.boolean(),
@@ -197,7 +198,10 @@ export class FixedGitHubConnectTransport implements GitHubConnectTransport {
   }
 
   async user(token: string, signal: AbortSignal): Promise<GitHubConnectUser> {
-    return parse(z.object({ id, login: owner }), await this.request("/user", token, signal))
+    return parse(
+      z.object({ id, login: gitHubUserLoginSchema }),
+      await this.request("/user", token, signal),
+    )
   }
 
   private async pages<T>(

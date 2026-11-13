@@ -503,6 +503,55 @@ describe("controller GitHub settings compatibility", () => {
 })
 
 describe("controller runtime lifecycle", () => {
+  test("saved Runtime resumes after a matching connection is reselected without a new Runtime save", async () => {
+    const saved = dispatch()
+    const original = structuredClone(saved)
+    settings.dispatchSettings.mockReturnValue(saved)
+    settings.githubAppSettings.mockReturnValue(appSettings())
+    settings.githubConnection.mockReturnValue(connection(saved))
+    const value = controller()
+    value.reload()
+    await running(value)
+
+    settings.githubConnection.mockReturnValue({
+      ...connection(saved),
+      repository: { ...saved.repository, id: 999, name: "different-repo" },
+    })
+    value.reload()
+    expect(value.app()).toBeUndefined()
+    expect(mocks.orchestrators[0].stop).toHaveBeenCalledOnce()
+    await vi.waitFor(() =>
+      expect(value.status()).toEqual({ state: "not_configured", reason: "configure_runtime" }),
+    )
+    expect(mocks.Orchestrator).toHaveBeenCalledOnce()
+
+    settings.githubConnection.mockReturnValue({
+      ...connection(saved),
+      connectedAt: 1_800_000_000_001,
+    })
+    value.reload()
+    await running(value)
+    expect(mocks.orchestrators).toHaveLength(2)
+    expect(mocks.orchestrators[1].start).toHaveBeenCalledOnce()
+    expect(mocks.orchestrators[1].config).toMatchObject({
+      repository: original.repository,
+      image: original.image,
+      allowedPaths: original.allowedPaths,
+      forbiddenPaths: original.forbiddenPaths,
+      commands: original.commands,
+    })
+    expect(mocks.apps[1].ready).toHaveBeenCalledOnce()
+    expect(mocks.installationClient).toHaveBeenCalledTimes(2)
+    expect(settings.dispatchSettings()).toEqual(original)
+
+    value.reload()
+    expect(mocks.orchestrators[1].stop).toHaveBeenCalledOnce()
+    await running(value)
+    expect(mocks.orchestrators).toHaveLength(3)
+    expect(mocks.orchestrators[2].start).toHaveBeenCalledOnce()
+    expect(settings.dispatchSettings()).toEqual(original)
+  })
+
   test("uses legacy runtime environment only while saved dispatch settings are absent", async () => {
     env.PRIVATE_KEY = "ignored-environment-key"
     const selected = selection()

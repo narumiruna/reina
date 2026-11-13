@@ -136,8 +136,9 @@ verified installations and select **Use repository**. Repository and installatio
 automatically. Use **Install or manage App** to add access when necessary; existing installations
 are reused. GitHub authorization is separate from Pocket ID login and model-provider login.
 
-Connecting selects one repository; it does not prepare a worker, approve coding, or prove that
-dispatch is running. Complete the worker and repository policy under **Runtime** before applying.
+Selecting a repository reloads Runtime. If it matches a complete saved configuration, scans can
+resume and use model quota after readiness checks. A different target still needs its own worker
+and policy under **Runtime**. Connection does not prepare a worker or grant coding approval.
 
 ## Configure the GitHub App
 

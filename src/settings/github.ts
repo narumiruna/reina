@@ -3,6 +3,13 @@ import { dispatchSettingsSchema } from "./dispatch.js"
 
 const fields = dispatchSettingsSchema.shape
 
+/** User logins can include managed-user underscores; repository owners cannot. */
+export const gitHubUserLoginSchema = z
+  .string()
+  .max(39)
+  .regex(/^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,37}[A-Za-z0-9])?$/)
+  .refine((value) => value.trim() === value)
+
 /** Complete trusted settings. Never return these secrets from the management API. */
 export const gitHubAppSettingsSchema = z.strictObject({
   appId: fields.appId,
@@ -29,7 +36,7 @@ export const gitHubConnectionSchema = z.strictObject({
   connectedAt: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   user: z.strictObject({
     id: fields.appId,
-    login: fields.repository.shape.owner.refine((value) => value.trim() === value),
+    login: gitHubUserLoginSchema,
   }),
 })
 

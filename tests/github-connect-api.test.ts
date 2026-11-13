@@ -188,6 +188,11 @@ describe("GitHub connection administrative boundary", () => {
   })
 
   it("requires an allowed session, exact Origin, and CSRF on every connection mutation", async () => {
+    const deniedOptions: { anonymous?: boolean; headers?: Record<string, string> }[] = [
+      { anonymous: true },
+      { headers: { origin: "https://attacker.invalid" } },
+      { headers: { "x-csrf-token": "wrong" } },
+    ]
     for (const [path, body] of [
       ["/api/github/app", { appId: 123, clientSecret }],
       ["/api/github/connect", undefined],
@@ -196,11 +201,7 @@ describe("GitHub connection administrative boundary", () => {
       ["/api/github/connect/select", { repositoryId: 456 }],
       ["/api/github/connect/cancel", undefined],
     ] as const) {
-      for (const options of [
-        { anonymous: true },
-        { headers: { origin: "https://attacker.invalid" } },
-        { headers: { "x-csrf-token": "wrong" } },
-      ]) {
+      for (const options of deniedOptions) {
         const response = await request(path, "POST", body, options)
         expect(response.status).toBe(options.anonymous ? 401 : 403)
       }
@@ -305,6 +306,82 @@ describe("GitHub connection administrative boundary", () => {
     expectNoSecrets((await request("/api/settings")).text)
     expectNoSecrets(JSON.stringify(log.error.mock.calls))
   })
+
+  it.each([
+    ".github",
+    "..repo",
+    ".repo.name",
+    "...",
+    "-repo",
+    "_repo",
+    "repo.-_name",
+    "a",
+    "a".repeat(100),
+  ])(
+    "authorizes, refreshes, selects, and saves Runtime for %s with a managed user through the API",
+    async (name) => {
+      configureApp()
+      const user = { id: 99, login: "mona-cat_octo" }
+      const selected = { ...repository, name, fullName: `${repository.owner}/${name}` }
+      vi.mocked(transport.user).mockResolvedValue(user)
+      vi.mocked(transport.repositories).mockResolvedValue([selected])
+      const { state } = await start()
+      expect((await authorize(state)).headers.location).toBe("/?github_connect=ready#github")
+      const choices = await request("/api/github/connect")
+      expect(choices.json()).toMatchObject({
+        state: "select_repository",
+        repositories: [{ id: repository.id, name, fullName: selected.fullName }],
+        user,
+      })
+      const refreshed = await request("/api/github/connect/refresh", "POST")
+      expect(refreshed.status).toBe(200)
+      expect(refreshed.json().repositories[0].name).toBe(name)
+      expect(
+        (await request("/api/github/connect/select", "POST", { repositoryId: repository.id }))
+          .status,
+      ).toBe(200)
+      const identity = {
+        id: repository.id,
+        owner: repository.owner,
+        name,
+        installationId: installation.id,
+      }
+      expect(store.githubConnection()).toMatchObject({ repository: identity, user })
+      const saved = await request("/api/runtime/settings", "POST", {
+        appId: app.id,
+        repository: identity,
+        image: `sha256:${"b".repeat(64)}`,
+        forbiddenPaths: ["security/**"],
+      })
+      expect(saved.status).toBe(200)
+      expect(store.dispatchSettings()?.repository).toEqual(identity)
+      const settings = await request("/api/settings")
+      expect(settings.json()).toMatchObject({
+        githubConnection: { repository: identity, user },
+        runtimeSettings: { repository: identity },
+      })
+      for (const response of [choices, refreshed, saved, settings]) expectNoSecrets(response.text)
+    },
+  )
+
+  it.each(["owner", "name", "fullName"])(
+    "fails closed on malformed discovered repository %s without saving or reloading",
+    async (field) => {
+      configureApp()
+      const invalid = { owner: "mona-cat_octo", name: "..", fullName: "other/project" }
+      vi.mocked(transport.repositories).mockResolvedValue([
+        { ...repository, [field]: invalid[field as keyof typeof invalid] },
+      ])
+      const { state } = await start()
+      const callback = await authorize(state)
+      expect(callback.headers.location).toBe("/?github_connect=github_connect_failed#github")
+      expect((await request("/api/github/connect")).json().state).toBe("idle")
+      expect(store.githubConnection()).toBeUndefined()
+      expect(store.dispatchSettings()).toBeUndefined()
+      expect(changed).not.toHaveBeenCalled()
+      expectNoSecrets(callback.text)
+    },
+  )
 
   it("refreshes repository access after external approval and removes revoked choices", async () => {
     configureApp()

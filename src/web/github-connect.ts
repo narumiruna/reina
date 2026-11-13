@@ -7,7 +7,12 @@ import {
   type GitHubConnectTransport,
   type GitHubConnectUser,
 } from "../github/connect.js"
-import { type GitHubAppSettings, gitHubAppSettingsSchema } from "../settings/github.js"
+import { dispatchSettingsSchema, repositoryNameSchema } from "../settings/dispatch.js"
+import {
+  type GitHubAppSettings,
+  gitHubAppSettingsSchema,
+  gitHubUserLoginSchema,
+} from "../settings/github.js"
 import type { SettingsStore } from "../settings/store.js"
 import type { Auth } from "./auth.js"
 
@@ -92,13 +97,13 @@ const secretsSchema = gitHubAppSettingsSchema.pick({
 })
 const userSchema = z.object({
   id: fields.appId,
-  login: z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/),
+  login: gitHubUserLoginSchema,
 })
 const choiceSchema = z.object({
   id: fields.appId,
   installationId: fields.appId,
-  owner: userSchema.shape.login,
-  name: z.string().regex(/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$/),
+  owner: dispatchSettingsSchema.shape.repository.shape.owner,
+  name: repositoryNameSchema,
   fullName: z.string().max(140),
 })
 

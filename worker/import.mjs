@@ -15,7 +15,7 @@ for await (const chunk of process.stdin) {
 }
 const files = JSON.parse(Buffer.concat(chunks))
 if (!Array.isArray(files) || files.length > 2000) process.exit(1)
-const root = kind === "workspace" ? "/workspace" : kind === "config" ? "/tmp/reina-agent" : "/tmp"
+const root = kind === "config" ? "/tmp/reina-agent" : "/workspace"
 let total = 0
 for (const file of files) {
   if (

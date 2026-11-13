@@ -274,6 +274,100 @@ describe("encrypted GitHub App settings and verified connections", () => {
     expect(publicMetadata).not.toContain(webhookSecret)
   })
 
+  it.each([
+    ".github",
+    "..repo",
+    ".repo.name",
+    "...",
+    "-repo",
+    "_repo",
+    "repo.-_name",
+    "a",
+    "a".repeat(100),
+  ])("encrypts and reopens a managed-user connection and Runtime for repository %s", (name) => {
+    const repository = { ...connection.repository, name }
+    const verified = {
+      ...connection,
+      repository,
+      user: { ...connection.user, login: "mona-cat_octo" },
+    }
+    store.saveGitHubAppSettings(appSettings)
+    store.saveGitHubConnection(verified)
+    store.saveDispatchSettings({ ...dispatchInput, repository })
+    const runtime = store.dispatchSettings()
+    const database = new DatabaseSync(path.join(directory, "settings.sqlite"))
+    try {
+      const rows = database
+        .prepare(
+          "SELECT value FROM secrets WHERE name IN ('github-connection','dispatch-settings')",
+        )
+        .all()
+      expect(rows).toHaveLength(2)
+      expect(JSON.stringify(rows)).not.toContain("mona-cat_octo")
+      expect(JSON.stringify(rows)).not.toContain('"repository"')
+    } finally {
+      database.close()
+    }
+    store.close()
+    store = new SettingsStore(directory, master)
+    expect(store.githubConnection()).toEqual(verified)
+    expect(store.dispatchSettings()).toEqual(runtime)
+    expect(store.dispatchStatus()?.repository).toEqual(repository)
+  })
+
+  it.each(["mona-cat_octo", "a", "a".repeat(39), `${"a".repeat(35)}_org`])(
+    "persists and reopens bounded user login %s without changing repository-owner rules",
+    (login) => {
+      const verified = { ...connection, user: { ...connection.user, login } }
+      store.saveGitHubConnection(verified)
+      store.close()
+      store = new SettingsStore(directory, master)
+      expect(store.githubConnection()).toEqual(verified)
+      expect(
+        gitHubConnectionSchema.safeParse({
+          ...verified,
+          repository: { ...verified.repository, owner: "mona-cat_octo" },
+        }).success,
+      ).toBe(false)
+    },
+  )
+
+  it.each([
+    "",
+    ".",
+    "..",
+    "repo/name",
+    "repo\\name",
+    "repo name",
+    " repo",
+    "repo ",
+    "repo\tname",
+    "repo\n",
+    "repo\0name",
+    "repo\u007fname",
+    "repo\u200bname",
+    "repo\u00a0name",
+    "répo",
+    "a".repeat(101),
+  ])(
+    "rejects malformed repository name %j in saved connection and Runtime without changing either",
+    (name) => {
+      store.saveGitHubAppSettings(appSettings)
+      store.saveGitHubConnection(connection)
+      store.saveDispatchSettings(dispatchInput)
+      const runtime = store.dispatchSettings()
+      const repository = { ...connection.repository, name }
+      expect(() => store.saveGitHubConnection({ ...connection, repository })).toThrow(
+        /^invalid_github_connection$/,
+      )
+      expect(() => store.saveDispatchSettings({ ...dispatchInput, repository })).toThrow(
+        /^invalid_dispatch_settings$/,
+      )
+      expect(store.githubConnection()).toEqual(connection)
+      expect(store.dispatchSettings()).toEqual(runtime)
+    },
+  )
+
   it("tracks credential writes and key deletion with a stable internal revision", () => {
     const empty = store.githubRevision()
     expect(empty).toMatch(/^[a-f0-9]{64}$/)
@@ -393,6 +487,8 @@ describe("encrypted GitHub App settings and verified connections", () => {
     ["repository", { ...connection.repository, id: 0 }],
     ["repository", { ...connection.repository, installationId: 1.5 }],
     ["repository", { ...connection.repository, owner: "-invalid" }],
+    ["repository", { ...connection.repository, owner: "mona-cat_octo" }],
+    ["repository", { ...connection.repository, owner: "a".repeat(40) }],
     ["repository", { ...connection.repository, name: "../invalid" }],
     ["repository", { ...connection.repository, token: "private-invalid-input" }],
     ["connectedAt", -1],
@@ -405,6 +501,14 @@ describe("encrypted GitHub App settings and verified connections", () => {
     ["user", { id: 42, login: "operator\n" }],
     ["user", { id: 42, login: "../operator" }],
     ["user", { id: 42, login: "a".repeat(40) }],
+    ["user", { id: 42, login: `${"a".repeat(36)}_org` }],
+    ["user", { id: 42, login: "_operator" }],
+    ["user", { id: 42, login: "operator_" }],
+    ["user", { id: 42, login: "op erator" }],
+    ["user", { id: 42, login: "op\\erator" }],
+    ["user", { id: 42, login: "op\0erator" }],
+    ["user", { id: 42, login: "op\u007ferator" }],
+    ["user", { id: 42, login: "op\u200berator" }],
     ["user", { id: 42, login: "operator", token: "private-invalid-input" }],
     ["token", "private-invalid-input"],
   ])(

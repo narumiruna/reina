@@ -144,10 +144,16 @@ service shutdown, or stale App/key settings invalidate the flow. Local token dis
 claim provider-side revocation. GitHub user authorization is separate from both Pocket ID login
 and model-provider authentication.
 
-Connection metadata does not establish worker readiness or grant approval. A different selected
-repository stops dispatch until the Runtime binding matches. Review its worker and policy before
-applying; the UI clears the previous target's image and forbidden-path draft when changing targets.
-Ordinary status refresh keeps unrelated unsaved edits.
+Connection metadata does not establish worker readiness or grant approval. Selecting a repository
+reloads the controller. If it matches a complete saved Runtime configuration, readiness checks can
+pass and scans can resume, including model use. Saved Runtime authority remains valid on reconnect;
+selection does not grant new coding approval.
+
+A different selected repository stops dispatch until the Runtime binding matches. Review its worker
+and policy before applying. The UI clears the previous target's image and forbidden-path draft when
+the connection identity changes, including changes from another tab. Ordinary status refresh keeps
+same-target drafts and validation errors. If the connection is removed, advanced identity controls
+become editable again.
 
 ### One-time service operator setup
 
