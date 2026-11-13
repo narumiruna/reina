@@ -376,8 +376,16 @@ test("workspace/temp quotas, seccomp, cgroup CPU and process limits are enforced
       (await checked(["exec", id, "node", "/opt/reina/probe.mjs"])).stdout.toString(),
       "controls_verified\n",
     )
+    const wrongPhase = await dockerCommand([
+      "exec",
+      "--env=REINA_PHASE=prepare",
+      id,
+      "node",
+      "/opt/reina/probe.mjs",
+    ])
+    assert.notEqual(wrongPhase.exitCode, 0)
     const script = `const a=require('node:assert/strict'),fs=require('node:fs'),cp=require('node:child_process');
-      for(const dir of ['/workspace','/tmp']) {const file=dir+'/quota-test',fd=fs.openSync(file,'w');let full=false;try{const b=Buffer.alloc(4*1024*1024,1);for(let i=0;i<70;i++)fs.writeSync(fd,b);}catch(e){a.equal(e.code,'ENOSPC');full=true;}finally{fs.closeSync(fd);fs.unlinkSync(file);}a.equal(full,true);}
+      for(const [dir,expected] of [['/workspace',268435456],['/tmp',67108864]]) {const stat=fs.statfsSync(dir);a.equal(stat.blocks*stat.bsize,expected);const file=dir+'/quota-test',fd=fs.openSync(file,'w');let full=false;try{const b=Buffer.alloc(4*1024*1024,1);for(let i=0;i<70;i++)fs.writeSync(fd,b);}catch(e){a.equal(e.code,'ENOSPC');full=true;}finally{fs.closeSync(fd);fs.unlinkSync(file);}a.equal(full,true);}
       (async()=>{const children=[];let denied=false;try{for(let i=0;i<140;i++){const child=cp.spawn('/bin/sleep',['20'],{stdio:'ignore'});const started=await new Promise(resolve=>{child.once('spawn',()=>resolve(true));child.once('error',e=>{a.equal(e.code,'EAGAIN');resolve(false);});});if(!started){denied=true;break;}children.push(child);}a.equal(denied,true);}finally{for(const child of children)child.kill('SIGKILL');await Promise.all(children.map(child=>new Promise(r=>child.once('close',r))));}
       const throttled=()=>Number(fs.readFileSync('/sys/fs/cgroup/cpu.stat','utf8').match(/nr_throttled (\\d+)/)[1]);const before=throttled();await Promise.all(Array.from({length:4},()=>new Promise((resolve,reject)=>{const p=cp.spawn(process.execPath,['-e','const end=Date.now()+1000;while(Date.now()<end){}'],{stdio:'ignore'});p.once('error',reject);p.once('close',code=>code===0?resolve():reject(Error('cpu probe failed')));})));a.ok(throttled()>before);process.stdout.write('limits_verified');})().catch(()=>process.exit(1));`
     const result = await checked(["exec", id, "node", "-e", script], { timeoutMs: 25000 })

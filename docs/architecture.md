@@ -168,7 +168,7 @@ external security prerequisite is verified.
 | Issue context                 | 100 ordinary comments and 128 KiB; one owned triage summary has a separate allowance |
 | Source                        | 2,000 regular files, 1 MiB per file, 16 MiB total                                    |
 | CPU / memory / processes      | One CPU / 2 GiB with no extra swap / 128 processes                                   |
-| Workspace / temporary storage | 256 MiB quota volume / 64 MiB tmpfs                                                  |
+| Workspace / temporary storage | 256 MiB job quota volume / 64 MiB tmpfs                                              |
 | Time                          | Triage 120 s; coding at most 600 s; validation 180 s                                 |
 | Model requests                | Eight triage or 24 coding requests; 1 MiB/request; 4 MiB response; 60 s/request      |
 | Model output                  | At most 4,096 tokens with supported non-Codex SDK caps; no exact Codex token cap     |
@@ -181,8 +181,11 @@ external security prerequisite is verified.
 Only Node/npm regular-file Git trees are supported. Symlinks, submodules, workspaces, external
 package sources, binary patches, mode changes, and dependencies that need lifecycle scripts are
 rejected. Paths are also limited to 240 UTF-8 bytes and exports to 4,001 archive entries.
-Preparation permits 2,000 packages, 32 MiB per tarball, 128 MiB total downloads, and 192 MiB of
-exported dependencies, with a 600-second overall deadline. Resource or dependency failures do not
+Preparation permits 2,000 packages, 64 MiB per tarball/import, 1 GiB total downloads, 128 MiB per
+exported dependency file, and 512 MiB of exported dependency content, with a 600-second overall
+deadline. The preparation-only workspace is 2 GiB; ordinary coding jobs retain their 256 MiB
+workspace and all phases retain the 64 MiB temporary filesystem. Dependency JSON imports are
+bounded at 96 MiB, and the raw dependency archive read is bounded at 576 MiB. Resource or dependency failures do not
 enable broader access. Linux cgroup v2, built-in seccomp, local tmpfs volumes, and Docker Unix
 socket binds are required. Build-time transitive OS/npm packages are resolved during preparation;
 the approved immutable image binds their actual contents. Remote Docker daemons and Docker Desktop
@@ -219,6 +222,40 @@ Operators must identify the target's security-sensitive source domains. Path che
 semantic safety; uncertain assessments are deferred and every draft still needs human review.
 
 ## Admin settings and runtime snapshots
+
+The existing GitHub App connection is a separate authorization boundary from Pocket ID and model
+providers. Pocket ID grants administration; GitHub App OAuth with PKCE proves the connecting
+GitHub user's access to installations and writable repositories. The server derives App client
+ID/slug using its App key, validates user access again before saving a repository, and never
+trusts a Setup URL installation ID alone. An installation callback must also match the flow's
+single-use session-bound state. Only fixed GitHub hosts and exact local callbacks are used.
+
+One-time service App credentials and a verified repository binding are encrypted in the existing
+settings secrets table. Public status omits App secrets; connection metadata contains only App,
+repository/installation, GitHub user identity, and connection time. User access tokens and PKCE
+verifiers exist only in bounded session-owned server memory and are discarded locally after use.
+App/key rewrites change an internal ciphertext-derived generation, so late callbacks cannot
+commit after replacement, including replacement with the same values. Logout and shutdown abort
+pending work. This flow neither changes provider credentials nor grants execution approval.
+
+A selected connection that differs from the effective dispatch App/repository binding keeps
+runtime unconfigured. Matching saved service App credentials override stale webhook secrets in
+legacy runtime snapshots; the controller never passes App secrets to Docker workers. Repository
+selection does not infer a safe path policy, build a worker, or bypass runtime controls.
+
+Authenticated **Runtime** settings store the App ID, webhook secret, repository/installation
+identity, immutable worker image, path policy, verification argv, and existing operational limits.
+The complete record is encrypted in the existing `settings.sqlite` secrets table; schema 3 is
+unchanged. The API returns configuration metadata and a webhook-secret presence flag, never the
+saved secret. Omitted secrets retain the saved value; the first save requires a secret. Runtime
+mutations use the same session, exact-Origin, and CSRF checks as other administrative writes.
+Saving can start scans and paid assessments, but cannot create execution approval.
+
+Saved runtime settings are authoritative over legacy dispatch environment values. Legacy values
+are consulted only when no saved runtime record exists. Corrupt or undecryptable saved state
+stops dispatch without legacy fallback. Bootstrap encryption, OIDC authorization, listener, and
+state-directory settings remain external so the management UI can start safely. Runtime changes
+use the existing stop-before-reload and generation checks; failed cleanup keeps dispatch stopped.
 
 The authenticated UI accepts an unencrypted RSA PEM App key (at least 2048 bits, at most 32 KiB)
 and typed `api_key` or `oauth` provider credentials. AES-256-GCM encrypts complete SDK credentials,

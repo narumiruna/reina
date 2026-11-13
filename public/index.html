@@ -17,6 +17,7 @@
       <nav aria-label="Settings">
         <a href="#models" id="nav-models" aria-current="page"><span class="nav-icon" aria-hidden="true">◈</span>Models</a>
         <a href="#github" id="nav-github"><span class="nav-icon" aria-hidden="true">⌘</span>GitHub App</a>
+        <a href="#runtime" id="nav-runtime"><span class="nav-icon" aria-hidden="true">⚙</span>Runtime</a>
       </nav>
       <div class="sidebar-note"><span class="small-dot" aria-hidden="true"></span> Your agent, configured.<p>Manage the connections that power Reina.</p></div>
     </aside>
@@ -28,7 +29,7 @@
         <button type="button" id="retry-settings" class="secondary" hidden>Retry loading settings</button>
         <noscript><p class="notice error">Enable JavaScript to manage Reina settings.</p></noscript>
         <div id="settings-content" hidden>
-          <section class="runtime-bar" aria-label="Runtime configuration"><div><span class="eyebrow">RUNTIME</span><p id="runtime-status">Checking configuration…</p></div><div class="runtime-actions"><button type="button" id="refresh-settings" class="quiet">Refresh status</button><button type="button" id="reload-runtime" class="secondary">Apply configuration</button></div></section>
+          <section class="runtime-bar" aria-label="Runtime configuration"><div><span class="eyebrow">RUNTIME</span><p id="runtime-status">Checking configuration…</p><a href="#runtime" id="runtime-settings-link" hidden>Open Runtime settings</a><p class="hint" id="runtime-apply-hint">Applying configuration can start bounded issue scans and use the selected model. Coding still requires explicit approval.</p></div><div class="runtime-actions"><button type="button" id="refresh-settings" class="quiet">Refresh status</button><button type="button" id="reload-runtime" class="secondary" aria-describedby="runtime-apply-hint">Apply configuration</button></div></section>
           <section id="models-page">
             <div class="section-heading"><h2>Providers <span id="provider-count" class="count">0</span></h2><span class="muted">Credentials stay private</span></div>
             <div id="provider-empty" class="empty-state" hidden><span class="empty-icon" aria-hidden="true">◈</span><p class="eyebrow">MAKE THE FIRST CONNECTION</p><h3>A model for your workflow</h3><p>Connect an account or API key, save a model,<br>then select it for Reina.</p><button type="button" id="empty-add-provider" class="primary">Configure your first provider</button><ol class="setup-steps"><li>Configure provider</li><li>Save model</li><li>Select model</li></ol></div>
@@ -40,8 +41,85 @@
             <!-- biome-ignore lint/a11y/noRedundantRoles: Safari removes list semantics when list-style is none. -->
             <ul id="model-list" class="model-list" role="list"></ul>
           </section>
+          <section id="runtime-page" hidden>
+            <form id="runtime-form" class="panel runtime-form" action="/api/runtime/settings" method="post" aria-labelledby="runtime-form-title">
+              <h2 id="runtime-form-title">Runtime settings</h2>
+              <p class="section-description">Configure one repository and its worker policy. Refresh status keeps your unsaved edits.</p>
+              <fieldset>
+                <legend>GitHub identity</legend>
+                <p class="hint" id="runtime-connection-status">Connect GitHub to select a verified repository. <a href="#github">Open GitHub settings</a>.</p>
+                <details id="runtime-github-identity">
+                  <summary>Advanced GitHub identity</summary>
+                  <p class="hint">Manual identity fields are retained for compatibility. A connected repository supplies these values automatically.</p>
+                <div class="field"><label for="runtime-app-id">GitHub App ID (required)</label><input id="runtime-app-id" name="appId" inputmode="numeric" pattern="[1-9][0-9]{0,15}" maxlength="16" required autocomplete="off"></div>
+                <div class="field"><label id="runtime-secret-label" for="runtime-webhook-secret">Webhook secret (required for first save)</label><p class="hint" id="runtime-secret-hint">Write-only. Enter at least 32 characters for the first save. Use the same secret in your GitHub App webhook configuration. Saved secrets are never displayed.</p><input id="runtime-webhook-secret" name="webhookSecret" type="password" minlength="32" maxlength="4096" required autocomplete="new-password" autocorrect="off" autocapitalize="none" spellcheck="false" aria-describedby="runtime-secret-hint"></div>
+                <div class="field"><label for="runtime-repository-owner">Repository owner (required)</label><input id="runtime-repository-owner" name="repository.owner" required maxlength="39" pattern="[A-Za-z0-9]([A-Za-z0-9\-]{0,37}[A-Za-z0-9])?" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false"></div>
+                <div class="field"><label for="runtime-repository-name">Repository name (required)</label><input id="runtime-repository-name" name="repository.name" required maxlength="100" pattern="[A-Za-z0-9_][A-Za-z0-9_.\-]{0,99}" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false"></div>
+                <div class="field"><label for="runtime-repository-id">Repository ID (required)</label><input id="runtime-repository-id" name="repository.id" inputmode="numeric" pattern="[1-9][0-9]{0,15}" maxlength="16" required autocomplete="off"></div>
+                <div class="field"><label for="runtime-installation-id">Installation ID (required)</label><input id="runtime-installation-id" name="repository.installationId" inputmode="numeric" pattern="[1-9][0-9]{0,15}" maxlength="16" required autocomplete="off"></div>
+                </details>
+              </fieldset>
+              <p id="runtime-repository-review" class="notice pending" role="status" aria-atomic="true" hidden></p>
+              <fieldset>
+                <legend>Worker image</legend>
+                <div class="field"><label for="runtime-image">Immutable worker image ID (required)</label><p class="hint" id="runtime-image-hint">Use a prepared worker image ID, sha256: followed by 64 lowercase hexadecimal characters, or an image reference pinned with @sha256: and that digest. Tags alone are not allowed.</p><input id="runtime-image" name="image" required maxlength="512" pattern="(sha256:[a-f0-9]{64}|.+@sha256:[a-f0-9]{64})" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" aria-describedby="runtime-image-hint"></div>
+              </fieldset>
+              <fieldset>
+                <legend>Repository policy</legend>
+                <div class="field"><label for="runtime-allowed-paths">Allowed paths (required)</label><p class="hint" id="runtime-allowed-hint">One repository-relative pattern per line, up to 64 patterns of 256 characters each. Blank lines are ignored. Forbidden paths take priority.</p><textarea id="runtime-allowed-paths" name="allowedPaths" rows="4" required maxlength="65536" autocorrect="off" autocapitalize="none" spellcheck="false" aria-describedby="runtime-allowed-hint">README.md
+docs/**
+src/**
+tests/**</textarea></div>
+                <div class="field"><label for="runtime-forbidden-paths">Forbidden paths (required)</label><p class="hint" id="runtime-forbidden-hint">Name this repository's security and deployment domains. For example, src/auth/**, infra/**, or .github/** may need protection in your repository. These examples are not a complete policy. Enter your own list: one repository-relative pattern per line, up to 64 patterns of 256 characters each.</p><textarea id="runtime-forbidden-paths" name="forbiddenPaths" rows="4" required maxlength="65536" autocorrect="off" autocapitalize="none" spellcheck="false" aria-describedby="runtime-forbidden-hint"></textarea></div>
+                <div class="field"><label for="runtime-commands">Verification commands (required)</label><p class="hint" id="runtime-commands-hint">Enter a JSON array of argument arrays, for example [["npm","run","ci"]]. Use 1–8 commands with 1–32 non-empty string arguments each. Commands run directly, not through a shell. Do not enter a shell command string.</p><textarea id="runtime-commands" name="commands" rows="4" required maxlength="65536" autocorrect="off" autocapitalize="none" spellcheck="false" aria-describedby="runtime-commands-hint">[["npm","run","ci"]]</textarea></div>
+              </fieldset>
+              <details id="runtime-advanced">
+                <summary>Advanced runtime limits</summary>
+                <fieldset>
+                  <legend>Scan and job limits</legend>
+                  <p class="hint runtime-concurrency">Maximum concurrent jobs is fixed at 1. Reina runs one job at a time to keep work bounded.</p>
+                  <div class="field"><label for="runtime-scan-interval">Scan interval (milliseconds, required)</label><p class="hint" id="runtime-scan-hint">60,000–86,400,000 ms. Default: 900,000 ms (15 minutes).</p><input id="runtime-scan-interval" name="scanIntervalMs" type="number" inputmode="numeric" min="60000" max="86400000" step="1" value="900000" required aria-describedby="runtime-scan-hint"></div>
+                  <div class="field"><label for="runtime-max-issues">Maximum issues per scan (required)</label><input id="runtime-max-issues" name="maxIssuesPerScan" type="number" inputmode="numeric" min="1" max="10" step="1" value="10" required></div>
+                  <div class="field"><label for="runtime-agent-timeout">Agent timeout (milliseconds, required)</label><p class="hint" id="runtime-timeout-hint">1,000–600,000 ms. Default: 600,000 ms (10 minutes).</p><input id="runtime-agent-timeout" name="agentTimeoutMs" type="number" inputmode="numeric" min="1000" max="600000" step="1" value="600000" required aria-describedby="runtime-timeout-hint"></div>
+                  <div class="field"><label for="runtime-max-files">Maximum changed files (required)</label><input id="runtime-max-files" name="maxChangedFiles" type="number" inputmode="numeric" min="1" max="10" step="1" value="10" required></div>
+                  <div class="field"><label for="runtime-max-bytes">Maximum patch size (bytes, required)</label><input id="runtime-max-bytes" name="maxPatchBytes" type="number" inputmode="numeric" min="1" max="65536" step="1" value="65536" required></div>
+                </fieldset>
+              </details>
+              <p class="hint" id="runtime-save-hint">Saving also applies these settings with a safe runtime reload. Issue scans and model use can start; coding still requires explicit approval.</p>
+              <p id="runtime-form-status" class="notice" role="status" aria-atomic="true"></p>
+              <div class="form-actions"><button type="submit" id="save-runtime" class="primary" aria-describedby="runtime-save-hint">Save and apply configuration</button></div>
+            </form>
+          </section>
           <section id="github-page" hidden>
-            <article class="panel key-panel"><div class="panel-heading"><div><h2>App private key</h2><p>Connect Reina to your GitHub App with a PEM private key.</p></div><span id="github-badge" class="badge">Not configured</span></div>
+            <article class="panel github-connect-panel" aria-labelledby="github-connect-title">
+              <div class="panel-heading"><div><h2 id="github-connect-title">Connect GitHub</h2><p>Authorize your GitHub account, then choose a repository available to this service's GitHub App. Existing App installations can be reused.</p></div><span id="github-connection-badge" class="badge">Not connected</span></div>
+              <p class="hint" id="github-connect-help">Continue to the official GitHub authorization page in this tab. Connecting does not start the runtime or approve coding. Review the worker image and repository policy separately in Runtime settings.</p>
+              <p id="github-service-notice" class="hint" hidden>This service needs one-time GitHub App setup. Choose Connect GitHub to open the missing settings. Existing App keys and matching webhook settings are retained.</p>
+              <dl id="github-connection-metadata" class="key-metadata" hidden><div><dt>Repository</dt><dd id="github-current-repository"></dd></div><div><dt>Connected by</dt><dd id="github-current-user"></dd></div><div><dt>Connected at</dt><dd id="github-connected-at"></dd></div></dl>
+              <p id="github-connect-status" class="notice" role="status" aria-atomic="true"></p>
+              <form id="github-repository-form" action="/api/github/connect/select" method="post" aria-labelledby="github-repository-title" hidden>
+                <h3 id="github-repository-title">Choose an authorized repository</h3>
+                <div class="field"><label for="github-repository-select">Repository (required)</label><p id="github-repository-hint" class="hint">Only verified repositories available to your account and this App are listed. Selection is not saved until you choose Use repository.</p><select id="github-repository-select" name="repositoryId" required aria-describedby="github-repository-hint"><option value="">Choose a repository</option></select></div>
+                <div class="form-actions"><button type="submit" id="github-use-repository" class="primary">Use repository</button></div>
+              </form>
+              <div class="form-actions github-connect-actions"><button type="button" id="github-connect" class="primary" aria-describedby="github-connect-help" disabled>Connect GitHub</button><button type="button" id="github-install" class="secondary" hidden>Install / manage App</button><button type="button" id="github-refresh" class="quiet" aria-describedby="github-install-help" disabled>Refresh repositories</button><button type="button" id="github-cancel" class="quiet" hidden>Cancel connection</button></div>
+              <p id="github-install-help" class="hint" hidden>To add repositories, use Install / manage App on GitHub. If organization approval is required, ask an organization owner to approve the request, then refresh repositories to check access again. If this connection attempt has expired, use Connect GitHub again. Reina cannot approve requests for you.</p>
+            </article>
+            <details id="github-service-setup" class="panel github-service-setup">
+              <summary>Service operator: one-time GitHub App setup</summary>
+              <p class="hint">This section is for the service operator, not users connecting a repository. Register an existing GitHub App for this Reina service. Credentials are write-only and are never displayed.</p>
+              <ol class="github-setup-instructions"><li>In your GitHub App settings, register the exact callback URL and setup URL below. Enable <strong>Redirect on update</strong>.</li><li>Leave <strong>Request user authorization (OAuth) during installation</strong> off. Connect GitHub starts a separate authorization flow with PKCE.</li><li>Enter the App ID and client secret. Configure the same webhook secret in GitHub and Reina. Upload the App's unencrypted PEM private key below.</li></ol>
+              <dl class="key-metadata"><div><dt>Callback URL</dt><dd><code id="github-callback-url">Unavailable until settings load</code></dd></div><div><dt>Setup URL</dt><dd><code id="github-setup-url">Unavailable until settings load</code></dd></div><div><dt>Service credentials</dt><dd id="github-service-status">Checking configuration…</dd></div></dl>
+              <form id="github-app-form" action="/api/github/app" method="post" aria-labelledby="github-app-title">
+                <h3 id="github-app-title">Register service App</h3>
+                <div class="field"><label for="github-app-id">GitHub App ID (required)</label><input id="github-app-id" name="appId" inputmode="numeric" pattern="[1-9][0-9]{0,15}" maxlength="16" required autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false"></div>
+                <p id="github-app-secret-hint" class="hint">Secrets are write-only. Leave a secret blank to keep its saved value for the same App. A different App requires new secrets. Client secret: paste the generated value from GitHub (1–4,096 characters); surrounding whitespace is removed. Webhook secret: 32–4,096 characters; whitespace is not changed.</p>
+                <div class="field"><label id="github-client-secret-label" for="github-client-secret">Client secret (required)</label><input id="github-client-secret" name="clientSecret" type="password" minlength="1" maxlength="4096" required autocomplete="new-password" autocorrect="off" autocapitalize="none" spellcheck="false" aria-describedby="github-app-secret-hint"></div>
+                <div class="field"><label id="github-webhook-secret-label" for="github-webhook-secret">Webhook secret (required)</label><input id="github-webhook-secret" name="webhookSecret" type="password" minlength="32" maxlength="4096" required autocomplete="new-password" autocorrect="off" autocapitalize="none" spellcheck="false" aria-describedby="github-app-secret-hint"></div>
+                <p id="github-app-status" class="notice" role="status" aria-atomic="true"></p>
+                <div class="form-actions"><button type="submit" id="github-save-app" class="primary">Save service App</button></div>
+              </form>
+            <article class="key-panel"><div class="panel-heading"><div><h2>App private key</h2><p>The service operator uploads the App's PEM private key once for this service.</p></div><span id="github-badge" class="badge">Not configured</span></div>
               <dl class="key-metadata"><div><dt>Fingerprint</dt><dd id="github-fingerprint" class="mono">No key uploaded</dd></div><div><dt>Last uploaded</dt><dd id="github-uploaded">—</dd></div></dl>
               <form id="github-form" action="/api/github/private-key" method="post" aria-labelledby="key-form-title">
                 <h3 id="key-form-title">Upload private key</h3>
@@ -50,6 +128,7 @@
               </form>
             </article>
             <div class="privacy-note"><span aria-hidden="true">◇</span><p><strong>Write-only credentials.</strong> Reina returns only the key fingerprint and configuration status. Upload a new file to replace an existing key.</p></div>
+            </details>
           </section>
         </div>
       </main>

@@ -14,8 +14,9 @@ import { join, resolve } from "node:path"
 import { backup, DatabaseSync } from "node:sqlite"
 import { fileURLToPath } from "node:url"
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
-import { loadConfig } from "../src/config.js"
+import { loadConfig, loadRuntimeConfig } from "../src/config.js"
 import { Store } from "../src/jobs/store.js"
+import { dispatchInputSchema, dispatchSettingsSchema } from "../src/settings/dispatch.js"
 import {
   allowedPath,
   eligible,
@@ -272,6 +273,8 @@ describe("strict configuration", () => {
       "maxTokens",
       "modelRevision",
       "privateKey",
+      "appId",
+      "webhookSecret",
     ])
       expect(value).not.toHaveProperty(field)
     expect(
@@ -284,6 +287,41 @@ describe("strict configuration", () => {
         }),
       ).image,
     ).toContain("@sha256:")
+  })
+
+  test("legacy and persisted dispatch schemas use the same fields and defaults", () => {
+    const { stateDir, ...legacy } = loadRuntimeConfig(environment())
+    const saved = dispatchInputSchema.parse({
+      appId: 123,
+      webhookSecret: environment().WEBHOOK_SECRET,
+      repository: { owner: "example", name: "project", id: 456, installationId: 789 },
+      image,
+      forbiddenPaths: JSON.parse(environment().REINA_FORBIDDEN_PATHS ?? "[]"),
+    })
+    expect(dispatchSettingsSchema.parse(saved)).toEqual(legacy)
+    const { appId: _appId, webhookSecret: _secret, ...runtime } = legacy
+    expect(loadConfig(environment())).toEqual({ ...runtime, stateDir })
+  })
+
+  test.each([
+    ["REINA_SCAN_INTERVAL_MS", "scanIntervalMs", 60_000, 86_400_000],
+    ["REINA_MAX_ISSUES_PER_SCAN", "maxIssuesPerScan", 1, 10],
+    ["REINA_MAX_CONCURRENT_JOBS", "maxConcurrentJobs", 1, 1],
+    ["REINA_AGENT_TIMEOUT_MS", "agentTimeoutMs", 1_000, 600_000],
+    ["REINA_MAX_CHANGED_FILES", "maxChangedFiles", 1, 10],
+    ["REINA_MAX_PATCH_BYTES", "maxPatchBytes", 1, 65_536],
+  ])("legacy %s and saved %s enforce the same numeric limits", (key, field, min, max) => {
+    const { stateDir: _stateDir, ...input } = loadRuntimeConfig(environment())
+    for (const value of [min, max]) {
+      expect(loadRuntimeConfig(environment({ [key]: String(value) }))).toHaveProperty(field, value)
+      expect(dispatchInputSchema.parse({ ...input, [field]: value })).toHaveProperty(field, value)
+    }
+    for (const value of [min - 1, max + 1, min + 0.5]) {
+      expect(() => loadRuntimeConfig(environment({ [key]: String(value) }))).toThrow(
+        `Invalid configuration fields: ${key}`,
+      )
+      expect(dispatchInputSchema.safeParse({ ...input, [field]: value }).success).toBe(false)
+    }
   })
 
   test("uses process.env by default without rejecting unrelated host variables", () => {

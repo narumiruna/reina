@@ -1264,6 +1264,48 @@ function wireBody(init?: RequestInit): Record<string, unknown> {
 }
 
 describe("host-only account requests", () => {
+  it("accepts bounded Codex SSE without Content-Type, not arbitrary response bodies", async () => {
+    const { config } = accountFixture("openai-codex", "openai-codex-responses")
+    const fetcher = vi.fn(async () => {
+      const response = sse(accountEvents("openai-codex-responses", false))
+      response.headers.delete("content-type")
+      return response
+    }) as unknown as typeof fetch
+    expect(await collect(config, request, fetcher)).toContain("Hello back")
+    expect(fetcher).toHaveBeenCalledTimes(1)
+
+    for (const body of ["<html>fixture-secret</html>", '{"error":"fixture-secret"}', ""]) {
+      const invalid = vi.fn(async () => new Response(new TextEncoder().encode(body)))
+      await expect(collect(config, request, invalid)).rejects.toThrow(
+        /^model_gateway_upstream_failed$/,
+      )
+      expect(invalid).toHaveBeenCalledTimes(1)
+    }
+  })
+
+  it.each(accountCases)(
+    "rejects missing non-Codex MIME and explicit incorrect MIME for $provider/$api",
+    async ({ provider, api }) => {
+      const { config } = accountFixture(provider, api)
+      for (const contentType of [
+        "text/html",
+        "application/json",
+        ...(api === "openai-codex-responses" ? [] : [null]),
+      ]) {
+        const fetcher = vi.fn(async () => {
+          const response = sse(accountEvents(api, false))
+          if (contentType === null) response.headers.delete("content-type")
+          else response.headers.set("content-type", contentType)
+          return response
+        })
+        await expect(collect(config, request, fetcher)).rejects.toThrow(
+          /^model_gateway_upstream_failed$/,
+        )
+        expect(fetcher).toHaveBeenCalledTimes(1)
+      }
+    },
+  )
+
   it.each(accountCases)(
     "continues $provider/$api with SDK auth, headers, and native parts",
     async ({ provider, api }) => {

@@ -1,10 +1,12 @@
-import { mkdtempSync, rmSync } from "node:fs"
+import { chmodSync, mkdtempSync, rmSync } from "node:fs"
 import type { IncomingMessage, ServerResponse } from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 import { httpServer } from "../src/app.js"
 import type { Store } from "../src/jobs/store.js"
+import { type DispatchSettings, dispatchInputSchema } from "../src/settings/dispatch.js"
+import type { GitHubAppSettings, GitHubConnection } from "../src/settings/github.js"
 import type { ModelSelection } from "../src/settings/schema.js"
 import type { SettingsStore } from "../src/settings/store.js"
 import type { Config } from "../src/types.js"
@@ -55,6 +57,9 @@ let directory: string
 let settings: {
   selection: ReturnType<typeof vi.fn<() => ModelSelection | undefined>>
   privateKey: ReturnType<typeof vi.fn<() => string | undefined>>
+  dispatchSettings: ReturnType<typeof vi.fn<() => DispatchSettings | undefined>>
+  githubAppSettings: ReturnType<typeof vi.fn<() => GitHubAppSettings | undefined>>
+  githubConnection: ReturnType<typeof vi.fn<() => GitHubConnection | undefined>>
 }
 let env: NodeJS.ProcessEnv
 const store = {} as Store
@@ -73,6 +78,36 @@ function selection(overrides: Partial<ModelSelection> = {}): ModelSelection {
     maxTokens: 4096,
     modelRevision: "fixture-revision-1",
     ...overrides,
+  }
+}
+function dispatch(overrides: Partial<DispatchSettings> = {}): DispatchSettings {
+  return {
+    ...dispatchInputSchema.parse({
+      appId: 321,
+      webhookSecret: "saved-webhook-secret-never-returned",
+      repository: { owner: "saved-owner", name: "saved-repo", id: 654, installationId: 987 },
+      image: `ghcr.io/saved/worker@sha256:${"e".repeat(64)}`,
+      forbiddenPaths: ["src/security/**", "src/deployment/**"],
+    }),
+    webhookSecret: "saved-webhook-secret-never-returned",
+    ...overrides,
+  }
+}
+function appSettings(appId = 321): GitHubAppSettings {
+  return {
+    appId,
+    clientId: "Iv23.fixture-client",
+    slug: "reina-fixture",
+    clientSecret: "fixture-client-secret-never-returned",
+    webhookSecret: "current-app-webhook-secret-never-returned",
+  }
+}
+function connection(saved = dispatch()): GitHubConnection {
+  return {
+    appId: saved.appId,
+    repository: { ...saved.repository },
+    connectedAt: 1_800_000_000_000,
+    user: { id: 42, login: "operator" },
   }
 }
 function deferred() {
@@ -120,6 +155,9 @@ beforeEach(() => {
   settings = {
     selection: vi.fn(() => selection()),
     privateKey: vi.fn(() => "fixture-uploaded-pem"),
+    dispatchSettings: vi.fn<() => DispatchSettings | undefined>(() => undefined),
+    githubAppSettings: vi.fn<() => GitHubAppSettings | undefined>(() => undefined),
+    githubConnection: vi.fn<() => GitHubConnection | undefined>(() => undefined),
   }
   mocks.getAuthenticated.mockResolvedValue({ data: { slug: "reina-fixture" } })
   mocks.getByUsername.mockResolvedValue({ data: { id: 99, type: "Bot" } })
@@ -165,6 +203,9 @@ describe("controller prerequisites", () => {
     expect(value.status().state).toBe("not_configured")
     expect(settings.selection).not.toHaveBeenCalled()
     expect(settings.privateKey).not.toHaveBeenCalled()
+    expect(settings.dispatchSettings).not.toHaveBeenCalled()
+    expect(settings.githubAppSettings).not.toHaveBeenCalled()
+    expect(settings.githubConnection).not.toHaveBeenCalled()
     expectNoRuntime()
   })
 
@@ -181,6 +222,8 @@ describe("controller prerequisites", () => {
     )
     expect(value.app()).toBeUndefined()
     expect(settings.privateKey).not.toHaveBeenCalled()
+    expect(settings.githubAppSettings).not.toHaveBeenCalled()
+    expect(settings.githubConnection).not.toHaveBeenCalled()
     expectNoRuntime()
   })
 
@@ -193,6 +236,8 @@ describe("controller prerequisites", () => {
       expect(value.status()).toEqual({ state: "not_configured", reason: "upload_private_key" }),
     )
     expect(value.app()).toBeUndefined()
+    expect(settings.githubAppSettings).not.toHaveBeenCalled()
+    expect(settings.githubConnection).not.toHaveBeenCalled()
     expectNoRuntime()
   })
 
@@ -201,13 +246,65 @@ describe("controller prerequisites", () => {
     const value = controller()
     value.reload()
     await vi.waitFor(() =>
-      expect(value.status()).toEqual({ state: "not_configured", reason: "configure_environment" }),
+      expect(value.status()).toEqual({ state: "not_configured", reason: "configure_runtime" }),
     )
     expect(value.app()).toBeUndefined()
     expectNoRuntime()
     env.REINA_REPOSITORY_ID = "456"
     value.reload()
     await running(value)
+  })
+
+  test("missing saved settings and legacy runtime fields request runtime configuration", async () => {
+    env = { REINA_STATE_DIR: env.REINA_STATE_DIR }
+    const value = controller()
+    value.reload()
+    await vi.waitFor(() =>
+      expect(value.status()).toEqual({ state: "not_configured", reason: "configure_runtime" }),
+    )
+    expect(value.app()).toBeUndefined()
+    expectNoRuntime()
+  })
+
+  test.each([undefined, "relative/state", process.cwd(), "/"])(
+    "saved settings cannot bypass an invalid bootstrap state directory: %s",
+    async (stateDir) => {
+      settings.dispatchSettings.mockReturnValue(dispatch())
+      env.REINA_STATE_DIR = stateDir
+      const value = controller()
+      value.reload()
+      await vi.waitFor(() =>
+        expect(value.status()).toEqual({ state: "not_configured", reason: "configure_runtime" }),
+      )
+      expect(value.app()).toBeUndefined()
+      expectNoRuntime()
+    },
+  )
+
+  test("saved settings cannot use a state directory with public permissions", async () => {
+    settings.dispatchSettings.mockReturnValue(dispatch())
+    chmodSync(directory, 0o755)
+    env.REINA_STATE_DIR = directory
+    const value = controller()
+    value.reload()
+    await vi.waitFor(() =>
+      expect(value.status()).toEqual({ state: "not_configured", reason: "configure_runtime" }),
+    )
+    expectNoRuntime()
+  })
+
+  test("invalid persisted settings fail closed instead of using valid legacy environment", async () => {
+    settings.dispatchSettings.mockImplementation(() => {
+      throw new Error("private-persisted-input")
+    })
+    const value = controller()
+    value.reload()
+    await vi.waitFor(() =>
+      expect(value.status()).toEqual({ state: "failed", reason: "settings_unavailable" }),
+    )
+    expect(value.app()).toBeUndefined()
+    expectNoRuntime()
+    expect(JSON.stringify(log.error.mock.calls)).not.toContain("private-persisted-input")
   })
 
   test("management routes work while webhook dispatch is unavailable without opening a socket", async () => {
@@ -252,8 +349,161 @@ describe("controller prerequisites", () => {
   })
 })
 
+describe("controller GitHub settings compatibility", () => {
+  test.each(["saved", "legacy"])(
+    "a new App identity cannot start the old %s dispatch configuration",
+    async (source) => {
+      if (source === "saved") settings.dispatchSettings.mockReturnValue(dispatch())
+      settings.githubAppSettings.mockReturnValue(appSettings(999))
+      const value = controller()
+      value.reload()
+      await vi.waitFor(() =>
+        expect(value.status()).toEqual({ state: "not_configured", reason: "configure_runtime" }),
+      )
+      expect(value.app()).toBeUndefined()
+      expectNoRuntime()
+    },
+  )
+
+  test.each([
+    ["appId", 999],
+    ["id", 999],
+    ["installationId", 999],
+    ["owner", "different-owner"],
+    ["name", "different-repo"],
+    ["owner", "Saved-owner"],
+    ["name", "Saved-repo"],
+  ])("rejects a verified connection with a different %s", async (field, replacement) => {
+    const saved = dispatch()
+    settings.dispatchSettings.mockReturnValue(saved)
+    settings.githubAppSettings.mockReturnValue(appSettings())
+    const verified = connection(saved)
+    settings.githubConnection.mockReturnValue(
+      field === "appId"
+        ? { ...verified, appId: Number(replacement) }
+        : { ...verified, repository: { ...verified.repository, [field]: replacement } },
+    )
+    const value = controller()
+    value.reload()
+    await vi.waitFor(() =>
+      expect(value.status()).toEqual({ state: "not_configured", reason: "configure_runtime" }),
+    )
+    expectNoRuntime()
+  })
+
+  test("a verified connection also prevents legacy dispatch from using another repository", async () => {
+    settings.githubConnection.mockReturnValue(connection())
+    const value = controller()
+    value.reload()
+    await vi.waitFor(() =>
+      expect(value.status()).toEqual({ state: "not_configured", reason: "configure_runtime" }),
+    )
+    expectNoRuntime()
+  })
+
+  test.each(["saved", "legacy"])(
+    "matching App settings use their current secret with %s dispatch without passing App credentials to the runtime",
+    async (source) => {
+      const saved = dispatch()
+      if (source === "saved") settings.dispatchSettings.mockReturnValue(saved)
+      else {
+        saved.appId = Number(env.APP_ID)
+        saved.repository = { owner: "example", name: "project", id: 456, installationId: 789 }
+      }
+      const app = appSettings(saved.appId)
+      const verified = connection(saved)
+      settings.githubAppSettings.mockReturnValue(app)
+      settings.githubConnection.mockReturnValue(verified)
+      const value = controller()
+      value.reload()
+      await running(value)
+      expect(mocks.Probot).toHaveBeenCalledWith(
+        expect.objectContaining({ appId: app.appId, secret: app.webhookSecret }),
+      )
+      expect(mocks.Probot.mock.calls[0][0]).not.toHaveProperty("clientSecret")
+      for (const config of [mocks.runtimes[0].config, mocks.orchestrators[0].config]) {
+        expect(config.repository).toEqual(saved.repository)
+        for (const field of ["appId", "clientId", "slug", "clientSecret", "webhookSecret", "user"])
+          expect(config).not.toHaveProperty(field)
+        expect(JSON.stringify(config)).not.toContain(app.clientSecret)
+        expect(JSON.stringify(config)).not.toContain(app.webhookSecret)
+      }
+      const rotated = { ...app, webhookSecret: "rotated-app-webhook-secret-never-returned" }
+      settings.githubAppSettings.mockReturnValue(rotated)
+      value.reload()
+      await running(value)
+      expect(mocks.orchestrators[0].stop).toHaveBeenCalledOnce()
+      expect(mocks.Probot).toHaveBeenLastCalledWith(
+        expect.objectContaining({ appId: app.appId, secret: rotated.webhookSecret }),
+      )
+      expect(settings.githubConnection()).toEqual(verified)
+      const output = JSON.stringify([value.status(), log.info.mock.calls, log.error.mock.calls])
+      for (const secret of [app.clientSecret, app.webhookSecret, rotated.webhookSecret])
+        expect(output).not.toContain(secret)
+    },
+  )
+
+  test.each(["githubAppSettings", "githubConnection"] as const)(
+    "corrupt %s fails closed before legacy environment validation",
+    async (getter) => {
+      settings[getter].mockImplementation(() => {
+        throw new Error("private-invalid-github-record")
+      })
+      env.APP_ID = "invalid"
+      const value = controller()
+      value.reload()
+      await vi.waitFor(() =>
+        expect(value.status()).toEqual({ state: "failed", reason: "settings_unavailable" }),
+      )
+      expectNoRuntime()
+      expect(JSON.stringify(log.error.mock.calls)).not.toContain("private-invalid-github-record")
+    },
+  )
+
+  test.each(["githubAppSettings", "githubConnection"] as const)(
+    "a %s read failure stops running dispatch without legacy fallback",
+    async (getter) => {
+      settings.dispatchSettings.mockReturnValue(dispatch())
+      const value = controller()
+      value.reload()
+      await running(value)
+      settings[getter].mockImplementation(() => {
+        throw new Error("private-invalid-github-record")
+      })
+      value.reload()
+      expect(value.app()).toBeUndefined()
+      expect(mocks.orchestrators[0].stop).toHaveBeenCalledOnce()
+      await vi.waitFor(() =>
+        expect(value.status()).toEqual({ state: "failed", reason: "settings_unavailable" }),
+      )
+      expect(mocks.Probot).toHaveBeenCalledOnce()
+      expect(mocks.DockerRuntime).toHaveBeenCalledOnce()
+      expect(JSON.stringify(log.error.mock.calls)).not.toContain("private-invalid-github-record")
+    },
+  )
+
+  test("changing the verified connection stops old dispatch instead of switching repositories", async () => {
+    settings.dispatchSettings.mockReturnValue(dispatch())
+    settings.githubConnection.mockReturnValue(connection())
+    const value = controller()
+    value.reload()
+    await running(value)
+    const next = connection()
+    next.repository.id = 999
+    settings.githubConnection.mockReturnValue(next)
+    value.reload()
+    expect(value.app()).toBeUndefined()
+    expect(mocks.orchestrators[0].stop).toHaveBeenCalledOnce()
+    await vi.waitFor(() =>
+      expect(value.status()).toEqual({ state: "not_configured", reason: "configure_runtime" }),
+    )
+    expect(mocks.Probot).toHaveBeenCalledOnce()
+    expect(mocks.DockerRuntime).toHaveBeenCalledOnce()
+  })
+})
+
 describe("controller runtime lifecycle", () => {
-  test("starts Probot only with stored selection, uploaded PEM, and valid dispatch settings", async () => {
+  test("uses legacy runtime environment only while saved dispatch settings are absent", async () => {
     env.PRIVATE_KEY = "ignored-environment-key"
     const selected = selection()
     settings.selection.mockReturnValue(selected)
@@ -269,7 +519,7 @@ describe("controller runtime lifecycle", () => {
     })
     expect(mocks.Probot).toHaveBeenCalledWith(
       expect.objectContaining({
-        appId: "123",
+        appId: 123,
         privateKey: "fixture-uploaded-pem",
         secret: env.WEBHOOK_SECRET,
       }),
@@ -292,6 +542,88 @@ describe("controller runtime lifecycle", () => {
     expect(mocks.orchestrators[0].start).toHaveBeenCalledOnce()
     expect(mocks.runtimes[0].cleanup).not.toHaveBeenCalled()
     expect(value.app()).toBe(mocks.apps[0])
+  })
+
+  test.each(["missing", "invalid", "stale"])(
+    "saved settings are authoritative when legacy environment is %s",
+    async (legacy) => {
+      const saved = dispatch({ scanIntervalMs: 120_000, maxPatchBytes: 1024 })
+      settings.dispatchSettings.mockReturnValue(saved)
+      if (legacy === "missing") env = { REINA_STATE_DIR: env.REINA_STATE_DIR }
+      if (legacy === "invalid") {
+        for (const key of Object.keys(env)) {
+          if (key !== "REINA_STATE_DIR") env[key] = "invalid-private-environment-input"
+        }
+        env.REINA_UNKNOWN_SETTING = "invalid-private-environment-input"
+      }
+      const value = controller()
+      value.reload()
+      await running(value)
+      const { appId, webhookSecret, ...runtime } = saved
+      expect(mocks.Probot).toHaveBeenCalledWith(
+        expect.objectContaining({
+          appId,
+          secret: webhookSecret,
+          privateKey: "fixture-uploaded-pem",
+        }),
+      )
+      expect(mocks.runtimes[0].config).toEqual({
+        ...runtime,
+        stateDir: env.REINA_STATE_DIR,
+        ...selection(),
+      })
+      expect(mocks.runtimes[0].config).not.toHaveProperty("webhookSecret")
+      expect(mocks.runtimes[0].config).not.toHaveProperty("appId")
+      const output = JSON.stringify([value.status(), log.info.mock.calls, log.error.mock.calls])
+      expect(output).not.toContain(webhookSecret)
+      expect(output).not.toContain("invalid-private-environment-input")
+    },
+  )
+
+  test("saved runtime edits retire prior work before replacement dispatch", async () => {
+    const first = dispatch()
+    settings.dispatchSettings.mockReturnValue(first)
+    const value = controller()
+    value.reload()
+    await running(value)
+    const stopped = deferred()
+    mocks.orchestrators[0].stop.mockReturnValue(stopped.promise)
+    const next = dispatch({
+      appId: 555,
+      webhookSecret: "replacement-webhook-secret-value-32",
+      maxPatchBytes: 2048,
+    })
+    settings.dispatchSettings.mockReturnValue(next)
+    value.reload()
+    expect(value.app()).toBeUndefined()
+    expect(mocks.orchestrators[0].stop).toHaveBeenCalledOnce()
+    await Promise.resolve()
+    expect(mocks.Probot).toHaveBeenCalledOnce()
+    stopped.resolve()
+    await running(value)
+    expect(mocks.Probot).toHaveBeenLastCalledWith(
+      expect.objectContaining({ appId: next.appId, secret: next.webhookSecret }),
+    )
+    expect(mocks.orchestrators[0].config.maxPatchBytes).toBe(first.maxPatchBytes)
+    expect(mocks.orchestrators[1].config.maxPatchBytes).toBe(next.maxPatchBytes)
+  })
+
+  test("a persisted read error retires running dispatch without resurrecting legacy config", async () => {
+    settings.dispatchSettings.mockReturnValue(dispatch())
+    const value = controller()
+    value.reload()
+    await running(value)
+    settings.dispatchSettings.mockImplementation(() => {
+      throw new Error("invalid_dispatch_settings")
+    })
+    value.reload()
+    expect(value.app()).toBeUndefined()
+    expect(mocks.orchestrators[0].stop).toHaveBeenCalledOnce()
+    await vi.waitFor(() =>
+      expect(value.status()).toEqual({ state: "failed", reason: "settings_unavailable" }),
+    )
+    expect(mocks.Probot).toHaveBeenCalledOnce()
+    expect(mocks.DockerRuntime).toHaveBeenCalledOnce()
   })
 
   test("reload disables dispatch and stops prior work before it starts the new selection snapshot", async () => {

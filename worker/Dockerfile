@@ -7,7 +7,7 @@ RUN timeout 180 sh -c 'apt-get update && apt-get install -y --no-install-recomme
     && test "$(pi --version)" = "1.5.0" \
     && mkdir -p /workspace /run /opt/reina /opt/deps \
     && chown 1000:1000 /workspace
-COPY bridge.mjs ready.mjs probe.mjs prepare.mjs import.mjs /opt/reina/
+COPY bridge.mjs ready.mjs probe.mjs prepare.mjs import.mjs dependency-limits.mjs /opt/reina/
 LABEL io.reina.runtime="1" io.reina.pi-version="1.5.0"
 ENV HOME=/tmp/home PI_CODING_AGENT_DIR=/tmp/reina-agent PI_OFFLINE=1 PI_TELEMETRY=0
 USER 1000:1000

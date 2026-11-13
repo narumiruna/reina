@@ -272,7 +272,7 @@ async function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise
 function limitedFetch(
   fetcher: typeof fetch,
   signal: AbortSignal,
-  allowCompressed: boolean,
+  codex: boolean,
   onRetryableFailure?: () => void,
 ): typeof fetch {
   return async (input, init) => {
@@ -282,7 +282,7 @@ function limitedFetch(
     if (
       !(
         (typeof body === "string" && Buffer.byteLength(body) <= BODY_LIMIT) ||
-        (allowCompressed &&
+        (codex &&
           body instanceof Uint8Array &&
           body.byteLength <= BODY_LIMIT &&
           new Headers(init?.headers).get("content-encoding") === "zstd" &&
@@ -302,11 +302,12 @@ function limitedFetch(
       throw new Error(FAILURE)
     }
     if (!requestSignal.aborted && retryableStatus(response.status)) onRetryableFailure?.()
-    if (
-      !response.ok ||
-      !response.headers.get("content-type")?.startsWith("text/event-stream") ||
-      !response.body
-    ) {
+    const contentType = response.headers.get("content-type")
+    // Codex can omit Content-Type on a successful SSE response. Its SDK still
+    // validates stream events; byte, time, origin, and completion checks apply.
+    const streamType =
+      contentType?.startsWith("text/event-stream") || (codex && contentType === null)
+    if (!response.ok || !streamType || !response.body) {
       await response.body?.cancel()
       throw new Error(FAILURE)
     }

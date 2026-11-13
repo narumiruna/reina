@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { readFile, statfs, writeFile } from "node:fs/promises"
 import os from "node:os"
+import { PREPARATION_WORKSPACE_BYTES } from "./dependency-limits.mjs"
 
 assert.equal(process.getuid(), 1000)
 const status = await readFile("/proc/self/status", "utf8")
@@ -16,7 +17,10 @@ const [quota, period] = (await readFile("/sys/fs/cgroup/cpu.max", "utf8"))
 assert.equal(quota / period, 1)
 const workspace = await statfs("/workspace")
 const temporary = await statfs("/tmp")
-assert.equal(workspace.blocks * workspace.bsize, 256 * 1024 * 1024)
+assert.equal(
+  workspace.blocks * workspace.bsize,
+  process.env.REINA_PHASE === "prepare" ? PREPARATION_WORKSPACE_BYTES : 256 * 1024 * 1024,
+)
 assert.equal(temporary.blocks * temporary.bsize, 64 * 1024 * 1024)
 await assert.rejects(writeFile("/rootfs-write-probe", "blocked"), { code: "EROFS" })
 assert.equal(Object.keys(os.networkInterfaces()).join(","), "lo")

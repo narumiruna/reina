@@ -5,6 +5,15 @@ import { lstat, readFile } from "node:fs/promises"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import tar from "tar-stream"
+import {
+  assertDependencyArchiveSize,
+  assertDependencyDownloadSize,
+  assertDependencyExportSize,
+  assertDependencyImportSize,
+  assertDependencyImportWireSize,
+  DEPENDENCY_ARCHIVE_BYTES,
+  PREPARATION_WORKSPACE_BYTES,
+} from "../worker/dependency-limits.mjs"
 
 const baseDigest =
   "node:26.11.1-bookworm-slim@sha256:86f07bc9c5dce4578cf37e5a418b7bfc7f817cda25cde66e2b66e95ed86c4567"
@@ -76,6 +85,8 @@ async function archive(entries) {
 }
 
 async function importFiles(containerId, kind, files) {
+  if (kind === "dependency")
+    assertDependencyImportSize(files.reduce((total, [, bytes]) => total + bytes.length, 0))
   const input = Buffer.from(
     JSON.stringify(
       files.map(([name, bytes]) => ({
@@ -85,6 +96,7 @@ async function importFiles(containerId, kind, files) {
       })),
     ),
   )
+  if (kind === "dependency") assertDependencyImportWireSize(input.length)
   await command(["exec", "--interactive", containerId, "node", "/opt/reina/import.mjs", kind], {
     input,
   })
@@ -153,9 +165,11 @@ async function download(url, integrity, budget) {
   for await (const chunk of response.body) {
     bytes += chunk.length
     budget.bytes += chunk.length
-    if (bytes > 32 * 1024 * 1024 || budget.bytes > 128 * 1024 * 1024) {
+    try {
+      assertDependencyDownloadSize(bytes, budget.bytes)
+    } catch (error) {
       await response.body.cancel().catch(() => {})
-      throw new Error("dependency_download_limit")
+      throw error
     }
     chunks.push(Buffer.from(chunk))
   }
@@ -166,6 +180,7 @@ async function download(url, integrity, budget) {
 }
 
 async function sanitizeDependencies(bytes) {
+  assertDependencyArchiveSize(bytes.length)
   const extract = tar.extract()
   const pack = tar.pack()
   const chunks = []
@@ -211,8 +226,7 @@ async function sanitizeDependencies(bytes) {
           pack.entry({ name, type: "symlink", linkname: target, mode: 0o777 })
         } else if (header.type === "file") {
           total += header.size
-          if (header.size > 32 * 1024 * 1024 || total > 192 * 1024 * 1024)
-            throw new Error("dependency_export_limit")
+          assertDependencyExportSize(header.size, total)
           const content = []
           let size = 0
           for await (const chunk of stream) {
@@ -297,7 +311,7 @@ try {
     "--label=io.reina.preparation=true",
     "--opt=type=tmpfs",
     "--opt=device=tmpfs",
-    "--opt=o=size=256m,uid=1000,gid=1000,mode=0700,nosuid,nodev",
+    `--opt=o=size=${PREPARATION_WORKSPACE_BYTES},uid=1000,gid=1000,mode=0700,nosuid,nodev`,
     volume,
   ])
   await command([
@@ -358,7 +372,7 @@ try {
   await command(["pause", container])
   const dependenciesTar = await sanitizeDependencies(
     await command(["cp", `${container}:/workspace/node_modules`, "-"], {
-      limit: 224 * 1024 * 1024,
+      limit: DEPENDENCY_ARCHIVE_BYTES,
     }),
   )
   const lockHash = `sha256:${createHash("sha256").update(lockBytes).digest("hex")}`

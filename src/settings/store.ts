@@ -6,6 +6,20 @@ import type { AuthType, Credential } from "@earendil-works/pi-ai"
 import { privateFile } from "../jobs/store.js"
 import { groupNamesSchema } from "../web/groups.js"
 import { type CredentialState, modelRequestResolver, validateCredential } from "./credentials.js"
+import {
+  type DispatchInput,
+  type DispatchSettings,
+  type DispatchStatus,
+  dispatchInputSchema,
+  dispatchSettingsSchema,
+} from "./dispatch.js"
+import {
+  type GitHubAppSettings,
+  type GitHubAppStatus,
+  type GitHubConnection,
+  gitHubAppSettingsSchema,
+  gitHubConnectionSchema,
+} from "./github.js"
 import { validateProviderUrl } from "./network.js"
 import {
   getBuiltinModel,
@@ -499,6 +513,125 @@ export class SettingsStore {
     }
   }
 
+  /** Trusted secret-bearing read. Invalid saved data must not enable environment fallback. */
+  githubAppSettings(): GitHubAppSettings | undefined {
+    const row = this.db.prepare("SELECT value FROM secrets WHERE name='github-app-settings'").get()
+    if (!row) return
+    try {
+      return gitHubAppSettingsSchema.parse(
+        JSON.parse(this.decrypt("github-app-settings", String(row.value))),
+      )
+    } catch {
+      throw new Error("invalid_github_app_settings")
+    }
+  }
+
+  githubAppStatus(): GitHubAppStatus | undefined {
+    const settings = this.githubAppSettings()
+    if (!settings) return
+    const { clientSecret, webhookSecret, ...status } = settings
+    return {
+      ...status,
+      clientSecretConfigured: clientSecret.length > 0,
+      webhookSecretConfigured: webhookSecret.length > 0,
+    }
+  }
+
+  saveGitHubAppSettings(input: GitHubAppSettings): void {
+    const result = gitHubAppSettingsSchema.safeParse(input)
+    if (!result.success) throw new Error("invalid_github_app_settings")
+    this.transaction(() => {
+      const previous = this.githubAppSettings()
+      this.db
+        .prepare(
+          "INSERT INTO secrets VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value,metadata=excluded.metadata",
+        )
+        .run(
+          "github-app-settings",
+          this.encrypt("github-app-settings", JSON.stringify(result.data)),
+          "{}",
+        )
+      if (previous && previous.appId !== result.data.appId)
+        this.db.prepare("DELETE FROM secrets WHERE name='github-connection'").run()
+    })
+  }
+
+  githubConnection(): GitHubConnection | undefined {
+    const row = this.db.prepare("SELECT value FROM secrets WHERE name='github-connection'").get()
+    if (!row) return
+    try {
+      return gitHubConnectionSchema.parse(
+        JSON.parse(this.decrypt("github-connection", String(row.value))),
+      )
+    } catch {
+      throw new Error("invalid_github_connection")
+    }
+  }
+
+  saveGitHubConnection(input: GitHubConnection): void {
+    const result = gitHubConnectionSchema.safeParse(input)
+    if (!result.success) throw new Error("invalid_github_connection")
+    this.transaction(() => {
+      const app = this.githubAppSettings()
+      if (app && app.appId !== result.data.appId) throw new Error("github_app_mismatch")
+      this.db
+        .prepare(
+          "INSERT INTO secrets VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value,metadata=excluded.metadata",
+        )
+        .run(
+          "github-connection",
+          this.encrypt("github-connection", JSON.stringify(result.data)),
+          "{}",
+        )
+    })
+  }
+
+  /** Trusted secret-bearing read. Invalid saved data must not enable environment fallback. */
+  dispatchSettings(): DispatchSettings | undefined {
+    const row = this.db.prepare("SELECT value FROM secrets WHERE name='dispatch-settings'").get()
+    if (!row) return
+    try {
+      return dispatchSettingsSchema.parse(
+        JSON.parse(this.decrypt("dispatch-settings", String(row.value))),
+      )
+    } catch {
+      throw new Error("invalid_dispatch_settings")
+    }
+  }
+
+  dispatchStatus(): DispatchStatus | undefined {
+    const settings = this.dispatchSettings()
+    if (!settings) return
+    const { webhookSecret, ...status } = settings
+    return { ...status, webhookSecretConfigured: webhookSecret.length > 0 }
+  }
+
+  saveDispatchSettings(input: DispatchInput): void {
+    const result = dispatchInputSchema.safeParse(input)
+    if (!result.success) throw new Error("invalid_dispatch_settings")
+    this.transaction(() => {
+      let webhookSecret = result.data.webhookSecret
+      if (webhookSecret === undefined) {
+        const app = this.githubAppSettings()
+        if (app?.appId === result.data.appId) webhookSecret = app.webhookSecret
+        else {
+          const previous = this.dispatchSettings()
+          if (previous?.appId === result.data.appId) webhookSecret = previous.webhookSecret
+        }
+      }
+      if (!webhookSecret) throw new Error("webhook_secret_required")
+      this.db
+        .prepare(
+          "INSERT INTO secrets VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value,metadata=excluded.metadata",
+        )
+        .run(
+          "dispatch-settings",
+          this.encrypt("dispatch-settings", JSON.stringify({ ...result.data, webhookSecret })),
+          "{}",
+        )
+    })
+  }
+
   savePrivateKey(input: string): void {
     const { pem, fingerprint } = validatePrivateKey(input)
     this.db
@@ -510,6 +643,16 @@ export class SettingsStore {
         this.encrypt("github-private-key", pem),
         JSON.stringify({ fingerprint, uploadedAt: Date.now() }),
       )
+  }
+
+  /** Internal credential revision. Ciphertext changes detect same-value rewrites and rotation. */
+  githubRevision(): string {
+    const rows = this.db
+      .prepare(
+        "SELECT name,value FROM secrets WHERE name IN ('github-private-key','github-app-settings') ORDER BY name",
+      )
+      .all()
+    return createHash("sha256").update(JSON.stringify(rows)).digest("hex")
   }
 
   githubStatus(): { configured: boolean; fingerprint?: string; uploadedAt?: number } {

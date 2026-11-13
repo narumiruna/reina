@@ -3,11 +3,13 @@ import type { IncomingMessage, ServerResponse } from "node:http"
 import { z } from "zod"
 import { logHttpFailure } from "../http-logging.js"
 import { modelCatalog } from "../settings/catalog.js"
+import { dispatchInputSchema } from "../settings/dispatch.js"
 import { modelSchema, providerSchema } from "../settings/schema.js"
 import type { SettingsStore } from "../settings/store.js"
 import type { Logger } from "../types.js"
 import type { Auth } from "./auth.js"
 import type { RuntimeStatus } from "./controller.js"
+import { GitHubConnect, GitHubConnectError } from "./github-connect.js"
 import { ProviderSetup, ProviderSetupError } from "./provider-setup.js"
 
 const safeErrors = new Set([
@@ -57,9 +59,9 @@ async function body(req: IncomingMessage, limit: number, contentType: string): P
   }
   return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks))
 }
-async function input(req: IncomingMessage): Promise<unknown> {
+async function input(req: IncomingMessage, limit = 65_536): Promise<unknown> {
   try {
-    return JSON.parse(await body(req, 65_536, "application/json"))
+    return JSON.parse(await body(req, limit, "application/json"))
   } catch (error) {
     if (error instanceof HttpError) throw error
     throw new HttpError(400, "invalid_input")
@@ -76,6 +78,7 @@ const setupInput = z.strictObject({
 export class AdminWeb {
   private readonly assets = new Map<string, Promise<Buffer>>()
   private readonly setups: ProviderSetup
+  private readonly github: GitHubConnect
   constructor(
     private readonly settings: SettingsStore,
     private readonly auth: Auth,
@@ -84,7 +87,9 @@ export class AdminWeb {
     private readonly changed: () => void,
     private readonly log: Logger,
     setups?: ProviderSetup,
+    github?: GitHubConnect,
   ) {
+    this.github = github ?? new GitHubConnect(settings, auth, origin, {})
     this.setups =
       setups ??
       new ProviderSetup({
@@ -106,14 +111,18 @@ export class AdminWeb {
 
   close(): void {
     this.setups.close()
+    this.github.close()
   }
 
   private error(req: IncomingMessage, res: ServerResponse, error: unknown): void {
-    if (error instanceof ProviderSetupError) json(res, error.status, { error: error.code })
+    if (error instanceof Error && error.message === "webhook_secret_required")
+      json(res, 400, { error: "invalid_input", fields: ["webhookSecret"] })
+    else if (error instanceof ProviderSetupError || error instanceof GitHubConnectError)
+      json(res, error.status, { error: error.code })
     else if (error instanceof z.ZodError) {
       json(res, 400, {
         error: "invalid_input",
-        fields: [...new Set(error.issues.map((issue) => String(issue.path[0] ?? "input")))],
+        fields: [...new Set(error.issues.map((issue) => issue.path.join(".") || "input"))],
       })
     } else if (error instanceof HttpError) json(res, error.status, { error: error.code })
     else if (error instanceof Error && safeErrors.has(error.message))
@@ -156,8 +165,42 @@ export class AdminWeb {
     const logoutOwner =
       url.pathname === "/auth/logout" ? this.auth.session(req)?.csrfToken : undefined
     if (await this.auth.handle(req, res, url)) {
-      if (logoutOwner && req.method === "POST" && res.statusCode === 200)
+      if (logoutOwner && req.method === "POST" && res.statusCode === 200) {
         this.setups.cancelOwner(logoutOwner)
+        this.github.cancelOwner(logoutOwner)
+      }
+      return true
+    }
+    if (["/auth/github/callback", "/auth/github/setup"].includes(url.pathname)) {
+      if (req.method !== "GET") {
+        json(res, 404, { error: "not_found" })
+        return true
+      }
+      const session = this.auth.session(req)
+      if (!session) {
+        res.writeHead(303, { location: "/login" }).end()
+        return true
+      }
+      let result = "ready"
+      try {
+        if (url.pathname === "/auth/github/callback")
+          await this.github.oauthCallback(session.csrfToken, url)
+        else await this.github.setupCallback(session.csrfToken, url)
+      } catch (error) {
+        const codes = new Set([
+          "github_connect_not_configured",
+          "github_connect_expired",
+          "github_connect_failed",
+          "github_connect_access_denied",
+          "github_connect_stale",
+          "github_connect_limit",
+        ])
+        result =
+          error instanceof GitHubConnectError && codes.has(error.code)
+            ? error.code
+            : "github_connect_failed"
+      }
+      res.writeHead(303, { location: `/?github_connect=${result}#github` }).end()
       return true
     }
     if (req.method === "GET" && url.pathname === "/assets/style.css") {
@@ -191,7 +234,10 @@ export class AdminWeb {
         providers: this.settings.providers(),
         selectedModelId: this.settings.selectedModelId(),
         github: this.settings.githubStatus(),
+        githubApp: this.github.status(),
+        githubConnection: this.settings.githubConnection() ?? null,
         runtime: this.runtime(),
+        runtimeSettings: this.settings.dispatchStatus() ?? null,
         user: { name: session.name },
         csrfToken: session.csrfToken,
       })
@@ -199,6 +245,14 @@ export class AdminWeb {
     }
     if (req.method === "GET" && url.pathname === "/api/catalog") {
       json(res, 200, modelCatalog())
+      return true
+    }
+    if (req.method === "GET" && url.pathname === "/api/github/connect") {
+      try {
+        json(res, 200, this.github.view(session.csrfToken))
+      } catch (error) {
+        this.error(req, res, error)
+      }
       return true
     }
     const setup = url.pathname.match(/^\/api\/provider-setups\/([a-f0-9-]{36})(\/responses)?$/)
@@ -220,6 +274,38 @@ export class AdminWeb {
       return true
     }
     try {
+      if (url.pathname === "/api/github/app" && req.method === "POST") {
+        await this.github.saveApp(session.csrfToken, await input(req))
+        this.changed()
+        json(res, 200, { ok: true })
+        return true
+      }
+      if (url.pathname === "/api/github/connect" && req.method === "POST") {
+        json(res, 200, await this.github.start(session.csrfToken))
+        return true
+      }
+      if (url.pathname === "/api/github/connect/refresh" && req.method === "POST") {
+        json(res, 200, await this.github.refresh(session.csrfToken))
+        return true
+      }
+      if (url.pathname === "/api/github/connect/install" && req.method === "POST") {
+        json(res, 200, await this.github.install(session.csrfToken))
+        return true
+      }
+      if (url.pathname === "/api/github/connect/select" && req.method === "POST") {
+        const value = z
+          .strictObject({ repositoryId: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER) })
+          .parse(await input(req))
+        await this.github.select(session.csrfToken, value.repositoryId)
+        this.changed()
+        json(res, 200, { ok: true })
+        return true
+      }
+      if (url.pathname === "/api/github/connect/cancel" && req.method === "POST") {
+        this.github.cancelOwner(session.csrfToken)
+        json(res, 200, { ok: true })
+        return true
+      }
       if (url.pathname === "/api/provider-setups" && req.method === "POST") {
         const value = setupInput.parse(await input(req))
         const existing = value.savedProviderId
@@ -313,6 +399,11 @@ export class AdminWeb {
         this.settings.deletePrivateKey()
         return
       }
+    }
+    if (path === "/api/runtime/settings" && req.method === "POST") {
+      // Include all bounded path/argv fields, UTF-8 expansion, and JSON overhead.
+      this.settings.saveDispatchSettings(dispatchInputSchema.parse(await input(req, 512 * 1024)))
+      return
     }
     if (path === "/api/runtime/reload" && req.method === "POST") return
     throw new HttpError(404, "not_found")

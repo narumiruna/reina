@@ -4,6 +4,17 @@ import os from "node:os"
 import path from "node:path"
 import { DatabaseSync } from "node:sqlite"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import {
+  type DispatchInput,
+  dispatchInputSchema,
+  dispatchSettingsSchema,
+} from "../src/settings/dispatch.js"
+import {
+  type GitHubAppSettings,
+  type GitHubConnection,
+  gitHubAppSettingsSchema,
+  gitHubConnectionSchema,
+} from "../src/settings/github.js"
 import { isPublicAddress, validateProviderUrl } from "../src/settings/network.js"
 import { modelSchema, providerSchema, validatePrivateKey } from "../src/settings/schema.js"
 import { SettingsStore } from "../src/settings/store.js"
@@ -16,6 +27,26 @@ const provider = {
   api: "openai-completions" as const,
   baseUrl: "https://model.example/v1",
   apiKey,
+}
+const dispatchInput: DispatchInput = {
+  appId: 123,
+  webhookSecret: "fixture-webhook-secret-never-returned",
+  repository: { owner: "example", name: "project", id: 456, installationId: 789 },
+  image: `ghcr.io/example/reina@sha256:${"d".repeat(64)}`,
+  forbiddenPaths: ["src/security/**", "src/deployment/**"],
+}
+const appSettings: GitHubAppSettings = {
+  appId: dispatchInput.appId,
+  clientId: "Iv23.fixture-client_id",
+  slug: "reina-fixture",
+  clientSecret: "fixture-app-client-secret-never-returned",
+  webhookSecret: "fixture-app-webhook-secret-never-returned",
+}
+const connection: GitHubConnection = {
+  appId: appSettings.appId,
+  repository: { ...dispatchInput.repository },
+  connectedAt: 1_800_000_000_000,
+  user: { id: 42, login: "verified-operator" },
 }
 const model = {
   modelId: "example/model",
@@ -183,6 +214,530 @@ describe("encrypted settings", () => {
     store.deletePrivateKey()
     expect(store.privateKey()).toBeUndefined()
     expect(store.githubStatus()).toEqual({ configured: false })
+  })
+})
+
+describe("encrypted GitHub App settings and verified connections", () => {
+  it("starts empty and encrypts complete records without a schema migration or public credentials", () => {
+    expect(store.githubAppSettings()).toBeUndefined()
+    expect(store.githubAppStatus()).toBeUndefined()
+    expect(store.githubConnection()).toBeUndefined()
+    store.saveGitHubAppSettings(appSettings)
+    store.saveGitHubConnection(connection)
+    expect(store.githubAppSettings()).toEqual(appSettings)
+    expect(store.githubConnection()).toEqual(connection)
+    const { clientSecret, webhookSecret, ...metadata } = appSettings
+    expect(store.githubAppStatus()).toEqual({
+      ...metadata,
+      clientSecretConfigured: true,
+      webhookSecretConfigured: true,
+    })
+    for (const field of ["clientSecret", "webhookSecret"])
+      expect(store.githubAppStatus()).not.toHaveProperty(field)
+    const database = new DatabaseSync(path.join(directory, "settings.sqlite"))
+    try {
+      const rows = database
+        .prepare("SELECT * FROM secrets WHERE name IN ('github-app-settings','github-connection')")
+        .all()
+      expect(rows).toHaveLength(2)
+      for (const row of rows) {
+        expect(row.metadata).toBe("{}")
+        expect(JSON.parse(String(row.value))).toMatchObject({ v: 1, data: expect.any(String) })
+      }
+      const output = JSON.stringify(rows)
+      for (const value of [
+        clientSecret,
+        webhookSecret,
+        appSettings.clientId,
+        appSettings.slug,
+        connection.repository.owner,
+        connection.user.login,
+        "appId",
+        "connectedAt",
+      ])
+        expect(output).not.toContain(value)
+      expect(database.prepare("PRAGMA user_version").get()?.user_version).toBe(3)
+    } finally {
+      database.close()
+    }
+    store.close()
+    store = new SettingsStore(directory, master)
+    expect(store.githubAppSettings()).toEqual(appSettings)
+    expect(store.githubConnection()).toEqual(connection)
+    const publicMetadata = JSON.stringify([
+      store.githubAppStatus(),
+      store.githubStatus(),
+      store.dispatchStatus(),
+      store.providers(),
+    ])
+    expect(publicMetadata).not.toContain(clientSecret)
+    expect(publicMetadata).not.toContain(webhookSecret)
+  })
+
+  it("tracks credential writes and key deletion with a stable internal revision", () => {
+    const empty = store.githubRevision()
+    expect(empty).toMatch(/^[a-f0-9]{64}$/)
+    expect(store.githubRevision()).toBe(empty)
+    store.saveGitHubAppSettings(appSettings)
+    const appSaved = store.githubRevision()
+    expect(appSaved).not.toBe(empty)
+    expect(store.githubRevision()).toBe(appSaved)
+    store.saveGitHubConnection(connection)
+    store.saveDispatchSettings(dispatchInput)
+    expect(store.githubRevision()).toBe(appSaved)
+    store.saveGitHubAppSettings(appSettings)
+    const appRewritten = store.githubRevision()
+    expect(appRewritten).not.toBe(appSaved)
+    store.saveGitHubAppSettings({ ...appSettings, clientSecret: "rotated-client-secret" })
+    const appRotated = store.githubRevision()
+    store.saveGitHubAppSettings(appSettings)
+    const appRestored = store.githubRevision()
+    expect(new Set([empty, appSaved, appRewritten, appRotated, appRestored]).size).toBe(5)
+    store.savePrivateKey(pem)
+    const keySaved = store.githubRevision()
+    store.savePrivateKey(pem)
+    const keyRewritten = store.githubRevision()
+    store.close()
+    store = new SettingsStore(directory, master)
+    expect(store.githubRevision()).toBe(keyRewritten)
+    store.deletePrivateKey()
+    const keyDeleted = store.githubRevision()
+    expect(keyDeleted).toBe(appRestored)
+    store.savePrivateKey(pem)
+    const keyRestored = store.githubRevision()
+    expect(new Set([appRestored, keySaved, keyRewritten, keyRestored]).size).toBe(4)
+  })
+
+  it("returns independent validated copies without retaining caller mutations", () => {
+    const inputApp = { ...appSettings }
+    const inputConnection = structuredClone(connection)
+    store.saveGitHubAppSettings(inputApp)
+    store.saveGitHubConnection(inputConnection)
+    inputApp.clientSecret = "mutated"
+    inputConnection.repository.id = 1
+    inputConnection.user.login = "mutated"
+    const trusted = store.githubAppSettings()
+    const visible = store.githubAppStatus()
+    const verified = store.githubConnection()
+    if (!trusted || !visible || !verified) throw new Error("github_fixture_missing")
+    trusted.webhookSecret = "mutated"
+    visible.clientId = "mutated"
+    verified.repository.installationId = 1
+    verified.user.id = 1
+    expect(store.githubAppSettings()).toEqual(appSettings)
+    expect(store.githubConnection()).toEqual(connection)
+    expect(store.githubAppStatus()?.clientId).toBe(appSettings.clientId)
+  })
+
+  it("accepts real GitHub client identifiers and bounded metadata", () => {
+    for (const clientId of ["Iv23liExample1234567890", "a", "a".repeat(100), "id._-123"]) {
+      expect(gitHubAppSettingsSchema.parse({ ...appSettings, clientId }).clientId).toBe(clientId)
+    }
+    expect(
+      gitHubAppSettingsSchema.parse({
+        ...appSettings,
+        appId: Number.MAX_SAFE_INTEGER,
+        slug: "a".repeat(100),
+        clientSecret: "s".repeat(4_096),
+        webhookSecret: "s".repeat(4_096),
+      }),
+    ).toMatchObject({ appId: Number.MAX_SAFE_INTEGER })
+    for (const connectedAt of [0, Number.MAX_SAFE_INTEGER])
+      expect(gitHubConnectionSchema.parse({ ...connection, connectedAt }).connectedAt).toBe(
+        connectedAt,
+      )
+  })
+
+  it.each([
+    ["appId", 0],
+    ["appId", 1.5],
+    ["appId", Number.MAX_SAFE_INTEGER + 1],
+    ["appId", "123"],
+    ["clientId", ""],
+    ["clientId", "a".repeat(101)],
+    ["clientId", "Iv23/client"],
+    ["clientId", "Iv23client\n"],
+    ["clientId", "non-ascii-識別子"],
+    ["slug", ""],
+    ["slug", "Uppercase"],
+    ["slug", "-invalid"],
+    ["slug", "invalid-"],
+    ["slug", "invalid_slug"],
+    ["slug", "a".repeat(101)],
+    ["slug", "slug\n"],
+    ["clientSecret", ""],
+    ["clientSecret", " secret"],
+    ["clientSecret", "secret "],
+    ["clientSecret", "secret\n"],
+    ["clientSecret", "secret\0value"],
+    ["clientSecret", "secret\u007fvalue"],
+    ["clientSecret", "s".repeat(4_097)],
+    ["webhookSecret", "short"],
+    ["webhookSecret", "s".repeat(4_097)],
+    ["webhookSecret", ` ${appSettings.webhookSecret}`],
+    ["webhookSecret", `${appSettings.webhookSecret}\n`],
+    ["token", "private-invalid-input"],
+  ])("rejects invalid App %s with a safe error and no saved changes", (field, value) => {
+    store.saveGitHubAppSettings(appSettings)
+    store.saveGitHubConnection(connection)
+    expect(() => store.saveGitHubAppSettings({ ...appSettings, [field]: value })).toThrow(
+      /^invalid_github_app_settings$/,
+    )
+    expect(store.githubAppSettings()).toEqual(appSettings)
+    expect(store.githubConnection()).toEqual(connection)
+  })
+
+  it.each([
+    ["appId", 0],
+    ["appId", Number.MAX_SAFE_INTEGER + 1],
+    ["repository", { ...connection.repository, id: 0 }],
+    ["repository", { ...connection.repository, installationId: 1.5 }],
+    ["repository", { ...connection.repository, owner: "-invalid" }],
+    ["repository", { ...connection.repository, name: "../invalid" }],
+    ["repository", { ...connection.repository, token: "private-invalid-input" }],
+    ["connectedAt", -1],
+    ["connectedAt", 1.5],
+    ["connectedAt", Number.MAX_SAFE_INTEGER + 1],
+    ["connectedAt", "1800000000000"],
+    ["user", { id: 0, login: "operator" }],
+    ["user", { id: Number.MAX_SAFE_INTEGER + 1, login: "operator" }],
+    ["user", { id: 42, login: "" }],
+    ["user", { id: 42, login: "operator\n" }],
+    ["user", { id: 42, login: "../operator" }],
+    ["user", { id: 42, login: "a".repeat(40) }],
+    ["user", { id: 42, login: "operator", token: "private-invalid-input" }],
+    ["token", "private-invalid-input"],
+  ])(
+    "rejects invalid connection %s without storing tokens or changing the record",
+    (field, value) => {
+      store.saveGitHubAppSettings(appSettings)
+      store.saveGitHubConnection(connection)
+      expect(() => store.saveGitHubConnection({ ...connection, [field]: value })).toThrow(
+        /^invalid_github_connection$/,
+      )
+      expect(store.githubConnection()).toEqual(connection)
+    },
+  )
+
+  it("permits a verified legacy connection but rejects an App identity mismatch when settings exist", () => {
+    store.saveGitHubConnection(connection)
+    expect(store.githubConnection()).toEqual(connection)
+    store.saveGitHubAppSettings(appSettings)
+    expect(store.githubConnection()).toEqual(connection)
+    expect(() => store.saveGitHubConnection({ ...connection, appId: 999 })).toThrow(
+      /^github_app_mismatch$/,
+    )
+    expect(store.githubConnection()).toEqual(connection)
+  })
+
+  it("preserves a connection on same-App rotation and deletes only that record when App identity changes", () => {
+    const providerId = store.saveProvider(provider)
+    const modelId = store.saveModel(providerId, model)
+    store.selectModel(modelId)
+    store.savePrivateKey(pem)
+    store.saveDispatchSettings(dispatchInput)
+    store.saveGitHubAppSettings(appSettings)
+    store.saveGitHubConnection(connection)
+    const selected = store.selection()
+    const session = store.createSession("subject", "Operator", ["reina-admins"])
+    const database = new DatabaseSync(path.join(directory, "settings.sqlite"))
+    try {
+      const unrelated = database
+        .prepare(
+          "SELECT * FROM secrets WHERE name NOT IN ('github-app-settings','github-connection') ORDER BY name",
+        )
+        .all()
+      const rotated = {
+        ...appSettings,
+        clientSecret: "replacement-client-secret",
+        webhookSecret: "replacement-app-webhook-secret-32",
+      }
+      store.saveGitHubAppSettings(rotated)
+      expect(store.githubConnection()).toEqual(connection)
+      store.saveGitHubAppSettings({ ...rotated, appId: 999 })
+      expect(store.githubConnection()).toBeUndefined()
+      expect(store.githubAppSettings()?.appId).toBe(999)
+      expect(store.dispatchSettings()?.appId).toBe(dispatchInput.appId)
+      expect(store.dispatchSettings()?.webhookSecret).toBe(dispatchInput.webhookSecret)
+      expect(
+        database
+          .prepare(
+            "SELECT * FROM secrets WHERE name NOT IN ('github-app-settings','github-connection') ORDER BY name",
+          )
+          .all(),
+      ).toEqual(unrelated)
+      expect(store.selection()).toEqual(selected)
+      expect(store.privateKey()).toBe(pem.trim())
+      expect(store.session(session.token)).toBeDefined()
+      expect(() => store.saveGitHubConnection(connection)).toThrow(/^github_app_mismatch$/)
+      store.saveGitHubConnection({ ...connection, appId: 999 })
+      expect(store.githubConnection()?.appId).toBe(999)
+    } finally {
+      database.close()
+    }
+  })
+
+  it.each([
+    ["github-app-settings", "invalid_github_app_settings"],
+    ["github-connection", "invalid_github_connection"],
+  ] as const)(
+    "fails closed on malformed or tampered %s records and enforces purpose binding",
+    (purpose, error) => {
+      store.saveGitHubAppSettings(appSettings)
+      store.saveGitHubConnection(connection)
+      const read = () =>
+        purpose === "github-app-settings" ? store.githubAppSettings() : store.githubConnection()
+      const database = new DatabaseSync(path.join(directory, "settings.sqlite"))
+      try {
+        for (const plaintext of [
+          "not-json",
+          "{}",
+          '{"appId":0}',
+          JSON.stringify({ ...connection, token: apiKey }),
+        ]) {
+          const nonce = randomBytes(12)
+          const cipher = createCipheriv("aes-256-gcm", Buffer.from(master, "hex"), nonce)
+          cipher.setAAD(Buffer.from(`reina:v1:${purpose}`))
+          const data = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()])
+          database.prepare("UPDATE secrets SET value=? WHERE name=?").run(
+            JSON.stringify({
+              v: 1,
+              nonce: nonce.toString("base64"),
+              tag: cipher.getAuthTag().toString("base64"),
+              data: data.toString("base64"),
+            }),
+            purpose,
+          )
+          expect(read).toThrow(new RegExp(`^${error}$`))
+          if (purpose === "github-app-settings")
+            expect(() => store.githubAppStatus()).toThrow(/^invalid_github_app_settings$/)
+        }
+        for (const wrongPurpose of [
+          "encryption-check",
+          purpose === "github-app-settings" ? "github-connection" : "github-app-settings",
+        ]) {
+          database
+            .prepare(
+              "UPDATE secrets SET value=(SELECT value FROM secrets WHERE name=?) WHERE name=?",
+            )
+            .run(wrongPurpose, purpose)
+          expect(read).toThrow(new RegExp(`^${error}$`))
+        }
+        if (purpose === "github-app-settings") {
+          expect(() => store.saveGitHubAppSettings(appSettings)).toThrow(
+            /^invalid_github_app_settings$/,
+          )
+          expect(() => store.saveGitHubConnection(connection)).toThrow(
+            /^invalid_github_app_settings$/,
+          )
+          expect(() =>
+            store.saveDispatchSettings({ ...dispatchInput, webhookSecret: undefined }),
+          ).toThrow(/^invalid_github_app_settings$/)
+        }
+      } finally {
+        database.close()
+      }
+    },
+  )
+})
+
+describe("persisted dispatch settings", () => {
+  it("starts unconfigured and persists a complete encrypted object without a schema change", () => {
+    expect(store.dispatchSettings()).toBeUndefined()
+    expect(store.dispatchStatus()).toBeUndefined()
+    store.saveDispatchSettings(dispatchInput)
+    const complete = dispatchSettingsSchema.parse(dispatchInputSchema.parse(dispatchInput))
+    expect(store.dispatchSettings()).toEqual(complete)
+    const { webhookSecret, ...visible } = complete
+    expect(store.dispatchStatus()).toEqual({ ...visible, webhookSecretConfigured: true })
+    expect(store.dispatchStatus()).not.toHaveProperty("webhookSecret")
+    expect(JSON.stringify(store.dispatchStatus())).not.toContain(webhookSecret)
+    const database = new DatabaseSync(path.join(directory, "settings.sqlite"))
+    try {
+      const row = database.prepare("SELECT * FROM secrets WHERE name='dispatch-settings'").get()
+      expect(row?.metadata).toBe("{}")
+      expect(JSON.parse(String(row?.value))).toMatchObject({ v: 1, data: expect.any(String) })
+      for (const value of [webhookSecret, complete.repository.owner, complete.image, "appId"])
+        expect(JSON.stringify(row)).not.toContain(value)
+      expect(database.prepare("PRAGMA user_version").get()?.user_version).toBe(3)
+    } finally {
+      database.close()
+    }
+    store.close()
+    store = new SettingsStore(directory, master)
+    expect(store.dispatchSettings()).toEqual(complete)
+    expect(store.dispatchStatus()).toEqual({ ...visible, webhookSecretConfigured: true })
+  })
+
+  it("requires a secret on first save and retains it across edits and restart", () => {
+    const { webhookSecret, ...withoutSecret } = dispatchInput
+    expect(() => store.saveDispatchSettings(withoutSecret)).toThrow(/^webhook_secret_required$/)
+    expect(store.dispatchSettings()).toBeUndefined()
+    store.saveDispatchSettings(dispatchInput)
+    store.close()
+    store = new SettingsStore(directory, master)
+    store.saveDispatchSettings({ ...withoutSecret, scanIntervalMs: 120_000 })
+    expect(store.dispatchSettings()?.webhookSecret).toBe(webhookSecret)
+    expect(store.dispatchStatus()?.scanIntervalMs).toBe(120_000)
+    for (const value of ["", "short", ` ${webhookSecret}`, `${webhookSecret}\n`]) {
+      expect(() => store.saveDispatchSettings({ ...withoutSecret, webhookSecret: value })).toThrow(
+        /^invalid_dispatch_settings$/,
+      )
+      expect(store.dispatchSettings()?.webhookSecret).toBe(webhookSecret)
+    }
+    const replacement = "replacement-webhook-secret-value-32"
+    store.saveDispatchSettings({ ...withoutSecret, webhookSecret: replacement })
+    expect(store.dispatchSettings()?.webhookSecret).toBe(replacement)
+    expect(JSON.stringify(store.dispatchStatus())).not.toContain(replacement)
+  })
+
+  it("uses the current matching App webhook secret when dispatch input omits it", () => {
+    store.saveGitHubAppSettings(appSettings)
+    const { webhookSecret: omitted, ...input } = dispatchInput
+    store.saveDispatchSettings(input)
+    expect(store.dispatchSettings()?.webhookSecret).toBe(appSettings.webhookSecret)
+    const replacement = "rotated-app-webhook-secret-value-32"
+    store.saveGitHubAppSettings({ ...appSettings, webhookSecret: replacement })
+    store.saveDispatchSettings(input)
+    expect(store.dispatchSettings()?.webhookSecret).toBe(replacement)
+    store.saveDispatchSettings(dispatchInput)
+    expect(store.dispatchSettings()?.webhookSecret).toBe(omitted)
+    store.saveDispatchSettings(input)
+    expect(store.dispatchSettings()?.webhookSecret).toBe(replacement)
+  })
+
+  it("does not reuse a previous dispatch secret after its App identity changes", () => {
+    store.saveDispatchSettings(dispatchInput)
+    const original = store.dispatchSettings()
+    const { webhookSecret: omitted, ...input } = dispatchInput
+    expect(() => store.saveDispatchSettings({ ...input, appId: 999 })).toThrow(
+      /^webhook_secret_required$/,
+    )
+    expect(store.dispatchSettings()).toEqual(original)
+    store.saveDispatchSettings({
+      ...input,
+      appId: 999,
+      webhookSecret: "explicit-new-app-webhook-secret-32",
+    })
+    expect(store.dispatchSettings()?.appId).toBe(999)
+  })
+
+  it("never imports an unrelated App secret and keeps same-App dispatch fallback", () => {
+    store.saveGitHubAppSettings({ ...appSettings, appId: 999 })
+    const { webhookSecret: omitted, ...input } = dispatchInput
+    expect(() => store.saveDispatchSettings(input)).toThrow(/^webhook_secret_required$/)
+    store.saveDispatchSettings(dispatchInput)
+    store.saveDispatchSettings({ ...input, scanIntervalMs: 120_000 })
+    expect(store.dispatchSettings()?.webhookSecret).toBe(omitted)
+    expect(store.dispatchSettings()?.webhookSecret).not.toBe(appSettings.webhookSecret)
+  })
+
+  it("replaces a prior App secret only with the new App's own secret", () => {
+    store.saveGitHubAppSettings(appSettings)
+    const { webhookSecret: omitted, ...input } = dispatchInput
+    store.saveDispatchSettings(input)
+    const next = {
+      ...appSettings,
+      appId: 999,
+      webhookSecret: "new-app-webhook-secret-value-at-least-32",
+    }
+    store.saveGitHubAppSettings(next)
+    store.saveDispatchSettings({ ...input, appId: next.appId })
+    expect(store.dispatchSettings()?.webhookSecret).toBe(next.webhookSecret)
+    expect(store.dispatchSettings()?.webhookSecret).not.toBe(appSettings.webhookSecret)
+  })
+
+  it("returns independent copies of trusted and public nested settings", () => {
+    store.saveDispatchSettings(dispatchInput)
+    const original = store.dispatchSettings()
+    const trusted = store.dispatchSettings()
+    const status = store.dispatchStatus()
+    if (!trusted || !status) throw new Error("settings_fixture_missing")
+    trusted.repository.id = 1
+    trusted.commands[0].push("mutated")
+    status.repository.installationId = 1
+    status.allowedPaths.length = 0
+    expect(store.dispatchSettings()).toEqual(original)
+    expect(store.dispatchStatus()?.allowedPaths).toEqual(original?.allowedPaths)
+  })
+
+  it.each([
+    ["appId", 0],
+    ["appId", 1.5],
+    ["appId", Number.MAX_SAFE_INTEGER + 1],
+    ["appId", "123"],
+    ["repository", { ...dispatchInput.repository, owner: "-invalid" }],
+    ["repository", { ...dispatchInput.repository, name: "../project" }],
+    ["repository", { ...dispatchInput.repository, id: 0 }],
+    ["repository", { ...dispatchInput.repository, installationId: -1 }],
+    ["repository", { ...dispatchInput.repository, token: "private-invalid-input" }],
+    ["image", "worker:latest"],
+    ["allowedPaths", []],
+    ["allowedPaths", ["../outside/**"]],
+    ["allowedPaths", ["src/**", "SRC/**"]],
+    ["forbiddenPaths", []],
+    ["forbiddenPaths", ["!src/security/**"]],
+    ["commands", []],
+    ["commands", ["npm run ci"]],
+    ["commands", [["npm", "run\nci"]]],
+    ["commands", [Array(33).fill("npm")]],
+    ["commands", Array(9).fill(["npm"])],
+    ["commands", [["x".repeat(4_097)]]],
+    ["commands", Array(8).fill(Array(32).fill("x".repeat(256)))],
+    ["scanIntervalMs", 59_999],
+    ["scanIntervalMs", 86_400_001],
+    ["maxIssuesPerScan", 11],
+    ["maxConcurrentJobs", 2],
+    ["agentTimeoutMs", 999],
+    ["agentTimeoutMs", 600_001],
+    ["maxChangedFiles", 11],
+    ["maxPatchBytes", 65_537],
+    ["stateDir", "/private-invalid-input"],
+    ["private-invalid-input", "private-invalid-input"],
+  ])("rejects invalid %s without changing saved settings or disclosing input", (field, value) => {
+    store.saveDispatchSettings(dispatchInput)
+    const original = store.dispatchSettings()
+    expect(() => store.saveDispatchSettings({ ...dispatchInput, [field]: value })).toThrow(
+      /^invalid_dispatch_settings$/,
+    )
+    expect(store.dispatchSettings()).toEqual(original)
+  })
+
+  it("fails closed on encrypted malformed settings and ciphertext tampering", () => {
+    store.saveDispatchSettings(dispatchInput)
+    const database = new DatabaseSync(path.join(directory, "settings.sqlite"))
+    try {
+      for (const plaintext of ["not-json", JSON.stringify(dispatchInput), '{"appId":0}']) {
+        const nonce = randomBytes(12)
+        const cipher = createCipheriv("aes-256-gcm", Buffer.from(master, "hex"), nonce)
+        cipher.setAAD(Buffer.from("reina:v1:dispatch-settings"))
+        const data = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()])
+        database.prepare("UPDATE secrets SET value=? WHERE name='dispatch-settings'").run(
+          JSON.stringify({
+            v: 1,
+            nonce: nonce.toString("base64"),
+            tag: cipher.getAuthTag().toString("base64"),
+            data: data.toString("base64"),
+          }),
+        )
+        expect(() => store.dispatchSettings()).toThrow(/^invalid_dispatch_settings$/)
+        expect(() => store.dispatchStatus()).toThrow(/^invalid_dispatch_settings$/)
+      }
+      database
+        .prepare(
+          "UPDATE secrets SET value=(SELECT value FROM secrets WHERE name='encryption-check') WHERE name='dispatch-settings'",
+        )
+        .run()
+      expect(() => store.dispatchSettings()).toThrow(/^invalid_dispatch_settings$/)
+      expect(() =>
+        store.saveDispatchSettings({ ...dispatchInput, webhookSecret: undefined }),
+      ).toThrow(/^invalid_dispatch_settings$/)
+      // An explicit complete replacement can recover the settings without legacy fallback.
+      store.saveDispatchSettings(dispatchInput)
+      expect(store.dispatchSettings()?.appId).toBe(dispatchInput.appId)
+    } finally {
+      database.close()
+    }
   })
 })
 
