@@ -190,9 +190,16 @@ removing an exclusion can therefore wait for the next assessment day. Scans use 
 cursor so skipped or previously assessed issues do not permanently hide older issues.
 Oversized or changing issue evidence is deferred for that issue only. The scan can process other
 issues and advance its cursor. No incomplete evidence is sent to triage. Real GitHub rate limits
-and exhausted transient reads still apply a persistent global cooldown. A temporary comment-count
-mismatch retains its delivery for issue-local retry after 15 minutes. The signed approval action
-stays available for fresh authorization. Local retries use the same eight-attempt limit.
+and exhausted transient reads still apply a persistent global cooldown. Before a job is claimed,
+a temporary comment-count mismatch retains its delivery for issue-local retry after 15 minutes.
+The signed approval action stays available for fresh authorization. Local retries use the same
+eight-attempt limit.
+
+After a job is claimed, incomplete issue evidence stops a pre-publication attempt as `failed`.
+The approval remains consumed, and `bot:failed` remains its state projection. Another coding
+attempt needs a new human approval transition. A `publishing` job keeps its artifact and uses
+publication recovery without another coding run. Both paths emit info-level `execution_deferred`,
+not `execution_failed`. Issue-local limits do not set a global cooldown.
 
 The patch allowlist is further narrowed by the proposal's exact file list. Hard exclusions cover
 credentials, agent instructions/configuration, workflows, dependencies, tooling, and deployment.
@@ -395,6 +402,23 @@ changed, do not resume remote writes. Existing remote effects require operator r
 Logs include event, repository ID/name, issue, installation, job/proposal, and correlation IDs.
 They use reason codes instead of raw API/model errors. Do not enable raw Probot debug payload
 logging or post private test output to GitHub.
+
+Job and delivery failures (`failed`, `execution_failed`, and `recovery_failed`) use `error` level.
+Normal lifecycle, deferral, and cancellation events use `info` level. A cancelled delivery emits
+`cancelled`, including an interrupted triage assessment. An interrupted or revoked execution emits
+`execution_cancelled`. The original execution failure is logged before label updates, so a failed
+notification cannot hide its job ID and reason.
+
+Runtime startup logs preserve explicitly allowed identity, Docker, and worker failure codes.
+Unknown errors use `authentication_or_sandbox_unavailable`; raw messages, stacks, and causes are
+not logged. Failed startup cleanup emits `runtime_stop_failed` with
+`cleanup_requires_operator_check` and keeps dispatch stopped.
+
+Unexpected administration and HTTP handler failures emit `http_request_failed` with a fixed
+reason, response status, allowed HTTP method, and allowed route or route template. Unknown
+methods and routes use a fixed marker. Logs exclude request bodies, headers, cookies, query
+strings, and raw errors. Expected validation/authentication responses, health checks, and webhook
+503 responses while dispatch is not configured do not emit error logs.
 
 For `runtime_timeout` or `pi_*`, inspect the phase and job ID, check provider/worker availability,
 and obtain a fresh human approval before another coding attempt. For `verification_failed`,

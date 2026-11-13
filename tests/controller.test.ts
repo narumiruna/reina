@@ -218,7 +218,7 @@ describe("controller prerequisites", () => {
       res.writeHead(200).end("management")
       return true
     })
-    const server = httpServer(() => value.app(), { handle } as unknown as AdminWeb)
+    const server = httpServer(() => value.app(), log, { handle } as unknown as AdminWeb)
     for (const [url, method, status, body] of [
       ["/", "GET", 200, "management"],
       ["/healthz", "GET", 200, "ok"],
@@ -391,6 +391,52 @@ describe("controller runtime lifecycle", () => {
     expect(mocks.orchestrators[1].start).toHaveBeenCalledOnce()
   })
 
+  test.each([
+    "worker_image_not_prepared",
+    "worker_pi_version_mismatch",
+    "docker_seccomp_unavailable",
+    "runtime_controls_unavailable",
+    "runtime_socket_unavailable",
+    "runtime_frozen_export_unavailable",
+  ])("preserves the safe startup reason %s without error context", async (reason) => {
+    const error = new Error(reason, { cause: new Error("private-startup-cause") })
+    error.stack = "private-startup-stack"
+    mocks.register.mockImplementationOnce(() => {
+      mocks.orchestrators[0].start.mockRejectedValueOnce(error)
+    })
+    const value = controller()
+    value.reload()
+    await vi.waitFor(() => expect(value.status()).toEqual({ state: "failed", reason }))
+    expect(value.app()).toBeUndefined()
+    expect(log.error).toHaveBeenCalledWith({ event: "runtime_configuration_failed", reason })
+    const logs = JSON.stringify([log.info.mock.calls, log.error.mock.calls])
+    expect(logs).not.toContain("private-startup-cause")
+    expect(logs).not.toContain("private-startup-stack")
+  })
+
+  test.each([
+    "private-startup-error",
+    "worker_image_not_prepared private-startup-secret",
+    "private-startup-secret runtime_controls_unavailable",
+  ])("does not log an unknown startup error: %s", async (message) => {
+    mocks.register.mockImplementationOnce(() => {
+      mocks.orchestrators[0].start.mockRejectedValueOnce(new Error(message))
+    })
+    const value = controller()
+    value.reload()
+    await vi.waitFor(() =>
+      expect(value.status()).toEqual({
+        state: "failed",
+        reason: "authentication_or_sandbox_unavailable",
+      }),
+    )
+    expect(log.error).toHaveBeenCalledWith({
+      event: "runtime_configuration_failed",
+      reason: "authentication_or_sandbox_unavailable",
+    })
+    expect(JSON.stringify(log.error.mock.calls)).not.toContain(message)
+  })
+
   test.each(["authentication", "bot lookup", "sandbox start", "webhook registration"])(
     "failed %s setup keeps the app unavailable and releases resources",
     async (phase) => {
@@ -486,6 +532,60 @@ describe("controller runtime lifecycle", () => {
     expect(value.app()).toBeUndefined()
     expect(value.status()).toEqual({ state: "failed", reason: "cleanup_requires_operator_check" })
     expect(mocks.apps[0].auth).not.toHaveBeenCalled()
+    controllers.splice(controllers.indexOf(value), 1)
+  })
+
+  test("logs stale startup cleanup failure before replacement dispatch is blocked", async () => {
+    const ready = deferred()
+    mocks.Probot.mockImplementationOnce(function (this: AppFixture) {
+      this.ready = vi.fn(() => ready.promise)
+      this.auth = vi.fn()
+      mocks.apps.push(this)
+    })
+    const value = controller()
+    value.reload()
+    await vi.waitFor(() => expect(mocks.apps[0]?.ready).toHaveBeenCalledOnce())
+    mocks.runtimes[0].cleanup.mockRejectedValueOnce(new Error("private-cleanup-error"))
+    value.reload()
+    ready.resolve()
+    await vi.waitFor(() =>
+      expect(value.status()).toEqual({
+        state: "failed",
+        reason: "cleanup_requires_operator_check",
+      }),
+    )
+    expect(log.error).toHaveBeenCalledExactlyOnceWith({
+      event: "runtime_stop_failed",
+      reason: "cleanup_requires_operator_check",
+    })
+    expect(JSON.stringify(log.error.mock.calls)).not.toContain("private-cleanup-error")
+    expect(value.app()).toBeUndefined()
+    expect(mocks.Probot).toHaveBeenCalledOnce()
+    expect(mocks.apps[0].auth).not.toHaveBeenCalled()
+    await expect(value.close()).rejects.toThrow("runtime_cleanup_failed")
+    controllers.splice(controllers.indexOf(value), 1)
+  })
+
+  test("logs cleanup failure after startup failure without replacing its reason", async () => {
+    mocks.register.mockImplementationOnce(() => {
+      mocks.orchestrators[0].start.mockRejectedValueOnce(new Error("worker_pi_version_mismatch"))
+      mocks.orchestrators[0].stop.mockRejectedValueOnce(new Error("private-stop-error"))
+    })
+    const value = controller()
+    value.reload()
+    await vi.waitFor(() =>
+      expect(value.status()).toEqual({
+        state: "failed",
+        reason: "cleanup_requires_operator_check",
+      }),
+    )
+    expect(log.error.mock.calls).toEqual([
+      [{ event: "runtime_configuration_failed", reason: "worker_pi_version_mismatch" }],
+      [{ event: "runtime_stop_failed", reason: "cleanup_requires_operator_check" }],
+    ])
+    expect(JSON.stringify(log.error.mock.calls)).not.toContain("private-stop-error")
+    expect(value.app()).toBeUndefined()
+    await expect(value.close()).rejects.toThrow("runtime_cleanup_failed")
     controllers.splice(controllers.indexOf(value), 1)
   })
 

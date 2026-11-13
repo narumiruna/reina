@@ -493,6 +493,15 @@ function expectNoPublication(value: ReturnType<typeof fixture>) {
   expect(value.github.refs.size).toBe(0)
 }
 
+function deferIssueRead(value: TestFixture, at: number, error: GitHubIssueDeferred) {
+  const read = required(value.github.issue.getMockImplementation())
+  let calls = 0
+  value.github.issue.mockImplementation(async (number) => {
+    if (++calls === at) throw error
+    return read(number)
+  })
+}
+
 describe("durable discovery through one trusted draft", () => {
   test("both agent phases receive repository instructions only as untrusted context", async () => {
     const value = fixture()
@@ -507,6 +516,8 @@ describe("durable discovery through one trusted draft", () => {
     expect(value.runtime.code.mock.calls[0][1]).toContain("Untrusted repository instructions:")
     expect(value.runtime.code.mock.calls[0][1]).toContain(instructions)
     expect(value.store.jobs()[0].artifact?.files.map((file) => file.path)).toEqual(["README.md"])
+    expect(value.log.info).toHaveBeenCalledWith(expect.objectContaining({ event: "pr_created" }))
+    expect(value.log.error).not.toHaveBeenCalled()
   })
 
   test("a failed proposal-label update is reconciled without another assessment or comment", async () => {
@@ -515,6 +526,11 @@ describe("durable discovery through one trusted draft", () => {
     await value.deliver()
     expect(value.store.proposals()[0].commentId).toBeDefined()
     expect(value.github.currentIssue.labels).not.toContain("fix_available")
+    expect(value.log.error).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "failed", reason: "request_rejected_or_failed" }),
+    )
+    expect(value.log.info).not.toHaveBeenCalledWith(expect.objectContaining({ event: "failed" }))
+    expect(JSON.stringify(value.log.error.mock.calls)).not.toContain("temporary_label_failure")
     await value.deliver(value.work(), "retry-projection")
     expect(value.github.currentIssue.labels).toContain("fix_available")
     expect(value.runtime.triage).toHaveBeenCalledTimes(1)
@@ -723,6 +739,7 @@ describe("durable discovery through one trusted draft", () => {
     expect(value.log.info).toHaveBeenCalledWith(
       expect.objectContaining({ event: "deferred", issue: 12, reason: "github_comments_limit" }),
     )
+    expect(value.log.error).not.toHaveBeenCalled()
     await value.deliver(value.work(), "unrelated-delivery")
     expect(value.runtime.triage).toHaveBeenCalledTimes(1)
   })
@@ -844,6 +861,210 @@ describe("triage schema and hard policy remain authoritative", () => {
     await value.deliver()
     expect(value.store.proposal(value.github.currentIssue.ref)).toBeUndefined()
     expect(value.publisher.propose).not.toHaveBeenCalled()
+    expect(value.log.info).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "cancelled", reason: "proposal_stale" }),
+    )
+    expect(value.log.error).not.toHaveBeenCalled()
+    expectNoPublication(value)
+  })
+})
+
+describe("issue-local execution deferrals", () => {
+  test.each([
+    ["github_comments_limit", false],
+    ["github_context_limit", false],
+    ["github_read_limit", false],
+    ["github_pagination_limit", false],
+    ["github_issue_changed_during_read", false],
+    ["github_issue_changed_during_read", true],
+  ] as const)("post-claim %s (retryAt: %s) logs deferral", async (code, retry) => {
+    const value = fixture()
+    await value.propose()
+    // The first read dispatches approval; the second is Worker.fresh after claim.
+    deferIssueRead(value, 2, new GitHubIssueDeferred(code, retry ? now + 60_000 : undefined))
+    await value.approve()
+    const job = value.store.jobs()[0]
+    expect(value.store.jobs()).toHaveLength(1)
+    expect(job).toMatchObject({ state: "failed", error: code, notified: true })
+    expect(value.log.info).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "execution_deferred", jobId: job.id, reason: code }),
+    )
+    expect(value.log.error).not.toHaveBeenCalled()
+    expect(value.publisher.labels).toHaveBeenLastCalledWith(12, ["bot:failed"], ["bot:working"])
+    expect(value.github.currentIssue.labels).toEqual([
+      "fix_available",
+      "bot:approved",
+      "bot:failed",
+    ])
+    expect(value.store.blockedUntil()).toBe(0)
+    expect(value.store.deliveries()).toEqual([])
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(value.runtime.verify).not.toHaveBeenCalled()
+    expectNoPublication(value)
+    value.orchestrator.scan()
+    await value.orchestrator.drain()
+    expect(value.github.discover).toHaveBeenCalledTimes(1)
+    expect(value.log.error).not.toHaveBeenCalled()
+  })
+
+  test.each([
+    ["before coding", 3, 0, "failed"],
+    ["after verification", 4, 1, "failed"],
+    ["publishing", 5, 1, "publishing"],
+  ] as const)("%s deferral preserves state and labels", async (_phase, read, runs, state) => {
+    const value = fixture()
+    await value.propose()
+    const code = "github_issue_changed_during_read"
+    deferIssueRead(value, read, new GitHubIssueDeferred(code, now + 60_000))
+    await value.approve()
+    const job = value.store.jobs()[0]
+    expect(job.state).toBe(state)
+    expect(job.error).toBe(state === "failed" ? code : undefined)
+    expect(job.notified).toBe(state === "failed" ? true : undefined)
+    expect(Boolean(job.artifact)).toBe(state === "publishing")
+    expect(value.log.info).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "execution_deferred", jobId: job.id, reason: code }),
+    )
+    expect(value.log.error).not.toHaveBeenCalled()
+    expect(value.publisher.labels).toHaveBeenLastCalledWith(12, ["bot:failed"], ["bot:working"])
+    expect(value.github.currentIssue.labels).toEqual([
+      "fix_available",
+      "bot:approved",
+      "bot:failed",
+    ])
+    expect(value.store.blockedUntil()).toBe(0)
+    expect(value.store.deliveries()).toEqual([])
+    expect(value.runtime.code).toHaveBeenCalledTimes(runs)
+    expect(value.runtime.verify).toHaveBeenCalledTimes(runs)
+    expectNoPublication(value)
+  })
+
+  test("consumed approval cannot replay coding after local deferral through redelivery, scan, or restart", async () => {
+    const value = fixture()
+    const proposal = await value.propose()
+    const code = "github_issue_changed_during_read"
+    deferIssueRead(value, 4, new GitHubIssueDeferred(code, now + 60_000))
+    const approval = await value.approve()
+    const job = value.store.jobs()[0]
+    const previousRuntime = value.runtime
+    expect(job).toMatchObject({ state: "failed", error: code, notified: true })
+    expect(previousRuntime.code).toHaveBeenCalledTimes(1)
+    expect(previousRuntime.verify).toHaveBeenCalledTimes(1)
+    await value.deliver(approval, "redelivered-consumed-approval")
+    await value.deliver(approval, "redelivered-consumed-approval")
+    value.github.discovered = [12]
+    value.orchestrator.scan()
+    await value.orchestrator.drain()
+    now += 60_000
+    await value.orchestrator.drain()
+    expect(value.store.deliveries()).toEqual([])
+    expect(previousRuntime.code).toHaveBeenCalledTimes(1)
+    expect(previousRuntime.verify).toHaveBeenCalledTimes(1)
+    await value.restart()
+    await value.deliver(approval, "consumed-approval-after-restart")
+    expect(value.store.claim(proposal, job.approval)).toBeUndefined()
+    expect(value.store.jobs()).toEqual([job])
+    expect(value.store.blockedUntil()).toBe(0)
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(value.runtime.verify).not.toHaveBeenCalled()
+    expect(value.log.error).not.toHaveBeenCalled()
+    expectNoPublication(value)
+  })
+
+  test("publishing recovery deferral retains the saved draft without repeated coding or verification", async () => {
+    const value = fixture()
+    await value.propose()
+    value.publisher.crashAfterCreate = true
+    const approval = await value.approve()
+    const interrupted = value.store.jobs()[0]
+    const previousRuntime = value.runtime
+    expect(interrupted).toMatchObject({ state: "publishing", publication: { prIntent: true } })
+    expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+    expect(value.log.error).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "execution_failed", reason: "github_pr_outcome_unknown" }),
+    )
+    value.log.info.mockClear()
+    value.log.error.mockClear()
+    const read = required(value.github.issue.getMockImplementation())
+    value.github.issue.mockRejectedValue(new GitHubIssueDeferred("github_comments_limit"))
+    await value.restart()
+    expect(value.store.job(interrupted.id)).toEqual(interrupted)
+    expect(value.store.blockedUntil()).toBe(0)
+    expect(value.log.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "execution_deferred",
+        jobId: interrupted.id,
+        reason: "github_comments_limit",
+      }),
+    )
+    expect(value.log.error).not.toHaveBeenCalled()
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(value.runtime.verify).not.toHaveBeenCalled()
+    expect(value.publisher.publish).toHaveBeenCalledTimes(1)
+    expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+    expect(value.publisher.labels).toHaveBeenLastCalledWith(12, ["bot:failed"], ["bot:working"])
+    value.github.issue.mockImplementation(read)
+    value.orchestrator.scan()
+    await value.orchestrator.drain()
+    expect(value.store.job(interrupted.id)).toMatchObject({
+      state: "pr_ready",
+      notified: true,
+      artifact: interrupted.artifact,
+      publication: { prIntent: true, prNumber: 40, commitSha: "b".repeat(40) },
+    })
+    await value.deliver(approval, "approval-after-publication-recovery")
+    await value.restart()
+    expect(previousRuntime.code).toHaveBeenCalledTimes(1)
+    expect(previousRuntime.verify).toHaveBeenCalledTimes(1)
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(value.runtime.verify).not.toHaveBeenCalled()
+    expect(value.publisher.publish).toHaveBeenCalledTimes(2)
+    expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+    expect(value.store.jobs()).toHaveLength(1)
+    expect(value.github.currentIssue.labels).toEqual(["bot:pr_ready"])
+    expect(value.log.error).not.toHaveBeenCalled()
+  })
+
+  test("logs the original safe deferral before a genuine failed-label notification error", async () => {
+    const value = fixture()
+    await value.propose()
+    const code = "github_context_limit"
+    const error = new GitHubIssueDeferred(code)
+    error.message = "private-issue-evidence"
+    error.cause = new Error("private-deferral-cause")
+    deferIssueRead(value, 2, error)
+    const labels = required(value.publisher.labels.getMockImplementation())
+    let loggedBeforeLabels = false
+    value.publisher.labels.mockImplementation(async (number, add, remove) => {
+      if (add.includes("bot:failed")) {
+        // Record the observation here; assertions must run outside the production catch.
+        loggedBeforeLabels = value.log.info.mock.calls.some(
+          ([fields]) =>
+            fields.event === "execution_deferred" &&
+            fields.jobId === value.store.jobs()[0].id &&
+            fields.reason === code,
+        )
+        throw new GitHubError("github_read_failed", 404)
+      }
+      return labels(number, add, remove)
+    })
+    await value.approve()
+    const job = value.store.jobs()[0]
+    expect(job).toMatchObject({ state: "failed", error: code })
+    expect(job.notified).not.toBe(true)
+    expect(loggedBeforeLabels).toBe(true)
+    expect(value.log.info).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "execution_deferred", jobId: job.id, reason: code }),
+    )
+    expect(value.log.error).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ event: "failed", reason: "request_rejected_or_failed" }),
+    )
+    const logs = JSON.stringify([value.log.info.mock.calls, value.log.error.mock.calls])
+    expect(logs).not.toContain("private-issue-evidence")
+    expect(logs).not.toContain("private-deferral-cause")
+    expect(value.store.blockedUntil()).toBe(0)
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(value.runtime.verify).not.toHaveBeenCalled()
     expectNoPublication(value)
   })
 })
@@ -880,6 +1101,15 @@ describe("freshness and revocation", () => {
     await value.approve()
     expect(value.store.jobs()[0]).toMatchObject({ state: "failed", error: "github_deferred" })
     expect(value.store.blockedUntil()).toBe(now + 3_600_000)
+    expect(value.log.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "execution_deferred",
+        jobId: value.store.jobs()[0].id,
+        reason: "github_rate_limit",
+      }),
+    )
+    expect(value.log.info).toHaveBeenCalledWith(expect.objectContaining({ event: "deferred" }))
+    expect(value.log.error).not.toHaveBeenCalled()
     expect(value.publisher.labels.mock.calls).toHaveLength(labels)
     value.orchestrator.accept("pending-during-worker-cooldown", value.work())
     await value.orchestrator.drain()
@@ -887,24 +1117,50 @@ describe("freshness and revocation", () => {
     expectNoPublication(value)
   })
 
-  test("repository invalidation aborts triage before a proposal or job exists", async () => {
-    const value = fixture()
-    const entered = Promise.withResolvers<AbortSignal>()
-    const never = new Promise<void>(() => {})
-    value.runtime.triage.mockImplementation(async (_snapshot, _prompt, signal) => {
-      entered.resolve(signal)
-      await waitForRelease(never, signal)
-      return JSON.stringify(decision())
-    })
-    const delivery = value.deliver()
-    const signal = await entered.promise
-    value.orchestrator.accept("repository-edited", { kind: "invalidate", disable: false })
-    await delivery
-    expect(signal.aborted).toBe(true)
-    expect(value.store.proposals()).toEqual([])
-    expect(value.publisher.propose).not.toHaveBeenCalled()
-    expectNoPublication(value)
-  })
+  test.each(["repository edited", "access removed", "issue edited", "issue closed"])(
+    "%s cancels active triage without an error log",
+    async (kind) => {
+      const value = fixture()
+      const entered = Promise.withResolvers<AbortSignal>()
+      const never = new Promise<void>(() => {})
+      value.runtime.triage.mockImplementation(async (_snapshot, _prompt, signal) => {
+        entered.resolve(signal)
+        await waitForRelease(never, signal)
+        return JSON.stringify(decision())
+      })
+      const delivery = value.deliver()
+      const signal = await entered.promise
+      if (kind === "repository edited" || kind === "access removed") {
+        value.orchestrator.accept("triage-revoked", {
+          kind: "invalidate",
+          disable: kind === "access removed",
+        })
+      } else {
+        if (kind === "issue closed") value.github.currentIssue.state = "closed"
+        value.orchestrator.accept(
+          "triage-revoked",
+          value.work({
+            action: kind === "issue closed" ? "closed" : "edited",
+            cancel: kind === "issue closed",
+            material: kind === "issue edited",
+          }),
+        )
+      }
+      await delivery
+      expect(signal.aborted).toBe(true)
+      expect(value.store.proposals()).toEqual([])
+      expect(value.publisher.propose).not.toHaveBeenCalled()
+      expect(value.log.info).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: "cancelled",
+          reason: "job_cancelled",
+          correlationId: "delivery-1",
+        }),
+      )
+      expect(value.log.error).not.toHaveBeenCalled()
+      expectNoPublication(value)
+    },
+  )
 
   test("an unrelated feature-branch push does not cancel the approved default-branch job", async () => {
     const value = fixture()
@@ -965,6 +1221,10 @@ describe("freshness and revocation", () => {
     })
     await value.approve()
     expect(value.store.jobs()[0]).toMatchObject({ state: "cancelled", error: "base_changed" })
+    expect(value.log.info).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "execution_cancelled", reason: "base_changed" }),
+    )
+    expect(value.log.error).not.toHaveBeenCalled()
     expect(value.runtime.code).not.toHaveBeenCalled()
     expectNoPublication(value)
   })
@@ -1036,6 +1296,12 @@ describe("freshness and revocation", () => {
       expect(value.store.proposal(proposal.ref)).toBeUndefined()
       expect(value.store.jobs()[0].state).toBe("cancelled")
       await value.orchestrator.drain()
+      expect(value.log.info).toHaveBeenCalledWith(
+        expect.objectContaining({ event: "execution_cancelled", jobId: value.store.jobs()[0].id }),
+      )
+      if (kind !== "access removed")
+        expect(value.log.info).toHaveBeenCalledWith(expect.objectContaining({ event: "cancelled" }))
+      expect(value.log.error).not.toHaveBeenCalled()
       expect(value.runtime.verify).not.toHaveBeenCalled()
       expectNoPublication(value)
       if (kind === "skip added") expect(value.github.currentIssue.labels).toContain("bot:skip")
@@ -1117,6 +1383,19 @@ describe("execution and verification failures cannot publish", () => {
       const work = await value.approve()
       const job = value.store.jobs()[0]
       expect(job.state).toBe("failed")
+      expect(value.log.error).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: "execution_failed",
+          jobId: job.id,
+          reason: "execution_failed",
+        }),
+      )
+      expect(value.log.info).not.toHaveBeenCalledWith(
+        expect.objectContaining({ event: "execution_failed" }),
+      )
+      const logs = JSON.stringify([value.log.info.mock.calls, value.log.error.mock.calls])
+      expect(logs).not.toContain("agent_failed")
+      expect(logs).not.toContain("sandbox_timeout")
       await value.deliver(work, "redelivery-after-execution-failure")
       expect(value.store.claim(proposal, job.approval)).toBeUndefined()
       expect(value.runtime.code).toHaveBeenCalledTimes(1)
@@ -1191,6 +1470,16 @@ describe("execution and verification failures cannot publish", () => {
     expect(value.runtime.code).toHaveBeenCalledTimes(1)
     expect(value.runtime.verify).toHaveBeenCalledTimes(1)
     expect(value.store.jobs()[0].state).toBe("failed")
+    expect(value.log.error).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "execution_failed",
+        jobId: value.store.jobs()[0].id,
+        reason:
+          kind === "unavailable" || kind === "invalid duration"
+            ? "execution_failed"
+            : "verification_failed",
+      }),
+    )
     expectNoPublication(value)
   })
 
@@ -1218,16 +1507,43 @@ describe("restart and shutdown", () => {
     const value = fixture()
     const labels = value.publisher.labels.getMockImplementation()
     if (!labels) throw new Error("fixture_labels_missing")
+    let failureLoggedBeforeLabels = false
     value.publisher.labels.mockImplementation(async (number, add, remove) => {
-      if (number === 12 && add.includes("bot:failed"))
+      if (number === 12 && add.includes("bot:failed")) {
+        failureLoggedBeforeLabels = value.log.error.mock.calls.some(
+          ([fields]) =>
+            fields.event === "execution_failed" &&
+            fields.jobId === value.store.jobs()[0].id &&
+            fields.reason === "runtime_timeout",
+        )
         throw new GitHubError("github_read_failed", 404)
+      }
       return labels(number, add, remove)
     })
     await value.propose()
-    value.runtime.code.mockRejectedValueOnce(new Error("controlled_agent_failure"))
+    value.runtime.code.mockRejectedValueOnce(
+      new Error("runtime_timeout", { cause: new Error("private-agent-cause") }),
+    )
     await value.approve()
-    expect(value.store.jobs()[0]).toMatchObject({ state: "failed" })
+    expect(value.store.jobs()[0]).toMatchObject({ state: "failed", error: "runtime_timeout" })
     expect(value.store.jobs()[0].notified).not.toBe(true)
+    expect(failureLoggedBeforeLabels).toBe(true)
+    expect(value.log.error).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "execution_failed",
+        jobId: value.store.jobs()[0].id,
+        reason: "runtime_timeout",
+      }),
+    )
+    expect(value.log.error).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "failed", reason: "request_rejected_or_failed" }),
+    )
+    expect(value.log.info).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event: "execution_failed" }),
+    )
+    expect(JSON.stringify([value.log.info.mock.calls, value.log.error.mock.calls])).not.toContain(
+      "private-agent-cause",
+    )
     value.github.currentIssue.ref = { ...value.github.currentIssue.ref, number: 13, issueId: 1013 }
     value.github.currentIssue.labels = []
     await value.propose()
@@ -1236,7 +1552,24 @@ describe("restart and shutdown", () => {
     )
     await value.approve()
     expect(value.store.jobs()[1].state).toBe("publishing")
+    expect(value.log.error).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "execution_failed",
+        jobId: value.store.jobs()[1].id,
+        reason: "github_pr_outcome_unknown",
+      }),
+    )
     await value.restart()
+    expect(value.log.error).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "recovery_failed",
+        jobId: value.store.jobs()[0].id,
+        reason: "github_read_failed",
+      }),
+    )
+    expect(value.log.info).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event: "recovery_failed" }),
+    )
     expect(value.store.jobs()[0].notified).toBe(true)
     expect(value.store.jobs()[1].state).toBe("pr_ready")
     expect(value.runtime.code).not.toHaveBeenCalled()
@@ -1422,6 +1755,10 @@ describe("restart and shutdown", () => {
     await value.orchestrator.stop()
     expect(signal.aborted).toBe(true)
     expect(value.store.jobs()[0].state).toBe("cancelled")
+    expect(value.log.info).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "execution_cancelled", jobId: value.store.jobs()[0].id }),
+    )
+    expect(value.log.error).not.toHaveBeenCalled()
     expect(() => value.orchestrator.accept("after-stop", value.work())).toThrow("service_stopping")
     expectNoPublication(value)
   })

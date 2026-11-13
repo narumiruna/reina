@@ -33,7 +33,9 @@ let server: Server
 let port: number
 let token: string
 let csrf: string
+let auth: Auth
 const changed = vi.fn()
+const log = { info: vi.fn(), error: vi.fn() }
 
 async function request(
   route: string,
@@ -99,7 +101,7 @@ beforeEach(async () => {
   const session = store.createSession("admin-subject", "Test Admin", ["reina-admins"])
   token = session.token
   csrf = session.csrfToken
-  const auth = new Auth(store, {
+  auth = new Auth(store, {
     origin,
     issuer: "https://id.example",
     clientId: "fixture-client",
@@ -112,15 +114,19 @@ beforeEach(async () => {
     origin,
     () => ({ state: "not_configured", reason: "configure_model" }),
     changed,
+    log,
   )
-  server = httpServer(() => undefined, admin)
+  server = httpServer(() => undefined, log, admin)
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
   port = (server.address() as import("node:net").AddressInfo).port
   changed.mockClear()
+  log.info.mockClear()
+  log.error.mockClear()
 })
 afterEach(async () => {
   server.closeAllConnections()
   await new Promise<void>((resolve) => server.close(() => resolve()))
+  vi.restoreAllMocks()
   store.close()
   rmSync(directory, { recursive: true, force: true })
 })
@@ -315,6 +321,111 @@ describe("admin web boundary", () => {
     ).toBe(413)
     expect(store.githubStatus().fingerprint).toBe(fingerprint)
     expect(changed).not.toHaveBeenCalled()
+  })
+
+  it("logs one safe error when settings persistence fails", async () => {
+    const secret = "private-database-error-with-credentials"
+    vi.spyOn(store, "saveProvider").mockImplementationOnce(() => {
+      throw new Error(secret)
+    })
+    const response = await request("/api/providers?code=private-oauth-code", "POST", provider, {
+      headers: { authorization: "Bearer private-header-value" },
+    })
+    expect(response.status).toBe(500)
+    expect(response.json()).toEqual({ error: "settings_unavailable" })
+    expect(changed).not.toHaveBeenCalled()
+    expect(log.error).toHaveBeenCalledExactlyOnceWith({
+      event: "http_request_failed",
+      reason: "settings_unavailable",
+      method: "POST",
+      route: "/api/providers",
+      status: 500,
+    })
+    const logs = JSON.stringify(log.error.mock.calls)
+    for (const value of [secret, apiKey, token, csrf, "private-oauth-code", "private-header-value"])
+      expect(logs).not.toContain(value)
+  })
+
+  it("logs one safe error for an uncaught settings handler failure", async () => {
+    vi.spyOn(store, "providers").mockImplementationOnce(() => {
+      throw new Error("private-settings-read-error")
+    })
+    expect((await request("/api/settings?state=private-state")).status).toBe(503)
+    expect(log.error).toHaveBeenCalledExactlyOnceWith({
+      event: "http_request_failed",
+      reason: "request_handler_failed",
+      method: "GET",
+      route: "/api/settings",
+      status: 503,
+    })
+  })
+
+  it("logs the actual response status when a handler fails after headers are sent", async () => {
+    vi.spyOn(auth, "handle").mockImplementationOnce(async (_req, res) => {
+      res.writeHead(200)
+      res.write("partial response")
+      throw new Error("private-handler-error")
+    })
+    const response = await request("/auth/callback?code=private-code")
+    expect(response.status).toBe(200)
+    expect(response.text).toBe("partial response")
+    expect(log.error).toHaveBeenCalledExactlyOnceWith({
+      event: "http_request_failed",
+      reason: "request_handler_failed",
+      method: "GET",
+      route: "/auth/callback",
+      status: 200,
+    })
+    expect(JSON.stringify(log.error.mock.calls)).not.toContain("private-")
+  })
+
+  it.each([
+    ["/auth/callback?code=private-code&state=private-state", "GET", "/auth/callback", "GET"],
+    ["/private-unknown-path?secret=private-query", "PURGE", "unknown", "unknown"],
+  ])(
+    "does not log raw request data on uncaught failure: %s",
+    async (url, method, route, safeMethod) => {
+      vi.spyOn(auth, "handle").mockRejectedValueOnce(new Error("private-error-message"))
+      const response = await request(url, method, "private-body", {
+        headers: { authorization: "Bearer private-header", "x-private": "private-header-data" },
+      })
+      expect(response.status).toBe(503)
+      expect(log.error).toHaveBeenCalledExactlyOnceWith({
+        event: "http_request_failed",
+        reason: "request_handler_failed",
+        method: safeMethod,
+        route,
+        status: 503,
+      })
+      const logs = JSON.stringify(log.error.mock.calls)
+      for (const value of ["private-", token, csrf]) expect(logs).not.toContain(value)
+    },
+  )
+
+  it("does not log errors for expected auth, validation, routing, health or standby responses", async () => {
+    expect((await request("/api/settings", "GET", undefined, { anonymous: true })).status).toBe(401)
+    expect(
+      (
+        await request("/api/providers", "POST", provider, {
+          headers: { "x-csrf-token": "wrong" },
+        })
+      ).status,
+    ).toBe(403)
+    expect((await request("/api/providers", "POST", {})).status).toBe(400)
+    expect(
+      (
+        await request("/api/github/private-key", "POST", "invalid-key", {
+          raw: true,
+          headers: { "content-type": "application/x-pem-file" },
+        })
+      ).status,
+    ).toBe(400)
+    expect((await request("/api/unknown")).status).toBe(404)
+    expect((await request("/healthz")).status).toBe(200)
+    expect((await request("/api/github/webhooks", "POST", {}, { anonymous: true })).status).toBe(
+      503,
+    )
+    expect(log.error).not.toHaveBeenCalled()
   })
 
   it("retains HMAC webhook separation and HTTP health during incomplete setup", async () => {

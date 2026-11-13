@@ -53,6 +53,7 @@ interface AppFixture {
   server: Server
   url: string
   logs: string[]
+  log: { info: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> }
   network: ReturnType<typeof vi.fn<typeof fetch>>
   approval(actor?: Actor): Envelope
   post(payload: unknown, delivery: string, name?: string): Promise<Response>
@@ -378,7 +379,8 @@ async function fixture(): Promise<AppFixture> {
     },
   )
   register(app, value, orchestrator, botId)
-  const server = httpServer(app)
+  const log = { info: vi.fn(), error: vi.fn() }
+  const server = httpServer(app, log)
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject)
     server.listen(0, "127.0.0.1", () => resolve())
@@ -397,6 +399,7 @@ async function fixture(): Promise<AppFixture> {
     server,
     url,
     logs,
+    log,
     network,
     approval(actor = maintainer) {
       if (github.currentIssue.labels.includes("bot:approved")) {
@@ -455,7 +458,7 @@ async function receive(value: AppFixture, name: string, data: unknown, id = "pro
 }
 
 function expectNoPrivateLogs(value: AppFixture) {
-  const logs = value.logs.join("\n")
+  const logs = `${value.logs.join("\n")}\n${JSON.stringify(value.log.error.mock.calls)}`
   for (const text of [rawIssueBody, rawCommentBody, privateKey, token, value.config.modelKey]) {
     expect(logs).not.toContain(text)
   }
@@ -780,7 +783,53 @@ describe("signed HTTP ingress and the complete credential-free workflow", () => 
     )
     expect(value.runtime.triage).not.toHaveBeenCalled()
     expect(value.publisher.createDraft).not.toHaveBeenCalled()
+    expect(value.log.error).toHaveBeenCalledExactlyOnceWith({
+      event: "http_request_failed",
+      reason: "webhook_intake_failed",
+      method: "POST",
+      route: "/api/github/webhooks",
+      status: 503,
+    })
     expectNoPrivateLogs(value)
+  })
+
+  test("logs one safe retryable receive failure without request or error secrets", async () => {
+    const value = await fixture()
+    vi.spyOn(value.app, "receive").mockRejectedValueOnce(new Error("private-receive-error"))
+    const raw = JSON.stringify(payload({ ignored: "private-request-body" }))
+    const response = await fetch(`${value.url}/api/github/webhooks`, {
+      method: "POST",
+      body: raw,
+      headers: {
+        "x-github-delivery": "private-delivery-id",
+        "x-github-event": "issues",
+        "x-hub-signature-256": sign(raw),
+        authorization: "Bearer private-authorization",
+        cookie: "private-cookie",
+      },
+    })
+    expect(response.status).toBe(503)
+    expect(value.log.error).toHaveBeenCalledExactlyOnceWith({
+      event: "http_request_failed",
+      reason: "webhook_intake_failed",
+      method: "POST",
+      route: "/api/github/webhooks",
+      status: 503,
+    })
+    expect(JSON.stringify(value.log.error.mock.calls)).not.toContain("private-")
+    expect(value.store.deliveries()).toEqual([])
+    expectNoPrivateLogs(value)
+  })
+
+  test("does not log errors for expected webhook rejection responses", async () => {
+    const value = await fixture()
+    expect((await value.postRaw("{}", "bad-signature", "issues", "invalid")).status).toBe(401)
+    expect((await value.postRaw("{", "invalid-json")).status).toBe(400)
+    expect((await value.postRaw("{}", "invalid/delivery")).status).toBe(400)
+    expect((await value.postRaw("x".repeat(1_048_577), "oversized")).status).toBe(413)
+    expect((await fetch(`${value.url}/healthz`)).status).toBe(200)
+    expect((await fetch(`${value.url}/private-unknown?secret=private-query`)).status).toBe(404)
+    expect(value.log.error).not.toHaveBeenCalled()
   })
 
   test.each(["invalid JSON", "invalid ID", "oversize envelope field"])(

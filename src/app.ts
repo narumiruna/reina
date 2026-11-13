@@ -1,8 +1,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import type { Probot } from "probot"
 import { z } from "zod"
+import { logHttpFailure } from "./http-logging.js"
 import type { Orchestrator, Work } from "./jobs/orchestrator.js"
-import type { Config } from "./types.js"
+import type { Config, Logger } from "./types.js"
 import type { AdminWeb } from "./web/admin.js"
 
 const id = z.number().int().positive()
@@ -124,7 +125,11 @@ async function body(req: IncomingMessage): Promise<string> {
 }
 
 // Bound and sanitize input before Probot dispatch, so even library error logs cannot contain issue bodies.
-export function httpServer(app: Probot | (() => Probot | undefined), admin?: AdminWeb) {
+export function httpServer(
+  app: Probot | (() => Probot | undefined),
+  log: Logger,
+  admin?: AdminWeb,
+) {
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.url === "/healthz" && req.method === "GET") {
       res.writeHead(200).end("ok")
@@ -178,11 +183,13 @@ export function httpServer(app: Probot | (() => Probot | undefined), admin?: Adm
       res.writeHead(202).end()
     } catch {
       // Handlers perform only synchronous durable intake. A failed write must remain retryable by GitHub.
+      logHttpFailure(log, req, "webhook_intake_failed", 503)
       res.writeHead(503).end()
     }
   }
   const server = createServer((req, res) => {
     void handle(req, res).catch(() => {
+      logHttpFailure(log, req, "request_handler_failed", res.headersSent ? res.statusCode : 503)
       if (!res.headersSent) res.writeHead(503)
       res.end()
     })
