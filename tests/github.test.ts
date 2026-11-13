@@ -128,8 +128,14 @@ class MockAPI {
       get: this.method("issues.get", () =>
         response({ ...this.issue, comments: this.comments.length }),
       ),
-      listComments: this.method("issues.listComments", () =>
-        response(this.comments, this.commentsLink),
+      listComments: this.method("issues.listComments", (params: { page: number }) =>
+        response(
+          this.comments.slice((params.page - 1) * 100, params.page * 100),
+          this.commentsLink ??
+            (this.comments.length > params.page * 100
+              ? '<https://api.github.test/untrusted?page=999>; rel="next"'
+              : undefined),
+        ),
       ),
       listEvents: this.method("issues.listEvents", () => response(this.events, this.eventsLink)),
       listForRepo: this.method("issues.listForRepo", () => response([this.issue])),
@@ -420,7 +426,7 @@ describe("bounded GitHub reads", () => {
       if (kind === "incomplete") api.commentsLink = '<https://api.github.test/page=2>; rel="next"'
       if (kind === "duplicate") api.comments[1].id = api.comments[0].id
       await expect(github.issue(12)).rejects.toThrow()
-      if (kind === "comments") expect(api.rest.issues.listComments).not.toHaveBeenCalled()
+      if (kind === "comments") expect(api.rest.issues.listComments).toHaveBeenCalledTimes(2)
     },
   )
 
@@ -760,6 +766,72 @@ describe("approval authority", () => {
 })
 
 describe("live proposal publication authority", () => {
+  function withSummaryOnTwoPages(summaryLast: boolean) {
+    const value = setup(true)
+    const p = proposal()
+    const saved = value.api.comments.pop()
+    if (!saved) throw new Error("Missing fixture proposal")
+    value.api.comments.push(
+      ...Array.from({ length: 97 }, (_, index) => ({
+        id: 10_000 + index,
+        user: bot,
+        body: "Ordinary bot comment; no reader allowance.",
+        created_at: fixture.now,
+      })),
+    )
+    const summary: Comment = {
+      id: 20_000,
+      user: bot,
+      body: `<!-- reina:triage:${repository.id}:${fixture.issue.id} -->\n## Issue triage`,
+      created_at: fixture.now,
+    }
+    value.api.comments.push(...(summaryLast ? [saved, summary] : [summary, saved]))
+    expect(value.api.comments).toHaveLength(101)
+    return { ...value, p }
+  }
+
+  test.each([false, true])(
+    "keeps exact proposal authority across two pages (summary last=%s)",
+    async (summaryLast) => {
+      const { api, github, publisher, p } = withSummaryOnTwoPages(summaryLast)
+      const issue = await github.issue(12)
+      const approval = await authorize(github, issue, p, actor)
+      await expect(publisher.propose(p)).resolves.toEqual({
+        commentId: p.commentId,
+        publishedAt: p.publishedAt,
+      })
+      const restarted = new Publisher(api.client(), repository, bot.id)
+      await expect(restarted.propose(p)).resolves.toMatchObject({ commentId: p.commentId })
+      await revalidate(github, issue, p, approval)
+      expect(api.rest.issues.listComments).toHaveBeenCalledWith(
+        expect.objectContaining({ page: 2, per_page: 100 }),
+      )
+      expect(api.rest.issues.createComment).not.toHaveBeenCalled()
+      const comment = api.comments.find((item) => item.id === p.commentId)
+      if (!comment) throw new Error("Missing fixture proposal")
+      comment.body += " changed"
+      await expect(authorize(github, issue, p, actor)).rejects.toMatchObject({
+        code: "approval_proposal_comment_changed",
+      })
+      api.comments = api.comments.filter((item) => item.id !== p.commentId)
+      await expect(revalidate(github, issue, p, approval)).rejects.toMatchObject({
+        code: "approval_proposal_comment_changed",
+      })
+      expect(api.rest.issues.createComment).not.toHaveBeenCalled()
+    },
+  )
+
+  test("an incomplete second page cannot grant approval or recreate a proposal", async () => {
+    const { api, github, publisher, p } = withSummaryOnTwoPages(true)
+    const issue = await github.issue(12)
+    api.commentsLink = '<https://api.github.test/untrusted?page=999>; rel="next"'
+    await expect(authorize(github, issue, p, actor)).rejects.toThrow()
+    await expect(publisher.propose(p)).rejects.toThrow()
+    api.comments = api.comments.filter((item) => item.id !== p.commentId)
+    await expect(new Publisher(api.client(), repository, bot.id).propose(p)).rejects.toThrow()
+    expect(api.rest.issues.createComment).not.toHaveBeenCalled()
+  })
+
   test("binds permission to the actor numeric ID, not a reused login", async () => {
     const { api, github } = setup(true)
     api.rest.repos.getCollaboratorPermissionLevel.mockResolvedValueOnce(
@@ -1004,6 +1076,8 @@ describe("publication retry authorization", () => {
       vi.setSystemTime(now + 1000)
       if (kind === "comment") {
         op.api.fail("issues.createComment", "after")
+        // Delayed visibility must affect both the count and the complete list.
+        op.api.rest.issues.get.mockResolvedValue(response({ ...op.api.issue, comments: 0 }))
         op.api.rest.issues.listComments.mockResolvedValueOnce(response([]))
         op.api.rest.issues.listComments.mockResolvedValueOnce(response([]))
       } else {
@@ -1017,6 +1091,11 @@ describe("publication retry authorization", () => {
       else op.api.rest.pulls.list.mockResolvedValueOnce(response([]))
       await expect(op.run(restarted)).rejects.toBeInstanceOf(GitHubOutcomeUnknown)
       expect(op.post).toHaveBeenCalledTimes(2)
+      if (kind === "comment") {
+        op.api.rest.issues.get.mockImplementation(async () =>
+          response({ ...op.api.issue, comments: op.api.comments.length }),
+        )
+      }
       await op.run(restarted)
       expect(op.post).toHaveBeenCalledTimes(2)
     },

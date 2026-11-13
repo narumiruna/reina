@@ -1,8 +1,8 @@
 # Reina
 
-Reina is a Probot GitHub App that proposes small issue fixes. A maintainer must approve the exact
-proposal before the Pi coding agent changes code. Validated changes become a **draft pull request**. Reina never
-merges a PR or enables auto-merge.
+Reina is a Probot GitHub App that assesses issues and proposes small fixes. A maintainer must
+approve the exact proposal before the Pi coding agent changes code. Validated changes become a
+**draft pull request**. Reina never merges a PR or enables auto-merge.
 
 The MVP supports one Node/npm repository, one service instance, and one coding job at a time.
 Dispatch requires persistent local storage and a prepared Docker worker. Missing isolation prevents
@@ -128,7 +128,9 @@ or dependencies requiring lifecycle scripts are not supported.
 
 1. Register a GitHub App and install it only on the target repository.
    - Create the label definitions `fix_available`, `bot:approved`, `bot:working`, `bot:pr_ready`,
-     `bot:failed`, and `bot:skip`. Reina applies status labels but does not provision their definitions.
+     `bot:failed`, and `bot:skip`, plus `bot:triaged`, `bot:needs-info`, `bot:needs-human`, and
+     `bot:triage-failed`. See [label meanings](docs/architecture.md#approval-and-state).
+     Reina applies status labels but does not provision their definitions.
 2. Give it Metadata read, Contents read/write, Issues read/write, and Pull requests read/write.
    Do not grant Actions or Workflows write, administration, or organization-member access.
 3. Subscribe to Issues, Issue comment, Pull request, Push, Repository, Installation, and
@@ -182,9 +184,14 @@ Legacy model environment variables are rejected by `loadConfig`; configure model
 
 ## Issue workflow
 
-- Open an actionable issue or wait for the bounded periodic scan.
-- Reina reads the issue and source in an isolated read-only environment.
-- An eligible proposal gets `fix_available` and a comment with exact files, checks, risks, and expiry.
+- Open an issue or wait for the bounded periodic scan. Closed issues, PRs, and `bot:skip` are excluded.
+- Reina reads complete issue evidence and source in an isolated read-only environment.
+- One mutable triage summary reports the kind and host-derived next action: `fix_candidate`,
+  `needs_info`, or `needs_human`. A confirmed summary and outcome labels get `bot:triaged`.
+  Needs-info and human-decision results are successful reviews, not coding failures.
+- A failed assessment gets `bot:triage-failed`, not a reviewed claim for that version.
+- A fix candidate can get a separate immutable proposal with exact files, checks, risks, and expiry.
+  `fix_available` is added only after that proposal is confirmed; triage alone never starts coding.
 - A human with write, maintain, or admin permission adds `bot:approved`.
 - Approval must follow publication of that revision. If necessary, remove and re-add the label.
   Same-second approval/comment ordering is rejected because GitHub timestamps lack sufficient precision.
@@ -194,8 +201,24 @@ Legacy model environment variables are rejected by `loadConfig`; configure model
 - Remove approval, close the issue, or add `bot:skip` to stop pending work and cancel running work.
   A failed/interrupted attempt needs a new human approval transition.
 
-Labels are not the job database. Proposals expire after 24 hours. Material issue/comment changes,
-base movement, scope changes, policy changes, a changed model configuration, or a different worker
+For example, a bug report without reproduction details can receive `bot:triaged` and
+`bot:needs-info`, with questions about the public version and minimal reproduction steps.
+Do not post credentials or private diagnostic data in response.
+
+Issue edits and non-Reina comment changes invalidate the previous review. Reina's own comments
+and label updates do not cause a paid reassessment loop. Non-fix results remain cached until their
+evidence or policy binding changes. Each persisted assessment cycle permits at most three model
+attempts, with one-minute and five-minute retry delays for allowed transient failures. Invalid
+output or unavailable isolation stops the cycle. Exhausted failures do not renew daily; removing
+labels or restarting does not reset the budget. GitHub publication recovery reuses the saved result.
+A successful fix-candidate cycle can renew after 24 hours, with a new assessment and fresh approval.
+See [triage lifecycle and recovery](docs/architecture.md#issue-triage).
+
+Labels are eventually consistent projections, not the job database or approval authority.
+`bot:triaged` means a validated assessment was published, not that a fix exists or tests passed.
+Manual review-label changes neither authorize code execution nor reset assessment attempts.
+Proposals expire after 24 hours. Material issue/comment changes, base movement, scope changes,
+policy changes, a changed model configuration, or a different worker
 image require a fresh proposal and approval. Credential replacement changes `modelRevision` and
 requires fresh approval. OAuth refresh within the same logical credential generation does not
 change approval authority. Credential removal stops affected work and clears its model selection.

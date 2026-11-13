@@ -88,7 +88,11 @@ flowchart TD
   Intake --> State[(Private durable SQLite)]
   State --> Triage[Read-only worker container]
   Triage --> Policy[Zod and deterministic policy]
-  Policy --> Proposal[Immutable proposal comment]
+  Policy --> Review[Persist validated triage result]
+  Review --> Summary[Mutable triage summary and review labels]
+  Summary --> Candidate{Host outcome is fix_candidate?}
+  Candidate -->|Yes, no existing conflict| Proposal[Immutable proposal comment]
+  Candidate -->|No| Wait[Wait for information or maintainer decision]
   Proposal --> Approval[Human actor and history checks]
   Approval --> Claim[Transactional single job claim]
   Claim --> Coding[Coding worker container]
@@ -157,22 +161,22 @@ external security prerequisite is verified.
 
 ## Limits and supported targets
 
-| Control                       | MVP limit                                                                        |
-| ----------------------------- | -------------------------------------------------------------------------------- |
-| Deployment                    | One service instance, enabled repository, and coding job                         |
-| Scan                          | Default 15 minutes; at most ten candidate issues per pass                        |
-| Issue context                 | 100 comments and 128 KiB; excess causes deferral                                 |
-| Source                        | 2,000 regular files, 1 MiB per file, 16 MiB total                                |
-| CPU / memory / processes      | One CPU / 2 GiB with no extra swap / 128 processes                               |
-| Workspace / temporary storage | 256 MiB quota volume / 64 MiB tmpfs                                              |
-| Time                          | Triage 120 s; coding at most 600 s; validation 180 s                             |
-| Model requests                | Eight triage or 24 coding requests; 1 MiB/request; 4 MiB response; 60 s/request  |
-| Model output                  | At most 4,096 tokens with supported non-Codex SDK caps; no exact Codex token cap |
-| Pi output                     | 1 MiB/JSONL record; 8 MiB stdout; 64 KiB stderr                                  |
-| Patch                         | Ten files and 64 KiB unified diff; configured limits can be lower                |
-| Approval                      | Exact revision and base; expires after 24 hours; one coding invocation           |
-| GitHub reads                  | Initial read plus at most three transient retries; rate-limit deferral           |
-| Persistent inbox              | Delivery deduplication; at most eight deferred attempts                          |
+| Control                       | MVP limit                                                                            |
+| ----------------------------- | ------------------------------------------------------------------------------------ |
+| Deployment                    | One service instance, enabled repository, and coding job                             |
+| Scan                          | Default 15 minutes; at most ten candidate issues per pass                            |
+| Issue context                 | 100 ordinary comments and 128 KiB; one owned triage summary has a separate allowance |
+| Source                        | 2,000 regular files, 1 MiB per file, 16 MiB total                                    |
+| CPU / memory / processes      | One CPU / 2 GiB with no extra swap / 128 processes                                   |
+| Workspace / temporary storage | 256 MiB quota volume / 64 MiB tmpfs                                                  |
+| Time                          | Triage 120 s; coding at most 600 s; validation 180 s                                 |
+| Model requests                | Eight triage or 24 coding requests; 1 MiB/request; 4 MiB response; 60 s/request      |
+| Model output                  | At most 4,096 tokens with supported non-Codex SDK caps; no exact Codex token cap     |
+| Pi output                     | 1 MiB/JSONL record; 8 MiB stdout; 64 KiB stderr                                      |
+| Patch                         | Ten files and 64 KiB unified diff; configured limits can be lower                    |
+| Approval                      | Exact revision and base; expires after 24 hours; one coding invocation               |
+| GitHub reads                  | Initial read plus at most three transient retries; rate-limit deferral               |
+| Persistent inbox              | Delivery deduplication; at most eight deferred attempts                              |
 
 Only Node/npm regular-file Git trees are supported. Symlinks, submodules, workspaces, external
 package sources, binary patches, mode changes, and dependencies that need lifecycle scripts are
@@ -184,10 +188,18 @@ socket binds are required. Build-time transitive OS/npm packages are resolved du
 the approved immutable image binds their actual contents. Remote Docker daemons and Docker Desktop
 are unsupported by this deployment layout. OrbStack is unverified.
 
-Identical assessments, including failed or deferred ones, run at most once per UTC day for each
-issue-content/base/policy key. A changed key permits a new assessment. State-only reopening or
-removing an exclusion can therefore wait for the next assessment day. Scans use a durable page
-cursor so skipped or previously assessed issues do not permanently hide older issues.
+Assessment cycles have a persisted three-attempt budget, separate from successful fix-candidate
+renewal after 24 hours. Failed cycles do not renew on a timer. See [issue triage](#issue-triage).
+Discovery scans use a durable page cursor so skipped or previously assessed issues do not
+permanently hide older issues. Stored-review reconciliation has its own rotating cursor and the
+same per-scan issue limit; it does not depend on open-issue discovery.
+One trusted triage summary can use a separate allowance of one comment and 64 KiB. It must have
+the configured bot ID and Bot type, the exact leading repository/issue marker, no repeated marker,
+and no proposal or job marker. A second bot-owned triage marker makes the allowance ambiguous.
+Foreign markers and all other comments remain ordinary evidence. The reader fetches the complete
+raw list within 101 comments, 192 KiB, and two numbered pages. It rejects duplicate IDs, incomplete
+pages, and metadata count mismatches. Approval still requires the exact immutable proposal comment.
+
 Oversized or changing issue evidence is deferred for that issue only. The scan can process other
 issues and advance its cursor. No incomplete evidence is sent to triage. Real GitHub rate limits
 and exhausted transient reads still apply a persistent global cooldown. Before a job is claimed,
@@ -297,6 +309,128 @@ A cleanup failure latches dispatch stopped with `cleanup_requires_operator_check
 cannot clear that condition. The operator must inspect cleanup and restart; never relax sandbox
 controls or clear job records to make configuration apply.
 
+## Issue triage
+
+`src/triage/assessment.ts` wraps the unchanged `TriageDecision` fix contract in a strict envelope.
+Kind is `bug`, `feature`, `question`, `documentation`, `maintenance`, or `unknown`. The summary is
+at most 1,000 characters; missing information has at most five questions of 300 characters each.
+Malformed or contradictory output is rejected. The host derives the outcome:
+
+- Reported risks or a required human decision produce `needs_human`.
+- Otherwise, missing evidence produces `needs_info`.
+- Only existing fix-policy eligibility, no missing information, and kind `bug`, `documentation`,
+  or `maintenance` can produce `fix_candidate`. Other results produce `needs_human`.
+
+Classification is not permission to modify code. No confidence score authorizes execution.
+Existing proposals, previous PRs, or conflicts do not suppress general triage, but still prevent
+another coding job or PR under the existing rules.
+
+### Summary and freshness
+
+`src/github/triage.ts` maintains one mutable Reina-owned summary per issue, separate from immutable
+proposal comments. It includes kind, summary, missing information, fix-assessment reason, outcome,
+and assessment time. Model text is escaped as data, not interpreted as mentions, links, or commands.
+Every summary states that triage did not modify code, verify a fix, or grant execution approval.
+The mutable summary is never approval evidence.
+
+Example rendered content for an incomplete bug report (not a live assessment):
+
+> Kind: bug
+>
+> The report describes an error when saving a note; reproduction details are missing.
+>
+> Missing information: Which public version is affected? What minimal steps reproduce the error
+> without private data? Do not publish credentials, security-sensitive information, or private diagnostics.
+>
+> Fix assessment: Reproduction details are needed before a small fix can be proposed.
+>
+> Next action: needs_info
+>
+> Assessed: 2026-11-13T12:00:00.000Z.
+>
+> This is a read-only assessment. Triage did not modify code or verify a fix. It does not grant
+> approval to execute changes or establish that a fix is available.
+
+That result gets `bot:needs-info` and then `bot:triaged` only after publication is confirmed.
+It does not get `fix_available` merely because it is classified as a bug.
+
+`src/jobs/triage.ts` binds a review to repository/installation/issue identity, complete issue
+fingerprint, base branch/SHA, policy/model revision, and assessment-protocol revision. Normal OAuth
+refresh does not change the binding. Labels and Reina's own comments are excluded from the
+fingerprint; intake ignores Reina's own comment and status-label events. Issue edits, reopening,
+and non-Reina comment creation/edit/deletion trigger current-evidence checks without a feedback loop.
+
+Observed evidence changes invalidate the old projection. Stale labels are removed and an existing
+summary is marked stale before replacement inference. Complete evidence, issue identity/state,
+`bot:skip`, and base are checked again before a successful result is published. Changed results are
+discarded as current evidence, not marked reviewed. GitHub writes cannot be atomic with issue edits;
+later intake and scans repair races. A reviewed label never proves freshness for execution.
+
+A separate bounded stored-review pass also checks closed, skipped, deleted, and incompletely readable
+issues. Confirmed closure or skip stops pending work, removes all four active triage labels, and
+marks an existing summary inactive. Deleted/unavailable or incomplete evidence invalidates the
+stored review with a safe reason; failed reads/writes are not reported as successful cleanup.
+Excluded or incompletely read issues do not start inference. Recovery does not require their return
+in open-issue discovery. Evidence-read diagnostics are separate from the model-attempt failure.
+A temporary read failure preserves the consumed attempts and retry deadline. Complete evidence
+clears that diagnostic, but does not reopen a permanent or exhausted failure.
+
+After a same-owner repository rename, the operator must update the configured name. A stored
+review can retain its old name during intake invalidation. Only a successful live GitHub read
+with unchanged repository ID, installation ID, owner, issue ID, and issue number can rebind that
+name. Rebinding uses revision CAS, invalidates old proposal/job authority in the same transaction,
+and requires a fresh policy-bound assessment. Old approval and job references remain immutable.
+Owner transfers and cross-repository moves are not supported.
+
+### Attempts and publication recovery
+
+Review states are `pending`, `running`, `assessed` (validated but unpublished), `complete`, `stale`,
+and `failed`. The store persists the binding, cycle revision, attempt count, retry deadline, safe
+failure code, validated result, comment identity, and publication intent/confirmation. It keeps one
+bounded current record per issue, not raw prompts, model streams, credentials, or extra snapshots.
+The immutable review/result representation must fit 60 KiB, reserving 4 KiB of the 64 KiB
+whole-record limit for mutable lifecycle metadata. This measurement is identical before and
+after publication or invalidation. Escaped comments must also fit their publication limit. Restored near-limit assessments
+fail safely or are compacted during invalidation, without blocking durable revocation.
+Legacy `assessments` hashes are attempt history, not completed reviews. Delivery acceptance,
+proposal revocation, and review invalidation commit in one transaction before active work is aborted.
+
+Each cycle permits at most three model attempts. Host-observed HTTP 408/429/5xx, allowlisted
+transport failures, and request deadlines can use one-minute then five-minute delays. The gateway
+passes only safe transient classification to the triage controller; generic Pi errors, authentication
+rejections, invalid output, local limits, and unavailable isolation do not grant retries.
+Request intake has a 30-second bound. After intake, an absolute 60-second provider deadline closes
+the worker response and records trusted timeout evidence, even if streaming heartbeats continue.
+Cancellation, gateway expiry, and revocation do not grant a timeout retry.
+An interrupted attempt consumes the persisted budget. Duplicate delivery, restart, and manual
+label changes cannot reset attempts. A failed cycle stays suppressed until evidence or policy
+changes. Successful non-fix results do not expire daily. A successful `fix_candidate` can start a
+new cycle after 24 hours; this is a new assessment and proposal requiring fresh approval, not a
+retry or a timestamp extension. There is no lifetime three-cycle limit on successful renewal.
+Revoking a candidate proposal or closing/reopening it also requires a fresh assessment before a
+replacement proposal. A host review-cycle UUID binds the replacement hash even in the same second;
+legacy callers without this value keep their original hash and stored proposal format.
+Existing single-slot execution, cancellation, worker limits, and GitHub cooldowns still apply.
+
+Publication retries use the saved assessment, not another model call. The publisher checks
+repository, issue, installation, bot authorship, stable issue marker, and stored comment ID before
+updates. Only the configured bot's ID and Bot type establish summary ownership; copied markers
+in other users' comments cannot claim ownership or block reconciliation. Unknown create responses
+must be reconciled before another create. Conflicting bot-owned markers fail closed. A confirmed summary conflict revokes stored completion
+and removes `bot:triaged` through scoped, CAS-guarded cleanup. Other labels and the saved assessment
+remain intact during that cleanup. A cleanup rate limit leaves completion revoked and defers more
+requests. An uncertain read alone does not authorize cleanup. A missing stored comment requires
+confirmed absence before recreation. Explicit
+rate-limit rejection uses the existing bounded, one-use retry authorization. Unrelated labels are
+preserved; Reina never replaces the whole label set or changes maintainer-owned type/priority labels.
+
+`bot:triaged` is added only after summary and mutually exclusive outcome labels are confirmed.
+A fix-candidate summary can complete while separate proposal publication remains pending;
+`fix_available` requires that proposal's confirmation. Failure projection uses `bot:triage-failed`
+and no current reviewed claim. If GitHub is unavailable, projection remains pending rather than
+becoming successful completion. Manual label edits repair the projection, not approval authority
+or model budgets. Never clear publication intents or attempts to force recovery.
+
 ## Approval and state
 
 The proposal hash binds repository/installation/issue IDs, material issue content, base name/SHA,
@@ -315,25 +449,32 @@ Observed close/reopen history also revokes proposals created before that lifecyc
 when those webhooks are missing. Accepted revocation and inbox state commit in one transaction,
 so a crash cannot restore authority before publication recovery.
 
-SQLite stores proposals, consumed approval events, inbox deliveries, jobs, and publication phases.
+SQLite stores reviews, proposals, consumed approval events, inbox deliveries, jobs, and publication phases.
 It uses foreign keys, WAL, full synchronous durability, and an independent process-lifetime
 SQLite lock. The OS releases that lock after a crash. The directory is service-owned and private.
 Ephemeral storage, network filesystems, and multiple service instances are unsupported.
-Schema version 4 stores global cooldowns separately from local delivery deadlines. The transactional
-upgrade preserves existing cooldowns from schema versions 1, 2, and 3. Stop the service and take a
-consistent backup before an upgrade.
+Job database `reina.sqlite` schema 5 adds current reviews and a separate review cursor through a
+transactional 4-to-5 migration. Supported older upgrades retain schema-4 cooldown separation.
+Existing proposals, approvals, jobs, deliveries, and legacy assessment hashes remain intact; no
+review completion is fabricated. Migration failure rolls back. This is separate from encrypted
+`settings.sqlite` schema 3; triage does not migrate settings. Stop the service and take a consistent
+backup before an upgrade.
 
 Normal job states are approved, working, validating, publishing, and pr_ready. Failed and
 cancelled jobs cannot resume coding. The public labels are projections of state:
 
-| Label           | Meaning                                                                 |
-| --------------- | ----------------------------------------------------------------------- |
-| `fix_available` | A current feasible proposal exists                                      |
-| `bot:approved`  | A human added an approval transition; the record still needs validation |
-| `bot:working`   | Coding, validation, or publication is in progress                       |
-| `bot:pr_ready`  | A confirmed draft PR exists                                             |
-| `bot:failed`    | An attempt failed or publication needs recovery                         |
-| `bot:skip`      | Maintainer-controlled exclusion; Reina never removes it                 |
+| Label               | Meaning                                                                                    |
+| ------------------- | ------------------------------------------------------------------------------------------ |
+| `bot:triaged`       | A validated assessment was published for the stored reviewed version, not merely attempted |
+| `bot:needs-info`    | Successful triage needs more evidence; mutually exclusive with `bot:needs-human`           |
+| `bot:needs-human`   | Successful triage requires a maintainer decision; not a coding failure                     |
+| `bot:triage-failed` | Assessment failed without a valid current result; not `bot:triaged`                        |
+| `fix_available`     | A concrete fix proposal has been confirmed                                                 |
+| `bot:approved`      | A human added an approval transition; the record still needs validation                    |
+| `bot:working`       | Coding, validation, or publication is in progress                                          |
+| `bot:pr_ready`      | A confirmed draft PR exists                                                                |
+| `bot:failed`        | An attempt failed or publication needs recovery                                            |
+| `bot:skip`          | Maintainer-controlled exclusion; Reina never removes it                                    |
 
 Live GitHub checks occur immediately before execution and publication. Received revocations,
 material edits, closure, and access loss cancel pending work and interrupt running containers.
@@ -384,18 +525,21 @@ changed, do not resume remote writes. Existing remote effects require operator r
    - There is no built-in key rotation. Do not blindly regenerate the key; replacing the environment
      value does not re-encrypt existing state. See [credential recovery](admin-webui.md#secret-storage-and-recovery).
 3. Version and restore the application, compatible databases, and original encryption key together.
-   A downgrade after settings schema 3 requires the matching pre-upgrade backup; do not delete
-   OAuth rows or columns by hand. Restored backups can restore old provider credentials and
-   sessions. Revoke affected sessions and review provider authorization before enabling dispatch.
+   A downgrade after job schema 5 or settings schema 3 requires matching pre-upgrade backups;
+   never lower schema versions or delete review, approval, job, or OAuth records by hand.
+   Restored backups can restore old provider credentials and sessions. Revoke affected sessions
+   and review provider authorization before enabling dispatch.
    Do not clear approvals, inbox IDs, or publication intents to make a retry succeed.
 4. If state is lost or corrupt, keep dispatch stopped. Restore a backup and reconcile GitHub
-   branches/PRs before enabling work. Labels cannot reconstruct authorization.
+   branches/PRs and triage comments/labels before enabling work. Restoring SQLite does not undo
+   GitHub writes or guarantee that restored review projections are current. Preserve maintainer
+   labels and immutable proposal evidence. Labels cannot reconstruct authorization.
 5. For an interrupted coding attempt, inspect its failure and have a maintainer remove/re-add
    approval only if the proposal is still current. Otherwise wait for a new proposal.
 6. For unknown publication, inspect the stored intent and matching GitHub resources. Do not
    delete a branch/PR or reset an intent without explicit maintainer authorization.
 7. On rollback, stop scans/dispatch, cancel workers, preserve resource IDs, and restore a compatible
-   application. Older binaries cannot open schema version 4 or read the optional retry deadlines.
+   application. Older binaries cannot open job schema 5 or interpret its review recovery state.
    Restore a matching state backup before using an older version. Do not automatically close
    existing PRs or delete branches.
 
@@ -403,7 +547,14 @@ Logs include event, repository ID/name, issue, installation, job/proposal, and c
 They use reason codes instead of raw API/model errors. Do not enable raw Probot debug payload
 logging or post private test output to GitHub.
 
-Job and delivery failures (`failed`, `execution_failed`, and `recovery_failed`) use `error` level.
+Triage logs use `triage_started`, `triage_decision`, `triage_completed`, `triage_stale`, and
+`triage_failed` with safe correlation/revision, attempt/outcome, or reason metadata as applicable.
+Correlate issue/repository identity with delivery logs; assessed and completed publication are
+different phases. Do not log issue bodies, missing-information questions, prompts, model text,
+or credentials.
+
+Job and delivery failures (`failed`, `execution_failed`, `recovery_failed`, and `triage_failed`)
+use `error` level.
 Normal lifecycle, deferral, and cancellation events use `info` level. A cancelled delivery emits
 `cancelled`, including an interrupted triage assessment. An interrupted or revoked execution emits
 `execution_cancelled`. The original execution failure is logged before label updates, so a failed
@@ -465,7 +616,7 @@ application type checking. Recheck this workaround when upgrading Probot or Node
 
 ### External acceptance owners
 
-1. **App owner:** register and install the App, create all six label definitions, and confirm
+1. **App owner:** register and install the App, create all ten label definitions, and confirm
    minimum permissions, subscribed events, installation authentication, and signed delivery.
    Supply App credentials securely; upload the PEM through the authenticated UI.
 2. **Pocket ID account owner and realm operator:** configure the confidential client, exact
@@ -488,10 +639,16 @@ application type checking. Recheck this workaround when upgrading Probot or Node
    failures also occur at the unmodified baseline boundary and remain a release restriction, not
    runtime acceptance. Missing controls keep execution stopped.
 5. **Repository maintainer:** confirm bot-triggered CI uses disposable runners without secrets,
-   write tokens, privileged containers, or deployment access. Authorize a fresh test-repository
-   issue, review its proposal, add a new human approval, and inspect the resulting draft PR.
-   Check denied approval, revocation, failure, and restart recovery. Expect no duplicate job/PR,
-   no merge, and no auto-merge. The MVP is not live-accepted until these external checks pass.
+   write tokens, privileged containers, or deployment access. Follow the
+   [issue-triage acceptance handoff](admin-webui.md#issue-triage-acceptance-handoff): authorize
+   disposable issues, inspect summary quality and label ordering, edit evidence, and check recovery.
+   Review a separate proposal, add fresh human approval, and inspect the resulting draft PR.
+   Check denied approval, revocation, failure, and restart recovery. Expect no duplicate summary,
+   job, or PR, no merge, and no auto-merge. The MVP is not live-accepted until these checks pass.
+
+Retain each owner's authorized prerequisites, actions, observed results, and unverified paths.
+Required local checks and production Linux runtime acceptance must pass before release, or receive
+an explicit authorized exception. Preflight success alone does not close the full runtime gate.
 
 No live App registration, paid inference, deployment, package publication, version tags, or release
 workflow dispatch is part of credential-free implementation validation.

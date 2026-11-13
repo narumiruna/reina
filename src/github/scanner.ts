@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto"
 import type { ProbotOctokit } from "probot"
 import type { Issue, LabelEvent, Repository, Snapshot, SourceFile } from "../types.js"
+import { isOwnedTriageSummary } from "./triage-summary.js"
 
 export type GitHubClient = ProbotOctokit
 
@@ -310,7 +311,8 @@ export class GitHub {
     return data
   }
 
-  private async readComments(number: number) {
+  private async readComments(number: number, issueId: number, expectedCount: number) {
+    if (expectedCount > 101) throw new GitHubIssueDeferred("github_comments_limit")
     const comments = await boundedList(
       (page) =>
         this.client.rest.issues.listComments({
@@ -319,10 +321,10 @@ export class GitHub {
           per_page: pageSize,
           page,
         }),
-      100,
+      101,
       (comment) => Buffer.byteLength(comment.body ?? ""),
-      contextBytes,
-      1,
+      contextBytes + 64 * 1024,
+      2,
     ).catch((error: unknown) => {
       if (
         error instanceof GitHubDeferred &&
@@ -338,13 +340,43 @@ export class GitHub {
       if (ids.has(id)) throw new GitHubError("github_duplicate_comment")
       ids.add(id)
     }
-    return comments
+    if (comments.length !== expectedCount)
+      throw new GitHubIssueDeferred("github_issue_changed_during_read", Date.now() + 15 * 60_000)
+    // Any second bot-owned triage marker makes the allowance ambiguous. Foreign
+    // markers remain ordinary evidence and cannot cancel a legitimate allowance.
+    const candidates = comments.filter(
+      (comment) =>
+        comment.user?.id === this.botId &&
+        comment.user.type === "Bot" &&
+        comment.body?.includes("<!-- reina:triage:"),
+    )
+    const summary =
+      candidates.length === 1 &&
+      isOwnedTriageSummary(candidates[0], { id: this.repository.id, issueId }, this.botId)
+        ? candidates[0]
+        : undefined
+    const ordinary = comments.filter((comment) => comment !== summary)
+    if (ordinary.length > 100) throw new GitHubIssueDeferred("github_comments_limit")
+    const ordinaryBytes = ordinary.reduce(
+      (sum, comment) => sum + Buffer.byteLength(comment.body ?? ""),
+      0,
+    )
+    if (ordinaryBytes > contextBytes) throw new GitHubIssueDeferred("github_read_limit")
+    return { comments, ordinaryBytes }
   }
 
   async comments(number: number) {
     numericId(number)
     await this.check()
-    return this.readComments(number)
+    const { data } = await githubRead(() =>
+      this.client.rest.issues.get({
+        ...this.coordinates,
+        issue_number: number,
+      }),
+    )
+    if (data.number !== number) throw new GitHubError("github_issue_mismatch")
+    const { comments } = await this.readComments(number, numericId(data.id), data.comments)
+    return comments
   }
 
   async issue(number: number): Promise<Issue> {
@@ -357,20 +389,16 @@ export class GitHub {
       }),
     )
     if (data.number !== number) throw new GitHubError("github_issue_mismatch")
-    if (data.comments > 100) throw new GitHubIssueDeferred("github_comments_limit")
-    const comments = await this.readComments(number)
-    if (comments.length !== data.comments)
-      throw new GitHubIssueDeferred("github_issue_changed_during_read", Date.now() + 15 * 60_000)
+    const issueId = numericId(data.id)
+    const { comments, ordinaryBytes } = await this.readComments(number, issueId, data.comments)
     if (
-      Buffer.byteLength(data.title) +
-        Buffer.byteLength(data.body ?? "") +
-        comments.reduce((sum, comment) => sum + Buffer.byteLength(comment.body ?? ""), 0) >
+      Buffer.byteLength(data.title) + Buffer.byteLength(data.body ?? "") + ordinaryBytes >
       contextBytes
     ) {
       throw new GitHubIssueDeferred("github_context_limit")
     }
     return {
-      ref: { ...this.repository, number, issueId: numericId(data.id) },
+      ref: { ...this.repository, number, issueId },
       title: data.title,
       body: data.body ?? "",
       comments: comments

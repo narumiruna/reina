@@ -1,19 +1,32 @@
 import assert from "node:assert/strict"
 import { randomUUID } from "node:crypto"
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
 import { fileURLToPath } from "node:url"
 import { dockerCommand } from "../../dist/agent/sandbox.js"
-import { lock, manifest } from "./fixture.mjs"
+import { fixtureTag, lock, manifest } from "./fixture.mjs"
 
 const root = fileURLToPath(new URL("../../", import.meta.url))
 
 test("Compose prepares a worker, shares runtime binds, and preserves private state", {
   timeout: 290000,
 }, async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "reina-compose-test-"))
+  const directory = await realpath(await mkdtemp(path.join(os.tmpdir(), "reina-compose-test-")))
+  // A daemon-owned directory stays root-owned even when the test runner is not.
+  // A short volume name also keeps Unix socket paths below the Linux limit.
+  const stagingVolume = `rc-${randomUUID().slice(0, 12)}`
+  let staging
+  let stagingCreated = false
+  let overrideWritten = false
+  const volume = async (argv) => {
+    const result = await dockerCommand(["volume", ...argv], { timeoutMs: 30_000, limit: 64 * 1024 })
+    assert.equal(result.exitCode, 0, `Owned fixture volume ${argv[0]} failed`)
+    return result.stdout.toString().trim()
+  }
+  const controllerTag = fixtureTag("controller")
+  const workerTag = fixtureTag("compose-worker")
   const state = `/var/lib/reina/test-${randomUUID()}`
   const args = [
     "compose",
@@ -26,7 +39,7 @@ test("Compose prepares a worker, shares runtime binds, and preserves private sta
     "--file",
     path.join(root, "compose.yaml"),
     "--file",
-    path.join(directory, "override.json"),
+    path.join(directory, "override.yaml"),
   ]
   const compose = async (argv) => {
     let diagnostics = ""
@@ -42,32 +55,48 @@ test("Compose prepares a worker, shares runtime binds, and preserves private sta
     return result.stdout.toString()
   }
   try {
+    await volume(["create", "--driver=local", "--label=io.reina.fixture=true", stagingVolume])
+    stagingCreated = true
+    staging = await volume(["inspect", "--format", "{{.Mountpoint}}", stagingVolume])
+    assert.ok(path.isAbsolute(staging) && path.normalize(staging) === staging && staging !== "/")
     await mkdir(path.join(directory, "snapshot"))
     await writeFile(path.join(directory, "snapshot/package.json"), manifest)
     await writeFile(path.join(directory, "snapshot/package-lock.json"), lock)
     const environment = "TARGET_DIR=./snapshot\nWEBHOOK_SECRET='fixture-$not_expanded#secret'\n"
     await writeFile(path.join(directory, ".env"), environment, { mode: 0o600 })
-    const image = { image: "reina-controller-fixture:local", build: { context: root } }
+    const volumes = [
+      { type: "volume", source: "reina-state", target: "/var/lib/reina" },
+      { type: "bind", source: staging, target: staging, bind: { create_host_path: false } },
+      {
+        type: "bind",
+        source: "/var/run/docker.sock",
+        target: "/var/run/docker.sock",
+        bind: { create_host_path: false },
+      },
+      {
+        type: "bind",
+        source: path.join(root, "tests/runtime"),
+        target: "/fixtures",
+        read_only: true,
+        bind: { create_host_path: false },
+      },
+    ]
     await writeFile(
-      path.join(directory, "override.json"),
-      JSON.stringify({
-        services: {
-          reina: {
-            ...image,
-            restart: "no",
-            volumes: [
-              {
-                type: "bind",
-                source: path.join(root, "tests/runtime"),
-                target: "/fixtures",
-                read_only: true,
-              },
-            ],
-          },
-          "prepare-worker": image,
-        },
-      }),
+      path.join(directory, "override.yaml"),
+      `services:
+  reina:
+    image: ${controllerTag}
+    build: ${JSON.stringify({ context: root })}
+    restart: "no"
+    environment:
+      TMPDIR: ${JSON.stringify(staging)}
+    volumes: !override ${JSON.stringify(volumes)}
+  prepare-worker:
+    image: ${controllerTag}
+    build: ${JSON.stringify({ context: root })}
+`,
     )
+    overrideWritten = true
 
     assert.equal((await compose(["config", "--services"])).trim(), "reina")
     const config = JSON.parse(await compose(["--profile", "setup", "config", "--format", "json"]))
@@ -76,9 +105,19 @@ test("Compose prepares a worker, shares runtime binds, and preserves private sta
     assert.equal(service.ports, undefined)
     assert.equal(service.environment.REINA_STATE_DIR, "/var/lib/reina")
     assert.equal(service.environment.DOCKER_HOST, "unix:///var/run/docker.sock")
-    const staging = service.volumes.find((mount) => mount.target === service.environment.TMPDIR)
-    assert.equal(staging.type, "bind")
-    assert.equal(staging.source, staging.target)
+    const stagingMount = service.volumes.find(
+      (mount) => mount.target === service.environment.TMPDIR,
+    )
+    assert.equal(stagingMount.type, "bind")
+    assert.equal(stagingMount.source, staging)
+    assert.equal(stagingMount.source, stagingMount.target)
+    assert.deepEqual(
+      service.volumes.map((mount) => mount.target).sort(),
+      [staging, "/var/lib/reina", "/var/run/docker.sock", "/fixtures"].sort(),
+    )
+    assert.ok(service.volumes.some((mount) => mount.target === "/fixtures" && mount.read_only))
+    assert.deepEqual(service.cap_drop, ["ALL"])
+    assert.ok(service.security_opt.includes("no-new-privileges:true"))
     assert.ok(
       service.volumes.some((mount) => mount.type === "volume" && mount.target === "/var/lib/reina"),
     )
@@ -99,7 +138,7 @@ test("Compose prepares a worker, shares runtime binds, and preserves private sta
       "--rm",
       "-T",
       "prepare-worker",
-      command.replace("reina-worker:local", "reina-compose-worker-fixture:local"),
+      command.replace("reina-worker:local", workerTag),
     ]
     await writeFile(path.join(directory, ".env"), "TARGET_DIR=./missing-snapshot\n")
     const missingSnapshot = await dockerCommand([...args, ...prepare], { timeoutMs: 60000 })
@@ -139,6 +178,7 @@ test("Compose prepares a worker, shares runtime binds, and preserves private sta
       assert.equal(process.env.WEBHOOK_SECRET, 'fixture-$not_expanded#secret');
       for (const directory of [process.env.REINA_STATE_DIR, process.env.TMPDIR]) {
         assert.equal(statSync(directory).mode & 0o777, 0o700);
+        assert.equal(statSync(directory).uid, 0);
       }
       for (const file of ['.env', '.git', 'src', 'node_modules/typescript']) {
         assert.equal(existsSync('/app/' + file), false);
@@ -157,7 +197,7 @@ test("Compose prepares a worker, shares runtime binds, and preserves private sta
       try {
         await runtime.preflight();
         const decision = JSON.parse(await runtime.triage(baseline, 'CASE:TRIAGE', new AbortController().signal));
-        assert.equal(decision.eligible, true);
+        assert.equal(decision.fix.eligible, true);
         assert.equal(model.calls.length, 2);
         const reply = model.calls[1].messages.find(message => message.role === 'tool');
         assert.ok(JSON.stringify(reply).includes('before'), JSON.stringify(reply));
@@ -177,9 +217,13 @@ test("Compose prepares a worker, shares runtime binds, and preserves private sta
   } finally {
     try {
       // Only this randomly named, credential-free test project owns these volumes.
-      await compose(["down", "--volumes", "--remove-orphans"])
+      if (overrideWritten) await compose(["down", "--volumes", "--remove-orphans"])
     } finally {
-      await rm(directory, { recursive: true, force: true })
+      try {
+        if (stagingCreated) await volume(["rm", stagingVolume])
+      } finally {
+        await rm(directory, { recursive: true, force: true })
+      }
     }
   }
 })

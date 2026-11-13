@@ -104,6 +104,27 @@ not the separate job database schema. A binary downgrade requires the matching p
 backup, not manual removal of OAuth rows or columns. A restored backup can restore old sessions
 and credentials: revoke affected sessions and review provider authorization before dispatch.
 
+## Upgrade to durable issue triage
+
+Job database `reina.sqlite` migrates transactionally from schema 4 to 5, adding bounded current
+review records and an independent reconciliation cursor. Existing proposals, approvals, jobs,
+deliveries, and legacy attempt hashes remain intact; attempt hashes do not become completed
+reviews. This is not encrypted `settings.sqlite`, which remains at schema 3. No new UI, settings,
+environment variable, or automatic label provisioning is added.
+
+Before upgrade, stop the single instance and back up both databases consistently, including WAL
+state, with the original `ENCRYPTION_KEY` retained separately. Test migration and restoration on
+disposable fixture copies first. A downgrade needs the matching pre-upgrade application and
+backups; never lower schema versions or delete approval/job/review records. A restore can restore
+old sessions, credentials, and publication intents but does not undo GitHub comments, labels,
+branches, or PRs. Review both restored authority and remote state before enabling dispatch.
+
+Have the App owner create `bot:triaged`, `bot:needs-info`, `bot:needs-human`, and `bot:triage-failed`
+in addition to the existing six definitions. See [label meanings](architecture.md#approval-and-state).
+Missing definitions can leave publication pending. Do not remove maintainer labels or edit immutable
+proposal comments to repair triage. Follow [triage recovery](architecture.md#attempts-and-publication-recovery)
+rather than clearing saved results, attempts, or publication intents.
+
 ## Onboarding
 
 Obtain authorization for paid provider use and test-repository changes before completing dispatch
@@ -270,10 +291,11 @@ continuation data. No ambient environment, command, filesystem, or host Pi auth 
    main database file. Preserve job, approval, inbox, and publication records with settings.
 3. Securely back up the original encryption key separately from the state backup. Restrict access
    to both. Losing that key makes the encrypted App key and provider credentials undecryptable.
-4. Restore compatible application state and the original key together. A schema-3 binary downgrade
-   requires the matching pre-upgrade backup. Review restored credentials and revoke affected
-   sessions; a backup can restore old authorization. Reconcile GitHub resources before enabling
-   dispatch. Do not delete state to hide an encryption-key mismatch.
+4. Restore compatible application state and the original key together. A downgrade after job
+   schema 5 or settings schema 3 requires matching pre-upgrade backups. Review restored credentials
+   and revoke affected sessions; a backup can restore old authorization. Reconcile GitHub resources,
+   including triage comments and labels, before enabling dispatch. A database restore does not undo
+   remote writes. Do not delete state to hide an encryption-key mismatch.
 5. There is no built-in encryption-key rotation. Do not blindly regenerate `ENCRYPTION_KEY` during
    setup, upgrade, or recovery. Plan any replacement as a controlled credential reconfiguration,
    with backups and dispatch stopped; changing the value alone does not re-encrypt data.
@@ -289,11 +311,12 @@ for an allowed group member, denied sign-in without a matching group, metadata-o
 responses, and local logout. Confirm that incomplete configuration returns HTTP 503 for webhooks;
 do not submit real unsigned webhook bodies.
 
-The complete runtime suite has not passed on this macOS/OrbStack development runner. The native
-run stopped at `runtime_socket_unavailable`; Linux-container runs through OrbStack also had
-preflight failures. An unmodified baseline reproduced failures in the same preflight boundary.
-Do not bypass these checks or treat a successful image build, Compose check, or browser test as
-runtime acceptance. The full suite must pass on the supported Linux deployment host.
+The native macOS controller path through OrbStack remains unverified: its baseline stopped at
+`runtime_socket_unavailable`. Earlier Linux-container attempts also failed preflight. The issue-triage
+verification below subsequently passed the full suite with a Linux controller, private same-path
+Linux staging, and the unchanged isolation requirements. This is evidence for that tested topology,
+not native macOS or production acceptance. Do not substitute an image build, Compose config, or
+browser check for the complete runtime gate on the actual Linux deployment host.
 
 ### Previous local verification on 2026-11-13
 
@@ -314,9 +337,9 @@ policy change was performed.
 
 ### Terminology review handoff
 
-The current work changes copy, a reused SDK type, and additive read-only presentation metadata
-only. Review the [retained glossary](architecture.md#terminology) and the local HTTPS fixture
-before/after captures for provider setup, authentication methods, model selection, and mobile
+The terminology change described here changed copy, a reused SDK type, and additive read-only
+presentation metadata only. Review the [retained glossary](architecture.md#terminology) and the
+local HTTPS fixture before/after captures for provider setup, authentication methods, model selection, and mobile
 layout. No live provider calls, paid requests, deployment, or state migration are needed for this
 wording review. Local checks can verify labels and metadata isolation, not subjective wording
 acceptance; the maintainer must confirm that configured, selected, and running states and both
@@ -361,10 +384,104 @@ The following work requires external owners and is not established by credential
    Docker, cgroup v2, seccomp, quotas, mounts, cleanup, and the upgraded login/refresh path. Keep
    the existing Host-preserving proxy. OrbStack remains unverified; its baseline failures do not
    waive the production Linux release gate.
-4. **Repository maintainer:** authorize a fresh test-repository issue, inspect its proposal, add a
-   new human approval, and verify one useful draft PR with no auto-merge. Also check denied
-   approval, revocation, failure, and restart recovery. Bot-triggered CI must use disposable
-   runners with no secrets, write tokens, privileged containers, or deployment access.
+4. **Repository maintainer:** complete the issue-triage handoff below, inspect the separate fix
+   proposal, add a new human approval, and verify one useful draft PR with no auto-merge. Also
+   check denied approval, revocation, failure, and restart recovery. Bot-triggered CI must use
+   disposable runners with no secrets, write tokens, privileged containers, or deployment access.
+
+### Issue-triage local verification on 2026-11-13
+
+- `npm run ci`: 1,087 tests across 25 files, Biome, and the TypeScript build passed.
+  Changeset validation, strict changed-test type checks, and whitespace checks passed.
+- `npm run test:runtime`: 14 passed, zero failed, zero skipped. The full suite used actual Pi
+  1.5.0, Docker, a local fake provider, and disposable SQLite/Compose resources. It checked
+  read-only triage, network denial, quotas, seccomp/cgroups, frozen export, cleanup, credential
+  isolation, and host classification of provider 503 versus permanent 401 failures.
+- Runtime execution used an ordinary Linux controller with dropped capabilities and
+  `no-new-privileges`, an owned Linux volume mounted at the same daemon-visible path, and
+  private HOME/Docker config. Node 26.11.1, Docker CLI 29.7.2, Compose 5.5.0, and the OrbStack
+  Docker 29.8.2 Linux daemon were tested. No production state or staging was mounted.
+- The old nonempty unauthorized readiness request could race a gateway 401 and produce EPIPE.
+  The empty-body request passed 20 diagnostic preflights without model calls; the full runtime
+  suite still requires 401 and all original sandbox controls. Fixture image tags and staging
+  are unique; detached-child fixture file modes are explicit. No check was skipped or weakened.
+- The prepared worker-base image ID remained unchanged before and after the run. Test-source
+  snapshot SHA-256: `94a11bc2dcd909dc11d6c6295f363f470f1bac340812bd24fa34191fb674c566`.
+  Local runtime evidence: `/tmp/reina-runtime-audit-JF2GDa/release-review-runtime.log`.
+- Regression fixtures cover strict assessment bounds, UTF-8/escaped-body limits, reserved lifecycle
+  metadata, atomic intake/revocation and rollback, restored near-limit records, foreign marker text,
+  schema upgrades/rollback, revision CAS, bounded retry/restart, own-comment loops, publication
+  response loss, missed closure/skip events, and same-second replacement after revocation.
+  Labels never grant approval; mutable summaries never replace immutable proposal evidence.
+
+The first GitHub runtime run passed 13 cases but failed the Compose case: the non-root runner's
+`0700` host staging directory was not readable by a root controller with all capabilities dropped.
+The fixture now uses its own daemon-owned staging volume and asserts root ownership and `0700`
+mode. It removes only that volume; no permission or capability check was relaxed. See the PR's
+CI checks for verification of the updated fixture.
+
+These checks used dummy identities and local provider responses. They do not establish live
+GitHub permissions/delivery ordering, real provider compatibility or cost, semantic triage quality,
+production backup restoration, or production-host runtime acceptance. Complete the handoff below.
+
+### Issue-triage acceptance handoff
+
+This is an owner-operated acceptance procedure, not permission for live writes or paid inference.
+Current issue-triage test evidence must be recorded separately from the historical counts above.
+
+1. **App owner and repository maintainer**
+   - Prerequisites: authorize disposable issues and bounded provider use; confirm minimum App
+     permissions/events, all ten label definitions, and safe target CI.
+   - Actions: submit a clear small fix, missing reproduction details, and a product decision.
+   - Expected: one mutable summary per issue with kind and host outcome. Needs-info gets
+     `bot:needs-info`; a human decision gets `bot:needs-human`. `bot:triaged` follows confirmed
+     summary/outcome publication. `fix_available` follows a separate immutable proposal.
+     No coding starts without fresh approval of that exact proposal. Then approve and inspect
+     one draft PR. Evidence/base/policy changes and 24-hour candidate renewal need new approval.
+2. **Repository maintainer and operator**
+   - Prerequisites: authorize disposable edit, failure, and restart scenarios; retain saved state.
+   - Actions: edit the issue; add/edit/delete a human comment; close or add `bot:skip`; check
+     missed-event scans, incomplete/deleted evidence, publication interruption, and restart.
+   - Expected: stale-state removal, one updated summary, and no own-comment/label inference loop.
+     Closure/skip makes the summary inactive and removes all four triage labels without inference.
+     Unavailable/incomplete evidence invalidates the review without claimed successful writes.
+     Read recovery preserves the saved model error, attempt count, and retry deadline. A summary
+     conflict clears the reviewed claim without editing foreign comments. One trusted, scoped
+     triage summary does not consume the ordinary 100-comment/128-KiB evidence budget.
+     Publication recovery reuses the saved result. At most three attempts use allowed one-minute/
+     five-minute retries; invalid output/isolation failure stops the cycle. Exhausted failures
+     remain suppressed after restart or label removal, separate from successful 24-hour renewal.
+   - For a same-owner rename, update the configured repository name. Confirm that live numeric
+     identity checks permit recovery, the summary is reused, and any replacement proposal needs
+     fresh approval. Do not use this path for owner transfers or cross-repository moves.
+3. **Provider account owner**
+   - Prerequisites: supported entitled account, explicit usage/cost authorization, and acceptance
+     of the Codex cap limitation where applicable.
+   - Actions: authorize bounded live assessment, including needs-info results; inspect semantic
+     quality, tool continuation, output behavior, and billing.
+   - Expected: retain actual provider results. Saved credentials and fixtures do not verify
+     remote compatibility, entitlement, semantic quality, or cost.
+4. **Deployment operator**
+   - Prerequisites: stopped-instance backups with WAL state and the original key, disposable
+     migration/restore copies, and supported Linux with private same-path staging.
+   - Actions: check job schema 4-to-5 migration separately from settings schema 3; test restore,
+     permissions, quotas, cleanup, and the complete runtime suite. Reconcile restored GitHub state.
+   - Expected: compatible state and confirmed runtime controls before dispatch. Preflight alone
+     is insufficient; retain full-suite results and any unverified paths.
+
+Retain verifier, date/revision, authorization scope, prerequisites, actions, observed results, and
+unverified paths without private issue text or credentials. Fixtures do not establish live model
+quality, App permissions/delivery ordering, provider billing, or production isolation. Record a
+blocked path as unverified, not passed. Release requires the required local checks, full runtime
+evidence, and owner acceptance, or an explicit authorized exception. The passing Linux-controller
+fixture does not establish native macOS/OrbStack or production acceptance; do not weaken isolation
+to close an unverified path.
+
+For incident checks, distinguish `triage_started` from `triage_decision` (validated result) and
+`triage_completed` (confirmed publication). `triage_stale` invalidates a projection;
+`triage_failed` records a safe assessment failure. Use revision, issue identity, and delivery
+correlation metadata, not issue bodies, questions, raw model text, or secrets. `bot:triage-failed`
+is separate from execution `bot:failed`; label writes can remain pending during GitHub outages.
 
 No live acceptance is claimed. See [architecture and operations](architecture.md) for isolation
 limits and publication recovery.

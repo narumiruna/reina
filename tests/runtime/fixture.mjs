@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process"
+import { randomUUID } from "node:crypto"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -47,16 +48,16 @@ export const baseline = {
   },
 }
 
-export async function prepareFixture() {
+export const fixtureTag = (name) => `reina-${name}-fixture:${randomUUID()}`
+
+export async function prepareFixture(tag) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "reina-approved-fixture-"))
   try {
     await writeFile(path.join(directory, "package.json"), manifest)
     await writeFile(path.join(directory, "package-lock.json"), lock)
-    const child = spawn(
-      process.execPath,
-      ["scripts/prepare-worker.mjs", directory, "reina-runtime-fixture:local"],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    )
+    const child = spawn(process.execPath, ["scripts/prepare-worker.mjs", directory, tag], {
+      stdio: ["ignore", "pipe", "pipe"],
+    })
     let output = ""
     let error = ""
     child.stdout.on("data", (chunk) => {

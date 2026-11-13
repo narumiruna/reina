@@ -186,6 +186,7 @@ export function makeProposal(
   config: Config,
   botId: number,
   now = Date.now(),
+  assessmentRevision?: string,
 ): Proposal {
   if (
     issue.ref.id !== config.repository.id ||
@@ -212,7 +213,9 @@ export function makeProposal(
     !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(snapshot.sha) ||
     snapshot.branch.length === 0 ||
     snapshot.branch.length > 255 ||
-    /[\p{Cc}]/u.test(snapshot.branch)
+    /[\p{Cc}]/u.test(snapshot.branch) ||
+    (assessmentRevision !== undefined &&
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(assessmentRevision))
   ) {
     throw new Error("Invalid proposal baseline")
   }
@@ -252,5 +255,7 @@ export function makeProposal(
       mode: file.mode,
       hash: createHash("sha256").update(file.content).digest("hex"),
     }))
-  return { revision: hash({ ...proposal, dependencies }), ...proposal }
+  // The host review cycle prevents a fresh, same-second assessment from reviving
+  // an invalidated immutable proposal. Omission preserves legacy callers' hashes.
+  return { revision: hash({ ...proposal, dependencies, assessmentRevision }), ...proposal }
 }
