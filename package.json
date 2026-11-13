@@ -21,6 +21,7 @@
     "check:changesets": "changeset status",
     "ci": "npm run check && npm test && npm run build",
     "changeset": "changeset",
+    "version-packages": "changeset version && biome format --write CHANGELOG.md",
     "release": "npm run build && changeset publish",
     "prepare": "husky"
   },
