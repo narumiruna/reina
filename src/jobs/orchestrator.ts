@@ -499,7 +499,11 @@ export class Orchestrator {
         }
       }
       this.event(
-        current?.state === "cancelled" ? "execution_cancelled" : "execution_failed",
+        current?.state === "cancelled"
+          ? "execution_cancelled"
+          : error instanceof GitHubIssueDeferred
+            ? "execution_deferred"
+            : "execution_failed",
         job.ref,
         {
           jobId: job.id,

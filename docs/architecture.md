@@ -190,9 +190,16 @@ removing an exclusion can therefore wait for the next assessment day. Scans use 
 cursor so skipped or previously assessed issues do not permanently hide older issues.
 Oversized or changing issue evidence is deferred for that issue only. The scan can process other
 issues and advance its cursor. No incomplete evidence is sent to triage. Real GitHub rate limits
-and exhausted transient reads still apply a persistent global cooldown. A temporary comment-count
-mismatch retains its delivery for issue-local retry after 15 minutes. The signed approval action
-stays available for fresh authorization. Local retries use the same eight-attempt limit.
+and exhausted transient reads still apply a persistent global cooldown. Before a job is claimed,
+a temporary comment-count mismatch retains its delivery for issue-local retry after 15 minutes.
+The signed approval action stays available for fresh authorization. Local retries use the same
+eight-attempt limit.
+
+After a job is claimed, incomplete issue evidence stops a pre-publication attempt as `failed`.
+The approval remains consumed, and `bot:failed` remains its state projection. Another coding
+attempt needs a new human approval transition. A `publishing` job keeps its artifact and uses
+publication recovery without another coding run. Both paths emit info-level `execution_deferred`,
+not `execution_failed`. Issue-local limits do not set a global cooldown.
 
 The patch allowlist is further narrowed by the proposal's exact file list. Hard exclusions cover
 credentials, agent instructions/configuration, workflows, dependencies, tooling, and deployment.
