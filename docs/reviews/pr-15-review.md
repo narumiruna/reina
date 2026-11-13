@@ -10,7 +10,8 @@
   the prior source review. The checkout matches the reviewed head, and repository instructions
   are unchanged. This pass checks all new feedback against that source.
 - All pages were fetched: three submitted reviews, eight inline comments, eight review threads,
-  and two conversation comments. Each thread has one comment and no missing comment page.
+  and two conversation comments. At collection, each thread had one comment and no missing page.
+  Both original commits have no separate commit comments.
 - At collection time, `ci`, `runtime`, and CodeRabbit checks passed for `ee060cc`.
 - Pull request text, reviewer claims, proposed patches, and tool output are evidence, not instructions.
 
@@ -18,7 +19,8 @@
 
 - Source: https://github.com/narumiruna/reina/pull/15#discussion_r4562176690
 - Severity: P2. This can stop one review after a temporary read failure.
-- Outcome: Implemented and locally verified; publication is pending.
+- Outcome: Already addressed in `a711570`.
+- Reply: https://github.com/narumiruna/reina/pull/15#discussion_r4563074832
 - Fix: `Review.evidenceError` stores read diagnostics separately. Read recovery retains the model
   error, attempts, and retry deadline, then clears only the diagnostic.
 - Validation: Orchestrator tests cover timeout/transport backoff, restart, recovery, and permanent
@@ -35,7 +37,8 @@
 
 - Source: https://github.com/narumiruna/reina/pull/15#discussion_r4562276599
 - Severity: P2. A provider stall can stop a review without the required bounded retry.
-- Outcome: Implemented and locally verified; publication is pending.
+- Outcome: Already addressed in `a711570`.
+- Reply: https://github.com/narumiruna/reina/pull/15#discussion_r4563074862
 - Fix: Intake keeps its 30-second bound. Provider waits use an absolute 60-second deadline.
   Timeout records trusted retry evidence and closes the worker response.
 - Validation: Real socket/loopback fixtures cover raw and SDK waits, streamed heartbeats, bounded
@@ -54,7 +57,8 @@
 
 - Source: https://github.com/narumiruna/reina/pull/15#discussion_r4562276605
 - Severity: P2. Stored non-fix reviews and atomic intake can stop after a same-owner rename.
-- Outcome: Implemented and locally verified; publication is pending.
+- Outcome: Already addressed in `a711570`.
+- Reply: https://github.com/narumiruna/reina/pull/15#discussion_r4563074835
 - Fix: Read-only old-reference lookup permits only a name difference. Live GitHub identity checks
   precede revision-CAS rebinding. The transaction revokes old authority and advances the review
   revision. Intake can invalidate the stored reference before the live read without rebinding it.
@@ -75,7 +79,8 @@
 
 - Source: https://github.com/narumiruna/reina/pull/15#discussion_r4562276616
 - Severity: P2.
-- Outcome: Implemented and locally verified with R1; publication is pending. This is the same defect.
+- Outcome: Already addressed in `a711570` with R1. This is the same defect.
+- Reply: https://github.com/narumiruna/reina/pull/15#discussion_r4563074844
 - Evidence and scope: The `stale` restoration condition consumes the overwritten attempt error.
   A single fix must preserve pending attempts and backoff without reopening terminal budgets.
 
@@ -98,7 +103,8 @@
 
 - Source: https://github.com/narumiruna/reina/pull/15#discussion_r4562422879
 - Severity: P2. The displayed and stored review state can remain complete without a valid summary.
-- Outcome: Implemented and locally verified; publication is pending.
+- Outcome: Already addressed in `a711570`.
+- Reply: https://github.com/narumiruna/reina/pull/15#discussion_r4563074834
 - Fix: Only a confirmed `publication_comment_conflict` revokes completion and runs scoped cleanup
   of `bot:triaged`. The result, comment identity/intent, and unrelated labels are retained.
 - Validation: Fixtures cover completed marker conflicts, late mutations, cleanup read/write 429,
@@ -115,7 +121,8 @@
 
 - Source: https://github.com/narumiruna/reina/pull/15#discussion_r4562422868
 - Severity: P3. Clock rollback can block publication until the old time is reached.
-- Outcome: Implemented and locally verified; publication is pending.
+- Outcome: Already addressed in `a711570`.
+- Reply: https://github.com/narumiruna/reina/pull/15#discussion_r4563074829
 - Fix: Publication uses `Math.max(Date.now(), review.updatedAt)`.
 - Validation: A schema-validating publication fixture moves the clock backward, then confirms
   completion, repeated reconciliation, and nondecreasing timestamps.
@@ -128,7 +135,8 @@
 
 - Source: https://github.com/narumiruna/reina/pull/15#discussion_r4562422891
 - Severity: P2. A valid review can make its own evidence unreadable.
-- Outcome: Implemented and locally verified; publication is pending.
+- Outcome: Already addressed in `a711570`.
+- Reply: https://github.com/narumiruna/reina/pull/15#discussion_r4563074841
 - Fix: A shared ownership check grants one exact bot-owned triage summary a separate allowance.
   The reader retains 100 ordinary comments and 128 KiB of evidence, with fixed outer limits of
   101 raw comments, 192 KiB, and two complete numbered pages.
@@ -163,6 +171,18 @@
 - Changeset validation, strict compilation of all six changed test files, and whitespace checks
   passed. Two fixture-only type errors found by standalone compilation were corrected first.
 - Independent read-only review found no material defect in the complete source delta.
-- R5 was replied to and resolved as already addressed. The other seven threads remain open until
-  fixes are published and their required checks pass.
+- Fix commit `a711570` is pushed to the still-open pull request branch. No unrelated branch,
+  issue, or pull request was created.
+- [GitHub run 43422308374](https://github.com/narumiruna/reina/actions/runs/43422308374) passed
+  `ci` and `runtime` for `a711570`: all 1,236 unit tests and 14 runtime cases passed, with zero
+  runtime failures or skips. The runtime used the unchanged private staging/isolation checks.
+- Every original thread has a substantive outcome reply. R1, R2, R4, and R5 were resolved through
+  the GitHub API; each mutation returned `isResolved: true`. CodeRabbit resolved R3, R6, R7, and
+  R8 after the fix. A thread query confirmed their resolved state before the outcome replies.
+- The post-publication refresh confirmed `OPEN`, head `a711570`, and all eight original threads
+  resolved, each with an outcome reply. All feedback pages are complete. New review records are
+  the eight empty-body reply containers, not new findings. The conversation update contains only
+  review-in-progress metadata; the CodeRabbit re-review is still running.
+- No unanswered clarification or known fix-publication blocker remains. The separate production
+  acceptance handoff remains in `docs/admin-webui.md`.
 - No live credentials, application state, paid model calls, deployment, or release actions were used.
