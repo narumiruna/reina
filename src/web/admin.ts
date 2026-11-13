@@ -1,9 +1,11 @@
 import { readFile } from "node:fs/promises"
 import type { IncomingMessage, ServerResponse } from "node:http"
 import { z } from "zod"
+import { logHttpFailure } from "../http-logging.js"
 import { modelCatalog } from "../settings/catalog.js"
 import { modelSchema, providerSchema } from "../settings/schema.js"
 import type { SettingsStore } from "../settings/store.js"
+import type { Logger } from "../types.js"
 import type { Auth } from "./auth.js"
 import type { RuntimeStatus } from "./controller.js"
 import { ProviderSetup, ProviderSetupError } from "./provider-setup.js"
@@ -80,6 +82,7 @@ export class AdminWeb {
     private readonly origin: string,
     private readonly runtime: () => RuntimeStatus,
     private readonly changed: () => void,
+    private readonly log: Logger,
     setups?: ProviderSetup,
   ) {
     this.setups =
@@ -105,7 +108,7 @@ export class AdminWeb {
     this.setups.close()
   }
 
-  private error(res: ServerResponse, error: unknown): void {
+  private error(req: IncomingMessage, res: ServerResponse, error: unknown): void {
     if (error instanceof ProviderSetupError) json(res, error.status, { error: error.code })
     else if (error instanceof z.ZodError) {
       json(res, 400, {
@@ -115,7 +118,10 @@ export class AdminWeb {
     } else if (error instanceof HttpError) json(res, error.status, { error: error.code })
     else if (error instanceof Error && safeErrors.has(error.message))
       json(res, 400, { error: error.message })
-    else json(res, 500, { error: "settings_unavailable" })
+    else {
+      logHttpFailure(this.log, req, "settings_unavailable", 500)
+      json(res, 500, { error: "settings_unavailable" })
+    }
   }
 
   private async asset(res: ServerResponse, path: string, type: string): Promise<void> {
@@ -200,7 +206,7 @@ export class AdminWeb {
       try {
         json(res, 200, this.setups.get(session.csrfToken, setup[1]))
       } catch (error) {
-        this.error(res, error)
+        this.error(req, res, error)
       }
       return true
     }
@@ -252,7 +258,7 @@ export class AdminWeb {
       this.changed()
       json(res, 200, { ok: true, ...(id ? { id } : {}) })
     } catch (error) {
-      this.error(res, error)
+      this.error(req, res, error)
     }
     return true
   }

@@ -9,6 +9,29 @@ import type { Store } from "../jobs/store.js"
 import type { SettingsStore } from "../settings/store.js"
 import type { Logger } from "../types.js"
 
+const startupReasons = new Set([
+  "app_identity_missing",
+  "bot_identity_missing",
+  "installation_token_invalid",
+  "installation_scope_invalid",
+  "docker_operation_failed",
+  "docker_unavailable",
+  "docker_stdout_limit",
+  "docker_stderr_limit",
+  "docker_seccomp_unavailable",
+  "worker_image_not_pinned",
+  "worker_image_identity_mismatch",
+  "worker_image_not_prepared",
+  "worker_pi_version_mismatch",
+  "worker_start_failed",
+  "worker_import_failed",
+  "runtime_controls_unavailable",
+  "runtime_socket_unavailable",
+  "runtime_frozen_export_unavailable",
+  "container_cleanup_failed",
+  "volume_cleanup_failed",
+])
+
 export interface RuntimeStatus {
   state: "starting" | "running" | "not_configured" | "failed"
   reason?: string
@@ -143,13 +166,13 @@ export class Controller {
         repositoryId: config.repository.id,
         installationId: config.repository.installationId,
       })
-    } catch {
-      if (!stale())
-        this.currentStatus = { state: "failed", reason: "authentication_or_sandbox_unavailable" }
-      this.log.error({
-        event: "runtime_configuration_failed",
-        reason: "authentication_or_sandbox_unavailable",
-      })
+    } catch (error) {
+      const reason =
+        error instanceof Error && startupReasons.has(error.message)
+          ? error.message
+          : "authentication_or_sandbox_unavailable"
+      if (!stale()) this.currentStatus = { state: "failed", reason }
+      this.log.error({ event: "runtime_configuration_failed", reason })
     } finally {
       if (!active) {
         if (this.orchestrator === orchestrator) this.orchestrator = undefined
@@ -159,6 +182,10 @@ export class Controller {
         } catch {
           this.cleanupFailed = true
           this.currentStatus = { state: "failed", reason: "cleanup_requires_operator_check" }
+          this.log.error({
+            event: "runtime_stop_failed",
+            reason: "cleanup_requires_operator_check",
+          })
         }
       }
     }

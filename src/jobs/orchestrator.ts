@@ -121,7 +121,10 @@ export class Orchestrator {
   }
 
   private event(event: string, ref?: IssueRef, extra: Record<string, unknown> = {}): void {
-    this.log.info({
+    const level = ["failed", "execution_failed", "recovery_failed"].includes(event)
+      ? "error"
+      : "info"
+    this.log[level]({
       event,
       repository: `${this.config.repository.owner}/${this.config.repository.name}`,
       repositoryId: this.config.repository.id,
@@ -292,19 +295,24 @@ export class Orchestrator {
         } else {
           if (this.stopped) return
           this.store.completeDelivery(delivery.id)
-          this.event(
-            error instanceof GitHubIssueDeferred ? "deferred" : "failed",
-            work.kind === "issue" ? work.ref : undefined,
-            {
-              correlationId: delivery.id,
-              reason:
-                error instanceof GitHubIssueDeferred
-                  ? error.code
-                  : error instanceof Error && reasons.has(error.message)
-                    ? error.message
-                    : "request_rejected_or_failed",
-            },
-          )
+          const event =
+            error instanceof GitHubIssueDeferred
+              ? "deferred"
+              : error instanceof Error &&
+                  ["proposal_stale", "base_changed", "job_cancelled", "runtime_cancelled"].includes(
+                    error.message,
+                  )
+                ? "cancelled"
+                : "failed"
+          this.event(event, work.kind === "issue" ? work.ref : undefined, {
+            correlationId: delivery.id,
+            reason:
+              error instanceof GitHubIssueDeferred
+                ? error.code
+                : error instanceof Error && reasons.has(error.message)
+                  ? error.message
+                  : "request_rejected_or_failed",
+          })
         }
       }
     }
@@ -475,7 +483,8 @@ export class Orchestrator {
         // Do not make even a label request until the dispatcher persists this cooldown.
         throw error
       }
-      if (current && !terminal.has(current.state)) {
+      const notify = current && !terminal.has(current.state)
+      if (notify) {
         const revoked =
           signal.aborted ||
           (error instanceof Error &&
@@ -488,6 +497,16 @@ export class Orchestrator {
           current.error = failureReason(error)
           this.store.saveJob(current)
         }
+      }
+      this.event(
+        current?.state === "cancelled" ? "execution_cancelled" : "execution_failed",
+        job.ref,
+        {
+          jobId: job.id,
+          reason: failureReason(error),
+        },
+      )
+      if (notify) {
         await publisher.labels(
           job.ref.number,
           current.state === "cancelled" ? [] : ["bot:failed"],
@@ -498,10 +517,6 @@ export class Orchestrator {
           this.store.saveJob(current)
         }
       }
-      this.event("execution_failed", job.ref, {
-        jobId: job.id,
-        reason: this.store.job(job.id)?.error ?? failureReason(error),
-      })
     } finally {
       if (this.controllers.get(key(job.ref)) === controller) {
         this.controllers.delete(key(job.ref))

@@ -25,6 +25,7 @@ let options: AuthOptions
 let cookie: string
 let csrf: string
 let changed: ReturnType<typeof vi.fn<() => void>>
+const log = { info: vi.fn(), error: vi.fn() }
 
 function provider() {
   const value = getBuiltinProvider("anthropic")
@@ -131,12 +132,15 @@ beforeEach(async () => {
   cookie = `__Host-reina-session=${session.token}`
   csrf = session.csrfToken
   changed = vi.fn()
+  log.info.mockClear()
+  log.error.mockClear()
   admin = new AdminWeb(
     settings,
     new Auth(settings, options),
     origin,
     () => ({ state: "not_configured" }),
     changed,
+    log,
   )
   server = http.createServer((req, res) => {
     void admin.handle(req, res).catch(() => {
@@ -153,6 +157,7 @@ afterEach(async () => {
   server.closeAllConnections()
   await new Promise<void>((resolve) => server.close(() => resolve()))
   vi.restoreAllMocks()
+  expect(log.error).not.toHaveBeenCalled()
   settings.close()
   rmSync(directory, { recursive: true, force: true })
 })

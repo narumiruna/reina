@@ -396,6 +396,23 @@ Logs include event, repository ID/name, issue, installation, job/proposal, and c
 They use reason codes instead of raw API/model errors. Do not enable raw Probot debug payload
 logging or post private test output to GitHub.
 
+Job and delivery failures (`failed`, `execution_failed`, and `recovery_failed`) use `error` level.
+Normal lifecycle, deferral, and cancellation events use `info` level. A cancelled delivery emits
+`cancelled`, including an interrupted triage assessment. An interrupted or revoked execution emits
+`execution_cancelled`. The original execution failure is logged before label updates, so a failed
+notification cannot hide its job ID and reason.
+
+Runtime startup logs preserve explicitly allowed identity, Docker, and worker failure codes.
+Unknown errors use `authentication_or_sandbox_unavailable`; raw messages, stacks, and causes are
+not logged. Failed startup cleanup emits `runtime_stop_failed` with
+`cleanup_requires_operator_check` and keeps dispatch stopped.
+
+Unexpected administration and HTTP handler failures emit `http_request_failed` with a fixed
+reason, response status, allowed HTTP method, and allowed route or route template. Unknown
+methods and routes use a fixed marker. Logs exclude request bodies, headers, cookies, query
+strings, and raw errors. Expected validation/authentication responses, health checks, and webhook
+503 responses while dispatch is not configured do not emit error logs.
+
 For `runtime_timeout` or `pi_*`, inspect the phase and job ID, check provider/worker availability,
 and obtain a fresh human approval before another coding attempt. For `verification_failed`,
 use the recorded exit codes and approved commands to reproduce inside the offline worker, never

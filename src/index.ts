@@ -38,8 +38,9 @@ async function main(): Promise<void> {
     config.auth.origin,
     () => controller.status(),
     () => controller.reload(),
+    log,
   )
-  const server = httpServer(() => controller.app(), admin)
+  const server = httpServer(() => controller.app(), log, admin)
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject)
