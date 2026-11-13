@@ -49,4 +49,4 @@ The Codex conversation summary reports no code findings. The CodeRabbit walkthro
 - Tests cover post-claim limits, later freshness checks, consumed-approval replay, publication recovery, and safe logging before a notification error.
 - A markdown table format error in the first full check was corrected before the successful run.
 
-Publish this change on the open pull request branch. Then reply to thread `PRRT_kwDOVhoFps62_ucX` with the fix, validation, and R1-state scope decision. Resolve the thread only after publication. No clarification is required.
+Fix commit `6b99b69` is pushed to the open pull request branch. The [review reply](https://github.com/narumiruna/reina/pull/14#discussion_r4560928488) states the fix, validation, and R1-state scope decision. Thread `PRRT_kwDOVhoFps62_ucX` was resolved through the GitHub API. A separate query confirmed `isResolved: true`. No clarification or publication blocker remains.
