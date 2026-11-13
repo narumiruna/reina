@@ -147,6 +147,12 @@ export interface Config {
   model: string
   modelUrl: string
   modelKey: string
+  modelApi?: import("./settings/schema.js").SupportedApi
+  modelProvider?: string
+  contextWindow?: number
+  maxTokens?: number
+  modelRevision?: string
+  resolveModelRequest?: import("./settings/schema.js").ModelSelection["resolveModelRequest"]
   allowedPaths: string[]
   forbiddenPaths: string[]
   commands: string[][]

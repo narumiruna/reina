@@ -1,5 +1,4 @@
 import { type ChildProcess, spawn } from "node:child_process"
-import { generateKeyPairSync } from "node:crypto"
 import {
   chmodSync,
   copyFileSync,
@@ -38,9 +37,6 @@ import type {
   TriageDecision,
 } from "../src/types.js"
 
-const pem = generateKeyPairSync("rsa", { modulusLength: 2_048 })
-  .privateKey.export({ type: "pkcs8", format: "pem" })
-  .toString()
 const image = `ghcr.io/example/reina@sha256:${"d".repeat(64)}`
 let directory: string
 const stores: Store[] = []
@@ -66,23 +62,24 @@ afterEach(async () => {
 function environment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     APP_ID: "123",
-    PRIVATE_KEY: pem,
     WEBHOOK_SECRET: "fixture-webhook-secret-32-characters",
     REINA_REPOSITORY: "example/project",
     REINA_REPOSITORY_ID: "456",
     REINA_INSTALLATION_ID: "789",
     REINA_STATE_DIR: join(directory, "state"),
     REINA_WORKER_IMAGE: image,
-    REINA_MODEL: "openai/gpt-test",
-    REINA_MODEL_URL: "https://model.example/v1",
-    REINA_MODEL_KEY: "fixture-model-key",
     REINA_FORBIDDEN_PATHS:
       '["src/identity/**","src/permissions/**","src/security/**","src/release/**","src/platform/**"]',
     ...overrides,
   }
 }
 function config(): Config {
-  return loadConfig(environment())
+  return {
+    ...loadConfig(environment()),
+    model: "openai/gpt-test",
+    modelUrl: "https://model.example/v1",
+    modelKey: "fixture-model-key",
+  }
 }
 function decision(overrides: Partial<TriageDecision> = {}): TriageDecision {
   return {
@@ -180,7 +177,7 @@ function publishing(store: Store, job: Job): Job {
   return advance(store, validating, "publishing", { artifact: artifact() })
 }
 
-// The private key and all endpoints are credential-free fixtures. No network is used.
+// All credentials and endpoints are in-memory fixtures. No network is used.
 
 describe("atomic revocation and persistent GitHub cooldown", () => {
   test("revocation and inbox acceptance commit together before restart publication recovery", () => {
@@ -246,7 +243,7 @@ describe("atomic revocation and persistent GitHub cooldown", () => {
 })
 describe("strict configuration", () => {
   test("loads one numeric repository, safe defaults, and trusted argv without auth fields", () => {
-    const value = config()
+    const value = loadConfig(environment())
     expect(value.repository).toEqual({
       owner: "example",
       name: "project",
@@ -265,7 +262,18 @@ describe("strict configuration", () => {
     })
     expect(value).not.toHaveProperty("PRIVATE_KEY")
     expect(value).not.toHaveProperty("WEBHOOK_SECRET")
-    expect(loadConfig(environment({ PRIVATE_KEY: pem.replace(/\n/g, "\\n") })).image).toBe(image)
+    for (const field of [
+      "model",
+      "modelUrl",
+      "modelKey",
+      "modelApi",
+      "modelProvider",
+      "contextWindow",
+      "maxTokens",
+      "modelRevision",
+      "privateKey",
+    ])
+      expect(value).not.toHaveProperty(field)
     expect(
       loadConfig(environment({ REINA_WORKER_IMAGE: `sha256:${"a".repeat(64)}` })).image,
     ).toMatch(/^sha256:/)
@@ -288,17 +296,12 @@ describe("strict configuration", () => {
     ["APP_ID", undefined],
     ["APP_ID", "1.5"],
     ["APP_ID", "9007199254740992"],
-    ["PRIVATE_KEY", "not-a-key"],
     ["WEBHOOK_SECRET", "short"],
     ["WEBHOOK_SECRET", undefined],
     ["REINA_REPOSITORY", "one/repo,other/repo"],
     ["REINA_REPOSITORY", "https://github.com/one/repo"],
     ["REINA_REPOSITORY_ID", "0"],
     ["REINA_INSTALLATION_ID", "-2"],
-    ["REINA_MODEL_URL", "http://model.example/v1"],
-    ["REINA_MODEL_URL", "https://user:password@model.example"],
-    ["REINA_MODEL_URL", "https://model.example?key=private"],
-    ["REINA_MODEL_KEY", ""],
     ["REINA_WORKER_IMAGE", "worker:latest"],
     ["REINA_WORKER_IMAGE", `worker@sha256:${"a".repeat(63)}`],
     ["REINA_FORBIDDEN_PATHS", undefined],
@@ -324,11 +327,23 @@ describe("strict configuration", () => {
     )
   })
 
-  test("rejects non-RSA keys and does not disclose credentials in errors", () => {
-    const ec = generateKeyPairSync("ec", { namedCurve: "prime256v1" })
-      .privateKey.export({ type: "pkcs8", format: "pem" })
-      .toString()
-    expect(() => loadConfig(environment({ PRIVATE_KEY: ec }))).toThrow(/PRIVATE_KEY/)
+  test.each([
+    ["REINA_MODEL", "openai/gpt-test"],
+    ["REINA_MODEL_URL", "https://model.example/v1"],
+    ["REINA_MODEL_KEY", "fixture-model-key"],
+  ])("rejects legacy %s even when its value was valid", (name, value) => {
+    expect(() => loadConfig(environment({ [name]: value }))).toThrow(
+      `Invalid configuration fields: ${name}`,
+    )
+  })
+
+  test("does not require, validate, or return environment private keys", () => {
+    const value = loadConfig(environment())
+    for (const PRIVATE_KEY of ["", "not-a-key", "secret-private-input"])
+      expect(loadConfig(environment({ PRIVATE_KEY }))).toEqual(value)
+  })
+
+  test("does not disclose credentials in configuration errors", () => {
     let message = ""
     try {
       loadConfig(
@@ -343,7 +358,7 @@ describe("strict configuration", () => {
     }
     expect(message).not.toContain("secret-private-input")
     expect(message).not.toContain("secret-model-input")
-    expect(message).not.toContain(pem)
+    expect(message).toBe("Invalid configuration fields: APP_ID, REINA_MODEL_KEY")
   })
 
   test("requires a private absolute state directory outside the checkout and its aliases", () => {
@@ -621,6 +636,30 @@ describe("triage schema and policy", () => {
     expect(
       policyHash({ ...config(), forbiddenPaths: [...config().forbiddenPaths, "src/core/**"] }),
     ).not.toBe(originalHash)
+  })
+
+  test("model API and revision changes invalidate policy and proposals, but key rotation does not", () => {
+    const now = 1_800_000_000_000
+    const original: Config = {
+      ...config(),
+      modelApi: "openai-completions",
+      modelRevision: "fixture-revision-1",
+    }
+    const baseline = makeProposal(issue(), snapshot(), decision(), original, 99, now)
+    for (const changed of [
+      { ...original, modelApi: "openai-responses" as const },
+      { ...original, modelRevision: "fixture-revision-2" },
+      { ...original, modelApi: undefined },
+      { ...original, modelRevision: undefined },
+    ]) {
+      expect(policyHash(changed)).not.toBe(policyHash(original))
+      expect(makeProposal(issue(), snapshot(), decision(), changed, 99, now).revision).not.toBe(
+        baseline.revision,
+      )
+    }
+    const rotated = { ...original, modelKey: "rotated-fixture-key" }
+    expect(policyHash(rotated)).toBe(policyHash(original))
+    expect(makeProposal(issue(), snapshot(), decision(), rotated, 99, now)).toEqual(baseline)
   })
 
   test("rejects closed, foreign, excluded, PR, or oversized evidence rather than truncating", () => {

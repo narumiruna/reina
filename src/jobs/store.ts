@@ -269,7 +269,7 @@ function encodePayload(payload: unknown): string {
   return json
 }
 
-function privateFile(path: string): void {
+export function privateFile(path: string): void {
   try {
     closeSync(
       openSync(

@@ -1,8 +1,8 @@
-import { createPrivateKey } from "node:crypto"
 import { existsSync, lstatSync, realpathSync } from "node:fs"
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path"
 import picomatch from "picomatch"
 import { z } from "zod"
+import type { ModelSelection } from "./settings/schema.js"
 import type { Config } from "./types.js"
 
 const integer = (min: number, max: number, fallback?: number) => {
@@ -17,19 +17,6 @@ const integer = (min: number, max: number, fallback?: number) => {
 const pinnedImage =
   /^(?:sha256:[a-f0-9]{64}|(?:[a-z0-9.-]+(?::[0-9]{1,5})\/)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?:\/[a-z0-9]+(?:[._-][a-z0-9]+)*)*(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[a-f0-9]{64})$/
 
-function privateKey(value: string): boolean {
-  try {
-    const pem = value.replace(/\\n/g, "\n").trim()
-    if (!/^-----BEGIN (?:RSA )?PRIVATE KEY-----\n/.test(pem)) return false
-    const key = createPrivateKey({ key: pem, format: "pem" })
-    return (
-      key.asymmetricKeyType === "rsa" && (key.asymmetricKeyDetails?.modulusLength ?? 0) >= 2_048
-    )
-  } catch {
-    return false
-  }
-}
-
 function within(parent: string, child: string): boolean {
   const path = relative(parent, child)
   return path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path))
@@ -42,7 +29,7 @@ function canonicalPath(path: string): string {
   return join(canonicalPath(parent), parse(path).base)
 }
 
-function privateStateDirectory(path: string): boolean {
+export function privateStateDirectory(path: string): boolean {
   try {
     if (!isAbsolute(path) || path !== resolve(path) || path === parse(path).root) return false
     let checkout = realpathSync(process.cwd())
@@ -120,7 +107,6 @@ function json<T extends z.ZodType>(schema: T, fallback?: string) {
 
 const environmentSchema = z.strictObject({
   APP_ID: integer(1, Number.MAX_SAFE_INTEGER),
-  PRIVATE_KEY: z.string().min(1).max(32_768).refine(privateKey),
   WEBHOOK_SECRET: z
     .string()
     .min(32)
@@ -134,35 +120,6 @@ const environmentSchema = z.strictObject({
   REINA_INSTALLATION_ID: integer(1, Number.MAX_SAFE_INTEGER),
   REINA_STATE_DIR: z.string().min(1).max(4_096).refine(privateStateDirectory),
   REINA_WORKER_IMAGE: z.string().max(512).regex(pinnedImage),
-  REINA_MODEL: z
-    .string()
-    .max(200)
-    .regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/),
-  REINA_MODEL_URL: z
-    .string()
-    .max(2_048)
-    .refine((value) => {
-      try {
-        const url = new URL(value)
-        return (
-          value.trim() === value &&
-          !/[\p{Cc}]/u.test(value) &&
-          url.protocol === "https:" &&
-          url.hostname !== "" &&
-          !url.username &&
-          !url.password &&
-          !url.search &&
-          !url.hash
-        )
-      } catch {
-        return false
-      }
-    }),
-  REINA_MODEL_KEY: z
-    .string()
-    .min(1)
-    .max(8_192)
-    .refine((value) => value.trim() === value && !/[\p{Cc}]/u.test(value)),
   REINA_ALLOWED_PATHS: json(patterns, '["README.md","docs/**","src/**","tests/**"]'),
   // Operators must name the repository's security and deployment domains. Syntax checks
   // cannot establish that this list covers those domains.
@@ -176,7 +133,9 @@ const environmentSchema = z.strictObject({
   REINA_MAX_PATCH_BYTES: integer(1, 65_536, 65_536),
 })
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+export function loadConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): Omit<Config, keyof ModelSelection> {
   // The host environment contains unrelated keys. Only this allowlist enters validation.
   const selected = Object.fromEntries(
     Object.keys(environmentSchema.shape).map((key) => [key, env[key]]),
@@ -205,9 +164,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     },
     stateDir: value.REINA_STATE_DIR,
     image: value.REINA_WORKER_IMAGE,
-    model: value.REINA_MODEL,
-    modelUrl: new URL(value.REINA_MODEL_URL).href.replace(/\/$/, ""),
-    modelKey: value.REINA_MODEL_KEY,
     allowedPaths: value.REINA_ALLOWED_PATHS,
     forbiddenPaths: value.REINA_FORBIDDEN_PATHS,
     commands: value.REINA_VERIFY_COMMANDS,

@@ -94,6 +94,14 @@ describe("Pi 1.5.0 CLI boundary", () => {
     expect(() => piArguments("fixture:high", "code")).toThrow()
     expect(JSON.stringify(trustedSettings())).toContain('"maxRetries":0')
     expect(JSON.stringify(trustedModels("fixture", "a".repeat(64)))).toContain("127.0.0.1:3210/v1")
+    expect(
+      JSON.stringify(
+        trustedModels("fixture", "a".repeat(64), { contextWindow: 64000, maxTokens: 2048 }),
+      ),
+    ).toContain('"maxTokens":2048')
+    expect(() => trustedModels("fixture", "a".repeat(64), { maxTokens: 4097 })).toThrow(
+      "invalid_model_limits",
+    )
   })
 
   it("handles split UTF-8 and Unicode separators without changing LF framing", () => {

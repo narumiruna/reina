@@ -3,6 +3,7 @@ import type { Probot } from "probot"
 import { z } from "zod"
 import type { Orchestrator, Work } from "./jobs/orchestrator.js"
 import type { Config } from "./types.js"
+import type { AdminWeb } from "./web/admin.js"
 
 const id = z.number().int().positive()
 const envelope = z.object({
@@ -123,14 +124,21 @@ async function body(req: IncomingMessage): Promise<string> {
 }
 
 // Bound and sanitize input before Probot dispatch, so even library error logs cannot contain issue bodies.
-export function httpServer(app: Probot) {
+export function httpServer(app: Probot | (() => Probot | undefined), admin?: AdminWeb) {
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.url === "/healthz" && req.method === "GET") {
       res.writeHead(200).end("ok")
       return
     }
+    if (admin && (await admin.handle(req, res))) return
     if (req.url !== "/api/github/webhooks" || req.method !== "POST") {
       res.writeHead(404).end()
+      return
+    }
+    const current = typeof app === "function" ? app() : app
+    if (!current) {
+      res.writeHead(503).end()
+      req.resume()
       return
     }
     const delivery = req.headers["x-github-delivery"]
@@ -153,7 +161,7 @@ export function httpServer(app: Probot) {
       res.writeHead(413).end()
       return
     }
-    if (!(await app.webhooks.verify(raw, signature).catch(() => false))) {
+    if (!(await current.webhooks.verify(raw, signature).catch(() => false))) {
       res.writeHead(401).end()
       return
     }
@@ -166,7 +174,7 @@ export function httpServer(app: Probot) {
     }
     try {
       const event = { id: delivery, name, payload } as Parameters<Probot["receive"]>[0]
-      await app.receive(event)
+      await current.receive(event)
       res.writeHead(202).end()
     } catch {
       // Handlers perform only synchronous durable intake. A failed write must remain retryable by GitHub.
