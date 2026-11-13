@@ -386,7 +386,9 @@ export class DockerRuntime implements AgentRuntime {
           "models.json": {
             mode: "100644",
             content: Buffer.from(
-              JSON.stringify(trustedModels(this.config.model, container.gateway.capability)),
+              JSON.stringify(
+                trustedModels(this.config.model, container.gateway.capability, this.config),
+              ),
             ),
           },
         }

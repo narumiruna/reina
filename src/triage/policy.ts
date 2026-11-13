@@ -170,6 +170,8 @@ export function policyHash(config: Config): string {
     image: config.image,
     model: config.model,
     modelUrl: config.modelUrl,
+    modelApi: config.modelApi,
+    modelRevision: config.modelRevision,
     maxConcurrentJobs: config.maxConcurrentJobs,
     agentTimeoutMs: config.agentTimeoutMs,
     maxChangedFiles: config.maxChangedFiles,

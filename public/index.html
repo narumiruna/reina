@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Models · Reina</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <script type="module" src="/assets/app.js"></script>
+</head>
+<body data-page="admin">
+  <a class="skip-link" href="#page-title">Skip to content</a>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="Reina home"><span class="brand-mark" aria-hidden="true">r</span><span>reina<span class="brand-subtitle">ADMINISTRATION</span></span></a>
+      <p class="nav-label">WORKSPACE</p>
+      <nav aria-label="Settings">
+        <a href="#models" id="nav-models" aria-current="page"><span class="nav-icon" aria-hidden="true">◈</span>Models</a>
+        <a href="#github" id="nav-github"><span class="nav-icon" aria-hidden="true">⌘</span>GitHub App</a>
+      </nav>
+      <div class="sidebar-note"><span class="small-dot" aria-hidden="true"></span> Your agent, configured.<p>Manage the connections that power Reina.</p></div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar"><span>Workspace settings</span><div class="identity"><span class="avatar" id="user-avatar" aria-hidden="true">R</span><span id="user-name">Loading account…</span><form id="logout-form" action="/auth/logout" method="post" aria-label="Reina session"><button class="quiet" type="submit" disabled>Log out of Reina</button></form></div></header>
+      <main>
+        <div class="page-heading"><div><p class="eyebrow">CONFIGURATION</p><h1 id="page-title" tabindex="-1">Models</h1><p id="page-description" class="lede">Configure a provider. Select a model for Reina.</p></div><button type="button" class="primary" id="add-provider" disabled>＋ Configure provider</button></div>
+        <div id="page-status" class="notice" role="status" aria-atomic="true">Loading your settings…</div>
+        <button type="button" id="retry-settings" class="secondary" hidden>Retry loading settings</button>
+        <noscript><p class="notice error">Enable JavaScript to manage Reina settings.</p></noscript>
+        <div id="settings-content" hidden>
+          <section class="runtime-bar" aria-label="Runtime configuration"><div><span class="eyebrow">RUNTIME</span><p id="runtime-status">Checking configuration…</p></div><div class="runtime-actions"><button type="button" id="refresh-settings" class="quiet">Refresh status</button><button type="button" id="reload-runtime" class="secondary">Apply configuration</button></div></section>
+          <section id="models-page">
+            <div class="section-heading"><h2>Providers <span id="provider-count" class="count">0</span></h2><span class="muted">Credentials stay private</span></div>
+            <div id="provider-empty" class="empty-state" hidden><span class="empty-icon" aria-hidden="true">◈</span><p class="eyebrow">MAKE THE FIRST CONNECTION</p><h3>A model for your workflow</h3><p>Connect an account or API key, save a model,<br>then select it for Reina.</p><button type="button" id="empty-add-provider" class="primary">Configure your first provider</button><ol class="setup-steps"><li>Configure provider</li><li>Save model</li><li>Select model</li></ol></div>
+            <!-- biome-ignore lint/a11y/noRedundantRoles: Safari removes list semantics when list-style is none. -->
+            <ul id="provider-list" class="provider-list" role="list"></ul>
+            <div class="section-heading saved-heading"><h2>Saved models <span id="model-count" class="count">0</span></h2><button type="button" id="clear-selection" class="quiet" hidden>Clear selection</button></div>
+            <p class="section-description">Saving a model does not select it. Choose <strong>Select model</strong> to save your preference. Runtime status shows whether the configuration is applied.</p>
+            <p id="models-empty" class="subtle-empty">No saved models yet. Configure a provider, then save a model from its catalog or enter your own.</p>
+            <!-- biome-ignore lint/a11y/noRedundantRoles: Safari removes list semantics when list-style is none. -->
+            <ul id="model-list" class="model-list" role="list"></ul>
+          </section>
+          <section id="github-page" hidden>
+            <article class="panel key-panel"><div class="panel-heading"><div><h2>App private key</h2><p>Connect Reina to your GitHub App with a PEM private key.</p></div><span id="github-badge" class="badge">Not configured</span></div>
+              <dl class="key-metadata"><div><dt>Fingerprint</dt><dd id="github-fingerprint" class="mono">No key uploaded</dd></div><div><dt>Last uploaded</dt><dd id="github-uploaded">—</dd></div></dl>
+              <form id="github-form" action="/api/github/private-key" method="post" aria-labelledby="key-form-title">
+                <h3 id="key-form-title">Upload private key</h3>
+                <div class="field"><label for="private-key">PEM file (required)</label><p class="hint" id="private-key-hint">Select an unencrypted RSA private key downloaded from your GitHub App (at least 2048 bits). Maximum 32 KiB. Its contents are never displayed.</p><input type="file" id="private-key" name="privateKey" accept=".pem,application/x-pem-file" required aria-describedby="private-key-hint"></div>
+                <div class="form-actions"><button class="primary" type="submit" id="upload-key">Upload private key</button><button class="danger quiet" id="delete-key" type="button" hidden>Delete private key</button></div>
+              </form>
+            </article>
+            <div class="privacy-note"><span aria-hidden="true">◇</span><p><strong>Write-only credentials.</strong> Reina returns only the key fingerprint and configuration status. Upload a new file to replace an existing key.</p></div>
+          </section>
+        </div>
+      </main>
+      <footer class="page-footer">Reina <span>Connection settings</span></footer>
+    </div>
+  </div>
+
+  <dialog id="provider-dialog" aria-labelledby="provider-title">
+    <div class="dialog-heading"><div><p class="eyebrow">CONNECTION</p><h2 id="provider-title">Configure provider</h2></div><button type="button" class="close-button" data-close="provider-dialog" aria-label="Close provider dialog">×</button></div>
+    <p id="provider-step" class="hint setup-step" aria-live="polite"></p>
+    <form id="auth-method-form" action="/api/provider-setups" method="post" aria-labelledby="provider-title">
+      <fieldset class="auth-methods"><legend>Select authentication method</legend>
+        <div class="auth-choice"><input id="auth-account" name="authType" type="radio" value="oauth" required autofocus><label for="auth-account">Sign in with an account<span>Authorize a supported provider account.</span></label></div>
+        <div class="auth-choice"><input id="auth-api-key" name="authType" type="radio" value="api_key" required><label for="auth-api-key">Sign in with an API key<span>Use the provider's prompts, or configure a custom endpoint.</span></label></div>
+      </fieldset>
+      <p class="hint">Only methods supported by Reina are listed. Credentials save separately from model selection.</p>
+      <details class="auth-limits"><summary>Supported sign-in limits</summary><p class="hint">OpenAI API keys use OpenAI. ChatGPT account login uses the separate OpenAI Codex provider. OpenAI and OpenRouter callback-based account login, Radius, filesystem credentials, and GitHub Enterprise login are not available here. A saved credential does not confirm subscription access or model availability.</p></details>
+      <div class="dialog-actions"><button type="submit" class="primary">Continue</button></div>
+    </form>
+    <form id="auth-provider-form" action="/api/provider-setups" method="post" aria-labelledby="provider-title" hidden>
+      <p id="auth-provider-description" class="section-description"></p>
+      <search class="field"><label for="provider-search">Search providers</label><input id="provider-search" name="providerSearch" type="search" placeholder="Search by name or ID" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false"></search>
+      <div class="field"><label for="provider-preset">Select provider (required)</label><select id="provider-preset" name="providerId" size="5" required aria-describedby="provider-catalog-status"></select><p class="hint" id="provider-catalog-status" role="status">Loading catalog…</p></div>
+      <button type="button" id="retry-provider-catalog" class="secondary" hidden>Retry catalog</button>
+      <button type="button" id="custom-provider" class="quiet" hidden>Add custom provider</button>
+      <div class="dialog-actions"><button type="submit" id="continue-provider" class="primary">Continue</button></div>
+    </form>
+    <form id="auth-policy-form" action="/api/provider-setups" method="post" aria-labelledby="provider-title" hidden>
+      <h3 id="auth-policy-title" tabindex="-1">Confirm GitHub Copilot policy changes</h3><p class="section-description">Starting GitHub Copilot sign-in may enable model policies on your GitHub account. Continue only if you permit these remote changes. Only public github.com accounts are supported.</p>
+      <div class="dialog-actions"><button type="submit" class="primary">Allow policy changes and continue</button></div>
+    </form>
+    <section id="auth-credential-actions" aria-labelledby="auth-credential-title" hidden>
+      <h3 id="auth-credential-title">Provider credential</h3><p id="auth-credential-status" class="section-description"></p>
+      <div class="form-actions"><button type="button" id="update-credential" class="primary">Update credential</button><button type="button" id="remove-credential" class="quiet danger">Remove credential</button></div>
+    </section>
+    <section id="auth-setup" aria-label="Provider sign-in" hidden>
+      <p id="auth-progress" class="hint" role="status" aria-atomic="true"></p>
+      <div id="auth-event" class="auth-event"></div>
+      <p id="auth-link-help" class="hint" hidden>Open the verification link in a new tab. If your browser blocks it, copy the link address and open it yourself. Reina does not open popups automatically.</p>
+      <form id="auth-prompt-form" action="/api/provider-setups" method="post" aria-labelledby="provider-title" hidden>
+        <div class="field"><label id="auth-prompt-label" for="auth-prompt-input">Provider response</label><input id="auth-prompt-input" name="value" type="text" maxlength="16384" autocomplete="current-password" autocorrect="off" autocapitalize="none" spellcheck="false"><select id="auth-prompt-select" name="choice" hidden></select></div>
+        <div class="dialog-actions"><button type="submit" id="submit-auth-prompt" class="primary">Continue</button></div>
+      </form>
+    </section>
+    <form id="provider-form" action="/api/providers" method="post" aria-labelledby="provider-title" hidden>
+      <div class="field"><label for="provider-name">Display name (required)</label><input id="provider-name" name="name" required maxlength="100" placeholder="e.g. My provider"></div>
+      <div class="field"><label for="provider-api">API (required)</label><p id="provider-api-hint" class="hint">The API selects the wire protocol used for model requests.</p><select id="provider-api" name="api" required aria-describedby="provider-api-hint"><option value="">Select an API</option></select></div>
+      <div class="field"><label for="provider-url">Base URL (required)</label><p id="provider-url-hint" class="hint">Use an HTTPS API endpoint, including its version path. Do not include credentials, a query, or a fragment.</p><input id="provider-url" name="baseUrl" type="url" required pattern="https://.*" maxlength="2048" placeholder="https://api.example.com/v1" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" aria-describedby="provider-url-hint"></div>
+      <div class="field"><label for="provider-key">API key (optional)</label><p class="hint" id="provider-key-hint">Write-only. You can add a key later; a key is required to use a model.</p><input id="provider-key" name="apiKey" type="password" maxlength="8192" autocomplete="new-password" autocorrect="off" autocapitalize="none" spellcheck="false" aria-describedby="provider-key-hint"></div>
+      <div class="dialog-actions"><button class="primary" type="submit" id="save-provider">Save provider</button></div>
+    </form>
+    <p class="dialog-status notice" id="provider-status" role="status" aria-atomic="true"></p>
+    <div class="dialog-actions setup-navigation"><button class="secondary" type="button" id="provider-back" hidden>Back</button><button class="secondary" type="button" data-close="provider-dialog">Cancel</button></div>
+  </dialog>
+
+  <dialog id="model-dialog" aria-labelledby="model-title">
+    <div class="dialog-heading"><div><p class="eyebrow" id="model-provider-name">MODEL</p><h2 id="model-title">Save model</h2></div><button type="button" class="close-button" data-close="model-dialog" aria-label="Close model dialog">×</button></div>
+    <div id="model-presets">
+      <search class="field"><label for="model-search">Search model catalog</label><input id="model-search" name="modelSearch" type="search" placeholder="Search by model name or ID" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" autofocus></search>
+      <div class="field"><label for="model-preset">Catalog models</label><select id="model-preset" name="modelPreset" size="5" aria-describedby="model-catalog-status"></select><p class="hint" id="model-catalog-status"></p></div>
+      <button type="button" id="use-model-preset" class="secondary">Select catalog model</button><p class="form-divider">Or enter a custom model below</p>
+    </div>
+    <form id="model-form" action="/api/models" method="post" aria-labelledby="model-title">
+      <div class="field"><label for="model-name">Display name (required)</label><input id="model-name" name="name" required maxlength="100" placeholder="e.g. My model"></div>
+      <div class="field"><label for="model-id">Model ID (required)</label><p class="hint" id="model-id-hint">The exact model identifier. Start with a letter or digit; use only letters, digits, dots, underscores, slashes, and hyphens.</p><input id="model-id" name="modelId" required maxlength="200" pattern="[A-Za-z0-9][A-Za-z0-9._\/\-]{0,199}" placeholder="e.g. model-name-version" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" aria-describedby="model-id-hint"></div>
+      <details id="model-advanced"><summary>Advanced limits</summary><p class="hint" id="model-limits-hint">Context window: 4,096–4,000,000 tokens. Maximum output tokens setting: 256–4,096 tokens. Codex SDK 1.5.0 ignores this setting. Gateway time, request-count, and response-size limits still apply; they are not an upstream token or billing cap.</p><div class="field"><label for="model-context">Context window (tokens, required)</label><input id="model-context" name="contextWindow" type="number" inputmode="numeric" min="4096" max="4000000" step="1" required value="128000"></div><div class="field"><label for="model-output">Maximum output tokens setting (required)</label><input aria-describedby="model-limits-hint" id="model-output" name="maxTokens" type="number" inputmode="numeric" min="256" max="4096" step="1" required value="4096"></div></details>
+      <p class="dialog-status notice" id="model-status" role="status" aria-atomic="true"></p>
+      <div class="dialog-actions"><button class="secondary" type="button" data-close="model-dialog">Cancel</button><button class="primary" type="submit">Save model</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="delete-dialog" class="confirm-dialog" aria-labelledby="delete-title" aria-describedby="delete-description">
+    <p class="eyebrow">CONFIRM DELETION</p><h2 id="delete-title">Delete item?</h2><p id="delete-description"></p>
+    <p class="notice" id="delete-status" role="status" aria-atomic="true"></p>
+    <form id="delete-form" action="/api/settings" method="post" aria-labelledby="delete-title"><div class="dialog-actions"><button type="button" class="secondary" data-close="delete-dialog" autofocus>Cancel</button><button type="submit" class="danger-button">Delete</button></div></form>
+  </dialog>
+</body>
+</html>

@@ -5,6 +5,8 @@
 !tsconfig.json
 !src
 !src/**
+!public
+!public/**
 !scripts
 !scripts/container-entrypoint.sh
 !scripts/prepare-worker.mjs

@@ -19,6 +19,7 @@ COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/docker-buildx /usr/
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
+COPY public ./public
 COPY scripts/container-entrypoint.sh scripts/prepare-worker.mjs ./scripts/
 COPY worker ./worker
 RUN install -d -m 700 /var/lib/reina /var/lib/reina-tmp

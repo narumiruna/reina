@@ -130,8 +130,23 @@ export function trustedSettings(): Record<string, unknown> {
   }
 }
 
-export function trustedModels(model: string, capability: string): Record<string, unknown> {
+export function trustedModels(
+  model: string,
+  capability: string,
+  limits: { contextWindow?: number; maxTokens?: number } = {},
+): Record<string, unknown> {
   piArguments(model, "triage")
+  const contextWindow = limits.contextWindow ?? 128_000
+  const maxTokens = limits.maxTokens ?? 4096
+  if (
+    !Number.isSafeInteger(contextWindow) ||
+    contextWindow < 4096 ||
+    contextWindow > 4_000_000 ||
+    !Number.isSafeInteger(maxTokens) ||
+    maxTokens < 256 ||
+    maxTokens > 4096
+  )
+    throw new Error("invalid_model_limits")
   if (!/^[a-f0-9]{64}$/.test(capability)) throw new Error("invalid_capability")
   return {
     providers: {
@@ -145,8 +160,8 @@ export function trustedModels(model: string, capability: string): Record<string,
             id: model,
             input: ["text"],
             reasoning: false,
-            contextWindow: 128_000,
-            maxTokens: 4096,
+            contextWindow,
+            maxTokens,
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
             compat: {
               maxTokensField: "max_tokens",

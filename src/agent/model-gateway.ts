@@ -2,7 +2,9 @@ import { randomBytes, timingSafeEqual } from "node:crypto"
 import { chmod, unlink } from "node:fs/promises"
 import http, { type IncomingMessage, type ServerResponse } from "node:http"
 import https from "node:https"
-import type { Config } from "../types.js"
+import { publicLookup, validateProviderUrl } from "../settings/network.js"
+import { supportedApis } from "../settings/schema.js"
+import { AdapterState, type ModelSnapshot, piChatStream, toPiContext } from "./pi-adapter.js"
 
 const BODY_LIMIT = 1024 * 1024
 const RESPONSE_LIMIT = 4 * 1024 * 1024
@@ -34,6 +36,9 @@ export class ModelGateway {
     void this.handle(req, res)
   })
   private readonly active = new Set<http.ClientRequest>()
+  private readonly controllers = new Set<AbortController>()
+  private readonly config: ModelSnapshot
+  private readonly adapterState = new AdapterState()
   private readonly expiresAt: number
   private readonly endpoint: URL
   private remaining: number
@@ -41,10 +46,17 @@ export class ModelGateway {
   private timer: NodeJS.Timeout | undefined
 
   constructor(
-    private readonly config: Pick<Config, "modelUrl" | "modelKey" | "model">,
+    config: ModelSnapshot,
     readonly socketPath: string,
     options: GatewayOptions,
   ) {
+    this.config = Object.freeze({ ...config })
+    if (!config.modelKey && !config.resolveModelRequest) throw new Error("invalid_model_endpoint")
+    if (config.modelApi !== undefined || config.resolveModelRequest) {
+      if (config.modelApi !== undefined && !supportedApis.includes(config.modelApi))
+        throw new Error("invalid_model_endpoint")
+      validateProviderUrl(config.modelUrl)
+    }
     this.endpoint = new URL(`${config.modelUrl.replace(/\/$/, "")}/chat/completions`)
     if (
       !["https:", "http:"].includes(this.endpoint.protocol) ||
@@ -189,11 +201,35 @@ export class ModelGateway {
         this.deny(res, 400)
         return
       }
+      if (
+        (data.temperature !== undefined &&
+          (typeof data.temperature !== "number" ||
+            !Number.isFinite(data.temperature) ||
+            data.temperature < 0 ||
+            data.temperature > 2)) ||
+        (data.top_p !== undefined &&
+          (typeof data.top_p !== "number" ||
+            !Number.isFinite(data.top_p) ||
+            data.top_p < 0 ||
+            data.top_p > 1))
+      ) {
+        this.deny(res, 400)
+        return
+      }
+      if (
+        this.config.resolveModelRequest ||
+        (this.config.modelApi && this.config.modelApi !== "openai-completions")
+      ) {
+        // Reject malformed tool history before any provider request or SSE output.
+        toPiContext(this.config, data, this.adapterState)
+        await this.forwardPi(data, res)
+        return
+      }
       // Never forward URL/routing fields or request headers. The endpoint must support max_tokens.
       const output = {
         ...data,
         model: this.config.model,
-        max_tokens: 4096,
+        max_tokens: Math.min(4096, this.config.maxTokens ?? 4096),
         n: 1,
         store: false,
         stream: true,
@@ -206,6 +242,7 @@ export class ModelGateway {
       }
       const upstream = (this.endpoint.protocol === "https:" ? https : http).request(this.endpoint, {
         method: "POST",
+        ...(this.config.modelApi ? { lookup: publicLookup, agent: false } : {}),
         timeout: Math.min(60_000, this.expiresAt - Date.now()),
         headers: {
           authorization: `Bearer ${this.config.modelKey}`,
@@ -263,6 +300,56 @@ export class ModelGateway {
       upstream.end(payload)
     } catch {
       this.deny(res, 400)
+    }
+  }
+
+  private async forwardPi(data: Record<string, unknown>, res: ServerResponse): Promise<void> {
+    const controller = new AbortController()
+    this.controllers.add(controller)
+    const stop = () => controller.abort()
+    const timer = setTimeout(stop, Math.max(1, Math.min(60_000, this.expiresAt - Date.now())))
+    timer.unref()
+    res.once("close", stop)
+    try {
+      for await (const chunk of piChatStream(
+        this.config,
+        data,
+        controller.signal,
+        undefined,
+        this.adapterState,
+      )) {
+        if (this.revoked || Date.now() >= this.expiresAt) controller.abort()
+        controller.signal.throwIfAborted()
+        if (!res.headersSent)
+          res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" })
+        if (!res.write(chunk)) {
+          await new Promise<void>((resolve, reject) => {
+            const cleanup = () => {
+              res.off("drain", drained)
+              controller.signal.removeEventListener("abort", aborted)
+            }
+            const drained = () => {
+              cleanup()
+              resolve()
+            }
+            const aborted = () => {
+              cleanup()
+              reject(new Error("model_gateway_aborted"))
+            }
+            res.once("drain", drained)
+            controller.signal.addEventListener("abort", aborted, { once: true })
+            if (controller.signal.aborted) aborted()
+          })
+        }
+      }
+      res.end()
+    } catch {
+      this.deny(res, 502)
+    } finally {
+      controller.abort()
+      clearTimeout(timer)
+      res.off("close", stop)
+      this.controllers.delete(controller)
     }
   }
 
@@ -382,7 +469,10 @@ export class ModelGateway {
 
   revoke(): void {
     this.revoked = true
+    this.adapterState.clear()
     clearTimeout(this.timer)
+    for (const controller of this.controllers) controller.abort()
+    this.controllers.clear()
     for (const request of this.active) request.destroy()
     this.active.clear()
     this.server.closeAllConnections()

@@ -1,83 +1,80 @@
-import { Probot } from "probot"
-import { DockerRuntime } from "./agent/sandbox.js"
-import { httpServer, register } from "./app.js"
-import { loadConfig } from "./config.js"
-import { boundaryFactory, installationClient, LimitedOctokit } from "./github/clients.js"
-import { numericId } from "./github/scanner.js"
-import { Orchestrator } from "./jobs/orchestrator.js"
+import { pino } from "pino"
+import { httpServer } from "./app.js"
 import { Store } from "./jobs/store.js"
+import { closeProviderAuthDispatcher } from "./settings/auth-network.js"
+import { drainCredentials } from "./settings/credentials.js"
+import { SettingsStore } from "./settings/store.js"
+import { AdminWeb } from "./web/admin.js"
+import { Auth } from "./web/auth.js"
+import { loadWebConfig } from "./web/config.js"
+import { Controller } from "./web/controller.js"
 
 async function main(): Promise<void> {
-  const config = loadConfig()
-  const app = new Probot({
-    appId: process.env.APP_ID,
-    privateKey: process.env.PRIVATE_KEY?.replace(/\\n/g, "\n"),
-    secret: process.env.WEBHOOK_SECRET,
-    Octokit: LimitedOctokit,
-    logLevel: "info",
-    logFormat: "json",
-  })
-  await app.ready()
+  const config = loadWebConfig()
+  const log = pino({ level: "info" })
   const store = new Store(config.stateDir)
-  const runtime = new DockerRuntime(config)
-  let orchestrator: Orchestrator | undefined
-  const server = httpServer(app)
+  let settings: SettingsStore | undefined
   try {
-    const root = await app.auth()
-    const { data: metadata } = await root.rest.apps.getAuthenticated({ request: { retries: 0 } })
-    if (!metadata?.slug) throw new Error("app_identity_missing")
-    const read = await installationClient(app, config, false)
-    const { data: bot } = await read.client.rest.users.getByUsername({
-      username: `${metadata.slug}[bot]`,
-      request: { retries: 0 },
-    })
-    if (bot.type !== "Bot" || !bot.id) throw new Error("bot_identity_missing")
-    const botId = numericId(bot.id)
-    orchestrator = new Orchestrator(
-      config,
-      store,
-      runtime,
-      boundaryFactory(app, config, botId),
-      botId,
-      app.log,
+    settings = new SettingsStore(config.stateDir, config.encryptionKey)
+    settings.bindAuthContext(
+      JSON.stringify([
+        "oidc-groups-v1",
+        config.auth.origin,
+        config.auth.issuer,
+        config.auth.clientId,
+        config.auth.allowedGroups,
+      ]),
     )
-    register(app, config, orchestrator, botId)
-    await orchestrator.start()
-    const port = Number(process.env.PORT ?? 36816)
-    if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) throw new Error("port_invalid")
+  } catch (error) {
+    settings?.close()
+    store.close()
+    throw error
+  }
+  const controller = new Controller(settings, store, process.env, log)
+  const auth = new Auth(settings, config.auth)
+  const admin = new AdminWeb(
+    settings,
+    auth,
+    config.auth.origin,
+    () => controller.status(),
+    () => controller.reload(),
+  )
+  const server = httpServer(() => controller.app(), admin)
+  try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject)
-      server.listen(port, "127.0.0.1", resolve)
+      server.listen(config.port, "127.0.0.1", resolve)
     })
-    app.log.info({
-      event: "ready",
-      port,
-      repositoryId: config.repository.id,
-      installationId: config.repository.installationId,
-    })
+    controller.reload()
+    log.info({ event: "management_ready", port: config.port })
   } catch {
-    await orchestrator?.stop()
-    await runtime.cleanup()
+    admin.close()
+    await controller.close()
+    await drainCredentials(settings)
+    await closeProviderAuthDispatcher()
+    settings.close()
     store.close()
-    app.log.error({
-      event: "startup_failed",
-      reason: "configuration_authentication_or_sandbox_unavailable",
-    })
     process.exitCode = 1
+    log.error({ event: "startup_failed", reason: "management_unavailable" })
     return
   }
   let stopping = false
   const stop = async () => {
     if (stopping) return
     stopping = true
+    admin.close()
     try {
       const closed = new Promise<void>((resolve) => server.close(() => resolve()))
-      await orchestrator?.stop()
+      await controller.close()
+      server.closeIdleConnections()
       await closed
     } catch {
-      app.log.error({ event: "shutdown_failed", reason: "cleanup_requires_operator_check" })
+      log.error({ event: "shutdown_failed", reason: "cleanup_requires_operator_check" })
       process.exitCode = 1
     } finally {
+      await drainCredentials(settings)
+      await closeProviderAuthDispatcher()
+      settings.close()
       store.close()
     }
   }
@@ -90,9 +87,9 @@ async function main(): Promise<void> {
 }
 
 void main().catch(() => {
-  // Configuration errors can contain secret values; never print the thrown object.
+  // Do not log errors that can contain credentials or request bodies.
   console.error(
-    "Reina startup failed. Check the required configuration and operating instructions.",
+    "Reina startup failed. Check the private state directory, ENCRYPTION_KEY, and web configuration.",
   )
   process.exitCode = 1
 })
