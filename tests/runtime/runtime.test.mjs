@@ -10,7 +10,7 @@ import tar from "tar-stream"
 import { ModelGateway } from "../../dist/agent/model-gateway.js"
 import { DockerRuntime, dockerCommand } from "../../dist/agent/sandbox.js"
 import { artifactHash, validateArtifact } from "../../dist/agent/validate.js"
-import { baseline, lock, manifest, prepareFixture } from "./fixture.mjs"
+import { baseline, fixtureTag, lock, manifest, prepareFixture } from "./fixture.mjs"
 import { fakeModel } from "./model.mjs"
 
 let model
@@ -60,7 +60,8 @@ async function activeContainers() {
 
 before(
   async () => {
-    const image = await prepareFixture()
+    const imageTag = fixtureTag("runtime")
+    const image = await prepareFixture(imageTag)
     directory = await mkdtemp(path.join(os.tmpdir(), "reina-runtime-tests-"))
     model = await fakeModel()
     config = {
@@ -89,20 +90,16 @@ before(
     runtime = new DockerRuntime(config)
     await runtime.preflight()
     const dockerfile = Buffer.from(
-      "FROM reina-runtime-fixture:local\nCOPY protocol-fixture.mjs /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js\n",
+      `FROM ${imageTag}\nCOPY protocol-fixture.mjs /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js\n`,
     )
-    await checked(
-      ["build", "--pull=false", "--network=none", "--tag", "reina-protocol-fixture:local", "-"],
-      {
-        input: await context([
-          ["Dockerfile", dockerfile],
-          ["protocol-fixture.mjs", await readFile("tests/runtime/protocol-fixture.mjs")],
-        ]),
-      },
-    )
-    protocolImage = (
-      await checked(["image", "inspect", "--format", "{{.Id}}", "reina-protocol-fixture:local"])
-    ).stdout
+    const protocolTag = fixtureTag("protocol")
+    await checked(["build", "--pull=false", "--network=none", "--tag", protocolTag, "-"], {
+      input: await context([
+        ["Dockerfile", dockerfile],
+        ["protocol-fixture.mjs", await readFile("tests/runtime/protocol-fixture.mjs")],
+      ]),
+    })
+    protocolImage = (await checked(["image", "inspect", "--format", "{{.Id}}", protocolTag])).stdout
       .toString()
       .trim()
   },
@@ -247,7 +244,7 @@ test("prepared images reject non-registry dependencies and wrong tarball integri
       await writeFile(path.join(source, "package-lock.json"), JSON.stringify(altered))
       const child = spawn(
         process.execPath,
-        ["scripts/prepare-worker.mjs", source, "reina-rejected-fixture:local"],
+        ["scripts/prepare-worker.mjs", source, fixtureTag("rejected")],
         { stdio: ["ignore", "ignore", "pipe"] },
       )
       let stderr = ""
@@ -281,7 +278,7 @@ test("actual Pi triage uses read-only tools and returns one decision object", {
 }, async () => {
   const start = model.calls.length
   const result = await runtime.triage(baseline, "CASE:TRIAGE", controller().signal)
-  assert.equal(JSON.parse(result).eligible, true)
+  assert.equal(JSON.parse(result).fix.eligible, true)
   const calls = model.calls.slice(start)
   assert.equal(calls.length, 2)
   assert.deepEqual(
@@ -298,6 +295,20 @@ test("actual Pi zero-exit provider failure is rejected without retries", {
   await assert.rejects(runtime.code(baseline, "CASE:ERROR", controller().signal), /pi_agent_error/)
   assert.equal(model.calls.length - start, 1)
   assert.deepEqual(await activeContainers(), [])
+})
+
+test("triage exposes host-owned transient failures without retrying permanent provider errors", {
+  timeout: 60000,
+}, async () => {
+  for (const [task, code] of [
+    ["CASE:ERROR", "model_request_transient"],
+    ["CASE:DENIED", "pi_agent_error"],
+  ]) {
+    const start = model.calls.length
+    await assert.rejects(runtime.triage(baseline, task, controller().signal), { message: code })
+    assert.equal(model.calls.length - start, 1)
+    assert.deepEqual(await activeContainers(), [])
+  }
 })
 
 async function hanging(phase, check) {

@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto"
+import { randomUUID } from "node:crypto"
 import { z } from "zod"
 import { authorize } from "../github/approval.js"
 import type { Publisher } from "../github/publisher.js"
@@ -10,10 +10,11 @@ import {
   GitHubIssueDeferred,
   sameRepository,
 } from "../github/scanner.js"
-import { fingerprint, policyHash } from "../triage/policy.js"
-import { triage } from "../triage/service.js"
+import { fingerprint, makeProposal, policyHash } from "../triage/policy.js"
+import type { ReviewInvalidation } from "../triage/review.js"
 import type { AgentRuntime, Config, Issue, IssueRef, Job, Logger, Proposal } from "../types.js"
 import type { Store } from "./store.js"
+import { IssueTriage } from "./triage.js"
 import { Worker } from "./worker.js"
 
 const refSchema = z.object({
@@ -39,6 +40,7 @@ export const workSchema = z.discriminatedUnion("kind", [
     material: z.boolean(),
     cancel: z.boolean(),
   }),
+  z.object({ kind: z.literal("review"), ref: refSchema }),
   z.object({ kind: z.literal("scan"), reason: z.string() }),
   z.object({ kind: z.literal("invalidate"), branch: z.string().optional(), disable: z.boolean() }),
 ])
@@ -107,7 +109,9 @@ export class Orchestrator {
   private scanTimer?: ReturnType<typeof setInterval>
   private controllers = new Map<string, AbortController>()
   private controllerBranches = new Map<string, string>()
+  private controllerRefs = new Map<string, IssueRef>()
   private worker: Worker
+  private reviews: IssueTriage
 
   constructor(
     private config: Config,
@@ -118,10 +122,13 @@ export class Orchestrator {
     private log: Logger,
   ) {
     this.worker = new Worker(config, store, runtime, botId, log)
+    this.reviews = new IssueTriage(config, store, runtime, botId, (event, ref, fields) =>
+      this.event(event, ref, fields),
+    )
   }
 
   private event(event: string, ref?: IssueRef, extra: Record<string, unknown> = {}): void {
-    const level = ["failed", "execution_failed", "recovery_failed"].includes(event)
+    const level = ["failed", "execution_failed", "recovery_failed", "triage_failed"].includes(event)
       ? "error"
       : "info"
     this.log[level]({
@@ -147,8 +154,43 @@ export class Orchestrator {
               .filter((proposal) => !validated.branch || proposal.baseBranch === validated.branch)
               .map((proposal) => proposal.ref)
           : []
-    if (!this.store.acceptDelivery(deliveryId, JSON.parse(JSON.stringify(validated)), revoked))
+    const invalidations = new Map<string, ReviewInvalidation>()
+    if (validated.kind === "issue" && (validated.material || validated.cancel)) {
+      invalidations.set(key(validated.ref), {
+        ref: validated.ref,
+        reason:
+          validated.action === "closed"
+            ? "closed"
+            : validated.label === "bot:skip"
+              ? "skipped"
+              : validated.action === "deleted"
+                ? "unavailable"
+                : "changed",
+      })
+    }
+    if (validated.kind === "invalidate") {
+      const reason = validated.disable ? "unavailable" : "changed"
+      for (const ref of revoked) invalidations.set(key(ref), { ref, reason })
+      for (const [issueKey, ref] of this.controllerRefs) {
+        if (!validated.branch || this.controllerBranches.get(issueKey) === validated.branch)
+          invalidations.set(issueKey, { ref, reason })
+      }
+    }
+    if (
+      !this.store.acceptDelivery(deliveryId, JSON.parse(JSON.stringify(validated)), revoked, [
+        ...invalidations.values(),
+      ])
+    )
       return
+    for (const { ref, reason } of invalidations.values()) {
+      const review = this.store.review(ref)
+      if (review)
+        this.event("triage_stale", ref, {
+          correlationId: deliveryId,
+          revision: review.revision,
+          reason,
+        })
+    }
     for (const ref of revoked) this.cancel(ref, true)
     if (validated.kind === "invalidate") {
       if (validated.disable) this.disabled = true
@@ -234,9 +276,27 @@ export class Orchestrator {
       const work = parsed.data
       try {
         if (work.kind === "issue" && !this.disabled) await this.issue(work, delivery.id)
+        if (work.kind === "review" && !this.disabled) {
+          await this.issue(
+            { kind: "issue", ref: work.ref, action: "reconcile", material: false, cancel: false },
+            delivery.id,
+          )
+        }
+        if (work.kind === "invalidate" && !this.disabled) {
+          this.store.acceptDelivery(`${delivery.id}-reviews`, {
+            kind: "scan",
+            reason: "repository_changed",
+          })
+        }
         if (work.kind === "scan" && !this.disabled) {
           const { github } = await this.boundaries()
           if (this.stopped) return
+          for (const review of this.store.reviewBatch(this.config.maxIssuesPerScan)) {
+            this.store.acceptDelivery(`${delivery.id}-review-${review.ref.issueId}`, {
+              kind: "review",
+              ref: review.ref,
+            } satisfies Work)
+          }
           const batch = await github.discover(this.config.maxIssuesPerScan, this.store.scanPage())
           for (const number of batch.numbers) {
             if (this.stopped) return
@@ -324,25 +384,57 @@ export class Orchestrator {
   ): Promise<void> {
     const { github, publisher } = await this.boundaries()
     if (this.stopped) return
-    const issue = await github.issue(work.ref.number)
+    let issue: Issue
+    try {
+      issue = await github.issue(work.ref.number)
+    } catch (error) {
+      if (
+        this.store.review(work.ref) &&
+        (error instanceof GitHubIssueDeferred || [404, 410].includes(errorStatus(error) ?? 0))
+      ) {
+        const invalidated = this.reviews.invalidate(work.ref, "unavailable", correlationId)
+        if (invalidated) {
+          const review = {
+            ...invalidated,
+            error:
+              error instanceof GitHubIssueDeferred
+                ? "triage_evidence_unavailable"
+                : "triage_issue_unavailable",
+            updatedAt: Math.max(Date.now(), invalidated.updatedAt),
+          }
+          if (!this.store.saveReview(review, invalidated.revision)) throw new Error("triage_stale")
+          try {
+            await this.reviews.project(review, publisher, this.shutdown.signal, correlationId)
+          } catch (publication) {
+            if (publication instanceof GitHubDeferred) throw publication
+            this.event("deferred", work.ref, {
+              correlationId,
+              revision: review.revision,
+              reason: "triage_projection_unavailable",
+            })
+          }
+        }
+      }
+      throw error
+    }
     if (this.stopped) return
     if (!this.enabled(issue.ref) || issue.ref.issueId !== work.ref.issueId)
       throw new Error("issue_identity_changed")
     this.event("discovered", issue.ref, { correlationId })
     if (issue.state !== "open" || issue.pullRequest || issue.labels.includes("bot:skip")) {
       this.cancel(issue.ref)
+      await this.reviews.inactive(
+        issue.ref,
+        issue.state === "closed"
+          ? "closed"
+          : issue.labels.includes("bot:skip")
+            ? "skipped"
+            : "unavailable",
+        publisher,
+        this.shutdown.signal,
+        correlationId,
+      )
       await publisher.labels(issue.ref.number, [], ["fix_available", "bot:approved", "bot:working"])
-      return
-    }
-    const existing = this.store
-      .jobs()
-      .find((job) => key(job.ref) === key(issue.ref) && job.state === "pr_ready")
-    if (existing) {
-      await publisher.labels(issue.ref.number, ["bot:pr_ready"], ["bot:working", "bot:failed"])
-      return
-    }
-    if (work.cancel) {
-      await publisher.labels(issue.ref.number, [], ["fix_available", "bot:working"])
       return
     }
     let proposal = this.store.proposal(issue.ref)
@@ -360,6 +452,38 @@ export class Orchestrator {
       this.cancel(issue.ref)
       await publisher.labels(issue.ref.number, [], ["fix_available", "bot:approved", "bot:working"])
       proposal = undefined
+    }
+    const controller = new AbortController()
+    const signal = AbortSignal.any([controller.signal, this.shutdown.signal])
+    this.controllers.set(key(issue.ref), controller)
+    this.controllerBranches.set(key(issue.ref), head.branch)
+    this.controllerRefs.set(key(issue.ref), issue.ref)
+    let review: Awaited<ReturnType<IssueTriage["run"]>>
+    try {
+      review = await this.reviews.run(issue, head, github, publisher, signal, correlationId)
+    } finally {
+      if (this.controllers.get(key(issue.ref)) === controller) {
+        this.controllers.delete(key(issue.ref))
+        this.controllerBranches.delete(key(issue.ref))
+        this.controllerRefs.delete(key(issue.ref))
+      }
+    }
+    if (this.stopped || signal.aborted || review?.state !== "complete") return
+    const existing = this.store
+      .jobs()
+      .find((job) => key(job.ref) === key(issue.ref) && job.state === "pr_ready")
+    if (existing) {
+      await publisher.labels(issue.ref.number, ["bot:pr_ready"], ["bot:working", "bot:failed"])
+      return
+    }
+    if (work.cancel) {
+      await publisher.labels(issue.ref.number, [], ["fix_available", "bot:working"])
+      return
+    }
+    if (review.outcome !== "fix_candidate") {
+      if (proposal) this.cancel(issue.ref)
+      await publisher.labels(issue.ref.number, [], ["fix_available", "bot:approved", "bot:working"])
+      return
     }
     if (proposal && !proposal.commentId) {
       Object.assign(
@@ -392,58 +516,42 @@ export class Orchestrator {
     if (issue.labels.includes("bot:approved"))
       await publisher.labels(issue.ref.number, [], ["bot:approved"])
     if ((await github.conflicts(issue.ref.number)) || this.stopped) return
-    const assessment = createHash("sha256")
-      .update(
-        JSON.stringify([
-          issue.ref.id,
-          issue.ref.issueId,
-          fingerprint(issue, this.botId),
-          head.sha,
-          policyHash(this.config),
-          Math.floor(Date.now() / 86_400_000),
-        ]),
-      )
-      .digest("hex")
-    if (this.store.assessed(assessment)) return
     const snapshot = await github.snapshotAt(head.branch, head.sha)
-    if (this.stopped) return
-    this.store.rememberAssessment(assessment)
-    const controller = new AbortController()
-    const signal = AbortSignal.any([controller.signal, this.shutdown.signal])
-    this.controllers.set(key(issue.ref), controller)
-    this.controllerBranches.set(key(issue.ref), snapshot.branch)
-    try {
-      this.event("triage_started", issue.ref, { correlationId })
-      proposal = await triage(issue, snapshot, this.config, this.runtime, this.botId, signal)
-      signal.throwIfAborted()
-      this.event("triage_decision", issue.ref, { correlationId, eligible: Boolean(proposal) })
-      if (!proposal) return
-      const current = await github.issue(issue.ref.number)
-      const currentHead = await github.head()
-      if (
-        current.state !== "open" ||
-        current.labels.includes("bot:skip") ||
-        fingerprint(current, this.botId) !== proposal.fingerprint ||
-        currentHead.sha !== proposal.baseSha ||
-        currentHead.branch !== proposal.baseBranch
-      ) {
-        throw new Error("proposal_stale")
-      }
-      signal.throwIfAborted()
-      this.store.saveProposal(proposal)
-      Object.assign(
-        proposal,
-        await publisher.propose(proposal, (value) => this.store.saveProposal(value)),
-      )
-      this.store.saveProposal(proposal)
-      await publisher.labels(issue.ref.number, ["fix_available"], ["bot:failed", "bot:working"])
-      this.event("proposal_created", issue.ref, { correlationId, proposalId: proposal.revision })
-    } finally {
-      if (this.controllers.get(key(issue.ref)) === controller) {
-        this.controllers.delete(key(issue.ref))
-        this.controllerBranches.delete(key(issue.ref))
-      }
-    }
+    const current = await github.issue(issue.ref.number)
+    const currentHead = await github.head()
+    if (
+      this.stopped ||
+      current.state !== "open" ||
+      current.labels.includes("bot:skip") ||
+      fingerprint(current, this.botId) !== review.binding.fingerprint ||
+      currentHead.sha !== review.binding.baseSha ||
+      currentHead.branch !== review.binding.baseBranch ||
+      this.store.review(issue.ref)?.revision !== review.revision
+    )
+      return
+    if (
+      !review.assessment ||
+      review.assessedAt === undefined ||
+      review.assessedAt + 86_400_000 <= Date.now()
+    )
+      return
+    proposal = makeProposal(
+      current,
+      snapshot,
+      review.assessment.fix,
+      this.config,
+      this.botId,
+      review.assessedAt,
+      review.revision,
+    )
+    this.store.saveProposal(proposal)
+    Object.assign(
+      proposal,
+      await publisher.propose(proposal, (value) => this.store.saveProposal(value)),
+    )
+    this.store.saveProposal(proposal)
+    await publisher.labels(issue.ref.number, ["fix_available"], ["bot:failed", "bot:working"])
+    this.event("proposal_created", issue.ref, { correlationId, proposalId: proposal.revision })
   }
 
   private async execute(
@@ -457,6 +565,7 @@ export class Orchestrator {
     const signal = AbortSignal.any([controller.signal, this.shutdown.signal])
     this.controllers.set(key(job.ref), controller)
     this.controllerBranches.set(key(job.ref), proposal.baseBranch)
+    this.controllerRefs.set(key(job.ref), job.ref)
     this.event("dispatched", job.ref, { jobId: job.id, proposalId: proposal.revision })
     try {
       await this.worker.run(job, proposal, github, publisher, signal)
@@ -525,6 +634,7 @@ export class Orchestrator {
       if (this.controllers.get(key(job.ref)) === controller) {
         this.controllers.delete(key(job.ref))
         this.controllerBranches.delete(key(job.ref))
+        this.controllerRefs.delete(key(job.ref))
       }
     }
   }

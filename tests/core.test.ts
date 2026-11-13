@@ -638,6 +638,28 @@ describe("triage schema and policy", () => {
     ).not.toBe(originalHash)
   })
 
+  test("host review cycles bind new proposals without changing legacy serialized fields", () => {
+    const now = 1_800_000_000_000
+    const firstCycle = "7505fea0-79f6-4163-a3ee-4213e4e934c8"
+    const secondCycle = "0ec47f5f-f377-4669-87a5-18dd3e99cb47"
+    const legacy = makeProposal(issue(), snapshot(), decision(), config(), 99, now)
+    const first = makeProposal(issue(), snapshot(), decision(), config(), 99, now, firstCycle)
+    const repeated = makeProposal(issue(), snapshot(), decision(), config(), 99, now, firstCycle)
+    const second = makeProposal(issue(), snapshot(), decision(), config(), 99, now, secondCycle)
+    expect(first).toEqual(repeated)
+    expect(first.revision).not.toBe(second.revision)
+    expect(first.revision).not.toBe(legacy.revision)
+    const { revision: _first, ...firstFields } = first
+    const { revision: _legacy, ...legacyFields } = legacy
+    expect(firstFields).toEqual(legacyFields)
+    expect(makeProposal(issue(), snapshot(), decision(), config(), 99, now, undefined)).toEqual(
+      legacy,
+    )
+    expect(() =>
+      makeProposal(issue(), snapshot(), decision(), config(), 99, now, "untrusted"),
+    ).toThrow()
+  })
+
   test("model API and revision changes invalidate policy and proposals, but key rotation does not", () => {
     const now = 1_800_000_000_000
     const original: Config = {
@@ -825,7 +847,8 @@ describe("durable store", () => {
       store.close()
       const path = join(directory, "state", "reina.sqlite")
       const db = new DatabaseSync(path)
-      db.exec(`ALTER TABLE deliveries DROP COLUMN global_until;
+      db.exec(`DROP TABLE reviews; DROP TABLE review_cursor;
+        ALTER TABLE deliveries DROP COLUMN global_until;
         ${version < 3 ? "DROP TABLE scan_cursor; DROP INDEX one_active_job_slot;" : ""}
         ${version === 1 ? "DROP TABLE assessments;" : ""}
         PRAGMA user_version = ${version};`)
@@ -838,7 +861,7 @@ describe("durable store", () => {
       expect(store.assessed("migrated")).toBe(true)
       const migrated = new DatabaseSync(path, { readOnly: true })
       try {
-        expect(migrated.prepare("PRAGMA user_version").get()?.user_version).toBe(4)
+        expect(migrated.prepare("PRAGMA user_version").get()?.user_version).toBe(5)
         expect(
           migrated
             .prepare("SELECT id,global_until FROM deliveries ORDER BY id")
@@ -862,6 +885,42 @@ describe("durable store", () => {
       expect(openStore().blockedUntil()).toBe(now + 3_000)
     },
   )
+
+  test("migrates schema 4 without inventing reviews or changing proposal and job authority", () => {
+    let store = openStore()
+    const value = proposal()
+    store.saveProposal(value)
+    const authority = approval(value)
+    const job = publishing(store, required(store.claim(value, authority)))
+    store.rememberAssessment("legacy-attempt-not-a-completed-review")
+    store.acceptDelivery("legacy-delivery", { kind: "issue", ref: value.ref })
+    store.saveScanPage(17)
+    store.close()
+    const path = join(directory, "state", "reina.sqlite")
+    const db = new DatabaseSync(path)
+    db.exec("DROP TABLE reviews; DROP TABLE review_cursor; PRAGMA user_version = 4;")
+    db.close()
+
+    store = openStore()
+    expect(store.proposal(value.ref)).toEqual(value)
+    expect(store.job(job.id)).toEqual(job)
+    expect(store.claim(value, authority)).toBeUndefined()
+    expect(store.assessed("legacy-attempt-not-a-completed-review")).toBe(true)
+    expect(store.review(value.ref)).toBeUndefined()
+    expect(store.reviewBatch(10)).toEqual([])
+    expect(store.scanPage()).toBe(17)
+    expect(store.deliveries()).toEqual([
+      { id: "legacy-delivery", payload: { kind: "issue", ref: value.ref } },
+    ])
+    const migrated = new DatabaseSync(path, { readOnly: true })
+    try {
+      expect(migrated.prepare("PRAGMA user_version").get()?.user_version).toBe(5)
+      expect(migrated.prepare("SELECT COUNT(*) AS count FROM reviews").get()?.count).toBe(0)
+      expect(migrated.prepare("SELECT COUNT(*) AS count FROM review_cursor").get()?.count).toBe(1)
+    } finally {
+      migrated.close()
+    }
+  })
 
   test("persists the bounded single-repository scan cursor", () => {
     let store = openStore()
@@ -1179,6 +1238,8 @@ describe("durable store", () => {
       () => store.rememberAssessment("x"),
       () => store.scanPage(),
       () => store.saveScanPage(2),
+      () => store.review(issue().ref),
+      () => store.reviewBatch(10),
     ])
       expect(operation).toThrow(/closed/)
     expect(() => openStore()).not.toThrow()

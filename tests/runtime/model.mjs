@@ -37,6 +37,10 @@ export async function fakeModel() {
       res.end(`data: ${"x".repeat(4 * 1024 * 1024 + 1)}\n\n`)
       return
     }
+    if (task.includes("CASE:DENIED")) {
+      res.writeHead(401).end('{"error":{"message":"fixture authorization denied"}}')
+      return
+    }
     if (task.includes("CASE:ERROR")) {
       res.writeHead(503).end('{"error":{"message":"fixture failure"}}')
       return
@@ -68,14 +72,19 @@ export async function fakeModel() {
     } else {
       const text = task.includes("CASE:TRIAGE")
         ? JSON.stringify({
-            eligible: true,
-            category: "typo",
-            reason: "One typo has a specified correction.",
-            proposedFix: "Correct the specified word.",
-            affectedFiles: ["src/message.txt"],
-            verificationPlan: ["Run the baseline check."],
-            requiresHumanDecision: false,
-            risks: [],
+            kind: "documentation",
+            summary: "One typo has a specified correction.",
+            missingInfo: [],
+            fix: {
+              eligible: true,
+              category: "typo",
+              reason: "One typo has a specified correction.",
+              proposedFix: "Correct the specified word.",
+              affectedFiles: ["src/message.txt"],
+              verificationPlan: ["Run the baseline check."],
+              requiresHumanDecision: false,
+              risks: [],
+            },
           })
         : "completed\u2028safely\u2029日本語"
       send({ role: "assistant", content: text })

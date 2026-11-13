@@ -10,8 +10,11 @@ import { artifactHash } from "../src/agent/validate.js"
 import { httpServer, register, sanitizeWebhook, webhookWork } from "../src/app.js"
 import { Publisher, proposalBody } from "../src/github/publisher.js"
 import { branchFor, GitHub, type GitHubClient } from "../src/github/scanner.js"
+import { publishReview } from "../src/github/triage.js"
 import { Orchestrator } from "../src/jobs/orchestrator.js"
 import { Store } from "../src/jobs/store.js"
+import type { Assessment } from "../src/triage/assessment.js"
+import { REVIEW_LABELS, type Review } from "../src/triage/review.js"
 import type {
   Actor,
   AgentRuntime,
@@ -139,11 +142,20 @@ function triageDecision(): TriageDecision {
   }
 }
 
+function triageAssessment(): Assessment {
+  return {
+    kind: "documentation",
+    summary: "The usage example has an incorrect command name.",
+    missingInfo: [],
+    fix: triageDecision(),
+  }
+}
+
 function controlledRuntime(value: Config) {
   return {
     preflight: vi.fn<AgentRuntime["preflight"]>(async () => {}),
     cleanup: vi.fn<AgentRuntime["cleanup"]>(async () => {}),
-    triage: vi.fn<AgentRuntime["triage"]>(async () => JSON.stringify(triageDecision())),
+    triage: vi.fn<AgentRuntime["triage"]>(async () => JSON.stringify(triageAssessment())),
     code: vi.fn<AgentRuntime["code"]>(async (snapshot, _prompt, signal) => {
       signal.throwIfAborted()
       return {
@@ -200,6 +212,114 @@ class MockGitHub extends GitHub {
       state: "open",
       pullRequest: false,
     }
+    Object.assign(this.client, this.api)
+  }
+
+  private scoped(params: {
+    owner: string
+    repo: string
+    issue_number?: number
+    request?: { retries: number }
+  }) {
+    expect(params.owner).toBe(this.repository.owner)
+    expect(params.repo).toBe(this.repository.name)
+    expect(params.request?.retries).toBe(0)
+    if (params.issue_number !== undefined)
+      expect(params.issue_number).toBe(this.currentIssue.ref.number)
+  }
+
+  private reviewComment(id: number) {
+    const comment = this.remoteComments.find((comment) => comment.id === id)
+    if (!comment) throw Object.assign(new Error("fixture_comment_missing"), { status: 404 })
+    expect(comment.body.startsWith("<!-- reina:triage:")).toBe(true)
+    return comment
+  }
+
+  api = {
+    auth: vi.fn(async () => ({
+      tokenType: "installation",
+      installationId: this.repository.installationId,
+    })),
+    rest: {
+      repos: {
+        get: vi.fn(async (params: { owner: string; repo: string }) => {
+          this.scoped(params)
+          return { data: { ...this.repository, owner: { login: this.repository.owner } } }
+        }),
+      },
+      issues: {
+        get: vi.fn(async (params: { owner: string; repo: string; issue_number: number }) => {
+          this.scoped(params)
+          return {
+            data: {
+              id: this.currentIssue.ref.issueId,
+              number: this.currentIssue.ref.number,
+              state: this.currentIssue.state,
+              labels: [...this.currentIssue.labels],
+              pull_request: this.currentIssue.pullRequest ? {} : undefined,
+            },
+          }
+        }),
+        getComment: vi.fn(async (params: { owner: string; repo: string; comment_id: number }) => {
+          this.scoped(params)
+          return { data: structuredClone(this.reviewComment(params.comment_id)) }
+        }),
+        createComment: vi.fn(
+          async (params: { owner: string; repo: string; issue_number: number; body: string }) => {
+            this.scoped(params)
+            expect(params.body.startsWith("<!-- reina:triage:456:1012 -->\n")).toBe(true)
+            expect(this.remoteComments.some((comment) => comment.id === 400)).toBe(false)
+            const comment = {
+              id: 400,
+              body: params.body,
+              user: { id: botId, type: "Bot", login: "reina[bot]" },
+              created_at: new Date(Date.now()).toISOString(),
+            }
+            this.remoteComments.push(comment)
+            this.currentIssue.comments.push({ id: 400, authorId: botId, body: params.body })
+            return { data: structuredClone(comment) }
+          },
+        ),
+        updateComment: vi.fn(
+          async (params: { owner: string; repo: string; comment_id: number; body: string }) => {
+            this.scoped(params)
+            const comment = this.reviewComment(params.comment_id)
+            comment.body = params.body
+            required(this.currentIssue.comments.find((item) => item.id === comment.id)).body =
+              params.body
+            return { data: structuredClone(comment) }
+          },
+        ),
+        getLabel: vi.fn(async (params: { owner: string; repo: string; name: string }) => {
+          this.scoped(params)
+          expect(REVIEW_LABELS).toContain(params.name)
+          return { data: { name: params.name } }
+        }),
+        addLabels: vi.fn(
+          async (params: {
+            owner: string
+            repo: string
+            issue_number: number
+            labels: string[]
+          }) => {
+            this.scoped(params)
+            for (const name of params.labels) expect(REVIEW_LABELS).toContain(name)
+            this.currentIssue.labels = [...new Set([...this.currentIssue.labels, ...params.labels])]
+            return { data: [...this.currentIssue.labels] }
+          },
+        ),
+        removeLabel: vi.fn(
+          async (params: { owner: string; repo: string; issue_number: number; name: string }) => {
+            this.scoped(params)
+            expect(REVIEW_LABELS).toContain(params.name)
+            this.currentIssue.labels = this.currentIssue.labels.filter(
+              (name) => name !== params.name,
+            )
+            return { data: [...this.currentIssue.labels] }
+          },
+        ),
+      },
+    },
   }
 
   override issue = vi.fn(
@@ -277,6 +397,10 @@ class MockPublisher extends Publisher {
     expect(this.store.proposal(proposal.ref)?.commentIntent).toBe(true)
     return this.createComment(proposal)
   })
+
+  override review = vi.fn((review: Review, save: (value: Review) => void, signal?: AbortSignal) =>
+    publishReview(this.reader, review, save, signal),
+  )
 
   override labels = vi.fn(async (_number: number, add: string[], remove: string[]) => {
     if (remove.includes("bot:skip")) throw new Error("maintainer_label_must_not_be_removed")
@@ -660,7 +784,7 @@ describe("signed HTTP ingress and the complete credential-free workflow", () => 
       signal.addEventListener("abort", cancel, { once: true })
       try {
         await Promise.race([release.promise, aborted.promise])
-        return JSON.stringify(triageDecision())
+        return JSON.stringify(triageAssessment())
       } finally {
         signal.removeEventListener("abort", cancel)
       }
@@ -686,8 +810,35 @@ describe("signed HTTP ingress and the complete credential-free workflow", () => 
     await value.orchestrator.drain()
     const proposal = required(value.store.proposal(value.github.currentIssue.ref))
     expect(proposal).toMatchObject({ commentIntent: true, commentId: 500, publishedAt: now })
+    expect(proposal.decision).toEqual(triageDecision())
+    const review = required(value.store.review(value.github.currentIssue.ref))
+    expect(review).toMatchObject({
+      state: "complete",
+      outcome: "fix_candidate",
+      assessment: triageAssessment(),
+      attempts: 1,
+      commentIntent: true,
+      commentId: 400,
+      assessedAt: now,
+      publishedRevision: review.revision,
+    })
+    expect(value.github.remoteComments).toHaveLength(2)
+    const summary = structuredClone(
+      required(value.github.remoteComments.find((item) => item.id === 400)),
+    )
+    expect(summary.body).toContain("<!-- reina:triage:456:1012 -->\n")
+    expect(summary.body).toContain("Next action: fix_candidate")
+    expect(summary.body).toContain("Triage did not modify code or verify a fix.")
+    const proposalComment = structuredClone(
+      required(value.github.remoteComments.find((item) => item.id === proposal.commentId)),
+    )
+    expect(proposalComment.body).toBe(proposalBody(proposal))
+    expect(proposalComment.body).toContain(
+      `<!-- reina:proposal:456:1012:${proposal.revision} -->\n`,
+    )
+    expect(value.github.api.rest.issues.createComment).toHaveBeenCalledTimes(1)
     expect(value.publisher.createComment).toHaveBeenCalledTimes(1)
-    expect(value.github.currentIssue.labels).toEqual(["fix_available"])
+    expect(value.github.currentIssue.labels).toEqual(["bot:triaged", "fix_available"])
     expect(value.runtime.triage.mock.calls[0][1]).toContain(value.github.currentIssue.body)
     expect(value.runtime.triage.mock.calls[0][1]).not.toContain(rawIssueBody)
 
@@ -734,7 +885,12 @@ describe("signed HTTP ingress and the complete credential-free workflow", () => 
     expect(value.store.claim(proposal, jobs[0].approval)).toBeUndefined()
     expect(value.runtime.code).toHaveBeenCalledTimes(1)
     expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
-    expect(value.github.currentIssue.labels).toEqual(["bot:pr_ready"])
+    expect(value.github.currentIssue.labels).toEqual(["bot:triaged", "bot:pr_ready"])
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    expect(value.github.api.rest.issues.createComment).toHaveBeenCalledTimes(1)
+    expect(value.github.api.rest.issues.updateComment).not.toHaveBeenCalled()
+    expect(value.publisher.createComment).toHaveBeenCalledTimes(1)
+    expect(value.github.remoteComments).toEqual([summary, proposalComment])
     expect(JSON.stringify(dispatched)).not.toContain(rawIssueBody)
     expectNoPrivateLogs(value)
   })

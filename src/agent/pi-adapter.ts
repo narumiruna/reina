@@ -17,6 +17,7 @@ import { stream as responsesStream } from "@earendil-works/pi-ai/api/openai-resp
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript"
 import { providerFetch, validateProviderUrl } from "../settings/network.js"
 import type { ModelRequest, ModelSelection, SupportedApi } from "../settings/schema.js"
+import { retryableStatus, retryableTransport } from "./failure.js"
 
 export type ModelSnapshot = Pick<ModelSelection, "model" | "modelUrl" | "modelKey"> &
   Partial<Omit<ModelSelection, "model" | "modelUrl" | "modelKey">>
@@ -272,6 +273,7 @@ function limitedFetch(
   fetcher: typeof fetch,
   signal: AbortSignal,
   allowCompressed: boolean,
+  onRetryableFailure?: () => void,
 ): typeof fetch {
   return async (input, init) => {
     signal.throwIfAborted()
@@ -289,10 +291,17 @@ function limitedFetch(
     )
       throw new Error(FAILURE)
     const requestSignal = init?.signal ? AbortSignal.any([signal, init.signal]) : signal
-    const response = await abortable(
-      fetcher(input, { ...init, signal: requestSignal, redirect: "error" }),
-      requestSignal,
-    )
+    let response: Response
+    try {
+      response = await abortable(
+        fetcher(input, { ...init, signal: requestSignal, redirect: "error" }),
+        requestSignal,
+      )
+    } catch (error) {
+      if (!requestSignal.aborted && retryableTransport(error)) onRetryableFailure?.()
+      throw new Error(FAILURE)
+    }
+    if (!requestSignal.aborted && retryableStatus(response.status)) onRetryableFailure?.()
     if (
       !response.ok ||
       !response.headers.get("content-type")?.startsWith("text/event-stream") ||
@@ -313,7 +322,8 @@ function limitedFetch(
             bytes += next.value.byteLength
             if (bytes > RESPONSE_LIMIT) throw new Error(FAILURE)
             controller.enqueue(next.value)
-          } catch {
+          } catch (error) {
+            if (!requestSignal.aborted && retryableTransport(error)) onRetryableFailure?.()
             await reader.cancel().catch(() => {})
             controller.error(new Error(FAILURE))
           }
@@ -485,9 +495,12 @@ export async function* piChatStream(
   signal: AbortSignal,
   fetcher?: typeof fetch,
   state?: AdapterState,
+  onRetryableFailure?: () => void,
 ): AsyncGenerator<string> {
+  const callerSignal = signal
+  const timeout = AbortSignal.timeout(60_000)
   try {
-    signal = AbortSignal.any([signal, AbortSignal.timeout(60_000)])
+    signal = AbortSignal.any([callerSignal, timeout])
     signal.throwIfAborted()
     // Validate history before resolving credentials (which can refresh over the network).
     const context = toPiContext(config, data, state)
@@ -521,6 +534,7 @@ export async function* piChatStream(
       fetcher ?? providerFetch(model.baseUrl),
       signal,
       model.api === "openai-codex-responses",
+      onRetryableFailure,
     )
     const id = `chatcmpl-${randomUUID()}`
     const created = Math.floor(Date.now() / 1000)
@@ -691,6 +705,7 @@ export async function* piChatStream(
     if (continuation) state?.remember(continuation, publicIds)
     yield "data: [DONE]\n\n"
   } catch {
+    if (timeout.aborted && !callerSignal.aborted) onRetryableFailure?.()
     throw new Error(FAILURE)
   }
 }

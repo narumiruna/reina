@@ -1,4 +1,5 @@
 import { artifactHash } from "../agent/validate.js"
+import { REVIEW_LABELS, type Review } from "../triage/review.js"
 import type { Artifact, Job, Proposal, Repository } from "../types.js"
 import {
   branchFor,
@@ -20,6 +21,7 @@ import {
   sameRepository,
   validSha,
 } from "./scanner.js"
+import { publishReview } from "./triage.js"
 
 function requireRef(repository: Repository, proposal: Proposal): void {
   if (!sameRepository(repository, proposal.ref) || !/^[a-z\d_-]{1,128}$/i.test(proposal.revision)) {
@@ -276,6 +278,14 @@ export class Publisher {
     return { commentId: numericId(comment.id), publishedAt }
   }
 
+  async review(
+    review: Review,
+    save: (review: Review) => void,
+    signal?: AbortSignal,
+  ): Promise<Review> {
+    return publishReview(this.github, review, save, signal)
+  }
+
   async labels(number: number, add: string[], remove: string[]): Promise<void> {
     numericId(number)
     const controlled = [
@@ -284,6 +294,7 @@ export class Publisher {
       "bot:working",
       "bot:pr_ready",
       "bot:failed",
+      ...REVIEW_LABELS,
     ]
     if (
       [...add, ...remove].some((label) => !controlled.includes(label)) ||
@@ -302,6 +313,14 @@ export class Publisher {
       data.labels.map((label) => (typeof label === "string" ? label : label.name)),
     )
     const missing = [...new Set(add)].filter((label) => !current.has(label))
+    for (const name of missing.filter((label) =>
+      (REVIEW_LABELS as readonly string[]).includes(label),
+    )) {
+      const { data: definition } = await githubRead(() =>
+        this.github.client.rest.issues.getLabel({ ...this.github.coordinates, name }),
+      )
+      if (definition.name !== name) throw new GitHubError("publication_label_mismatch")
+    }
     if (missing.length)
       await githubWrite(() =>
         this.github.client.rest.issues.addLabels({

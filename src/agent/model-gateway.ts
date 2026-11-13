@@ -4,6 +4,7 @@ import http, { type IncomingMessage, type ServerResponse } from "node:http"
 import https from "node:https"
 import { publicLookup, validateProviderUrl } from "../settings/network.js"
 import { supportedApis } from "../settings/schema.js"
+import { retryableStatus, retryableTransport } from "./failure.js"
 import { AdapterState, type ModelSnapshot, piChatStream, toPiContext } from "./pi-adapter.js"
 
 const BODY_LIMIT = 1024 * 1024
@@ -43,7 +44,14 @@ export class ModelGateway {
   private readonly endpoint: URL
   private remaining: number
   private revoked = false
+  private failure = false
+  private requestVersion = 0
   private timer: NodeJS.Timeout | undefined
+
+  /** Host-only evidence from the latest admitted request, never from worker error text. */
+  get retryableFailure(): boolean {
+    return this.failure
+  }
 
   constructor(
     config: ModelSnapshot,
@@ -152,6 +160,12 @@ export class ModelGateway {
         req.resume()
         return
       }
+      const version = ++this.requestVersion
+      this.failure = false
+      const setFailure = (retryable: boolean) => {
+        if (version === this.requestVersion && !this.revoked && Date.now() < this.expiresAt)
+          this.failure = retryable
+      }
       if (this.remaining-- <= 0) {
         this.deny(res, 429)
         req.resume()
@@ -216,13 +230,13 @@ export class ModelGateway {
         this.deny(res, 400)
         return
       }
+      // Reject malformed tool history before any provider request or SSE output.
+      toPiContext(this.config, data, this.adapterState)
       if (
         this.config.resolveModelRequest ||
         (this.config.modelApi && this.config.modelApi !== "openai-completions")
       ) {
-        // Reject malformed tool history before any provider request or SSE output.
-        toPiContext(this.config, data, this.adapterState)
-        await this.forwardPi(data, res)
+        await this.forwardPi(data, res, setFailure)
         return
       }
       // Never forward URL/routing fields or request headers. The endpoint must support max_tokens.
@@ -240,10 +254,11 @@ export class ModelGateway {
         this.deny(res, 413)
         return
       }
+      const timeoutMs = Math.min(60_000, this.expiresAt - Date.now())
       const upstream = (this.endpoint.protocol === "https:" ? https : http).request(this.endpoint, {
         method: "POST",
         ...(this.config.modelApi ? { lookup: publicLookup, agent: false } : {}),
-        timeout: Math.min(60_000, this.expiresAt - Date.now()),
+        timeout: timeoutMs,
         headers: {
           authorization: `Bearer ${this.config.modelKey}`,
           "content-type": "application/json",
@@ -252,19 +267,24 @@ export class ModelGateway {
         },
       })
       this.active.add(upstream)
+      let stopped = false
       const stop = () => {
+        stopped = true
         upstream.destroy()
         this.active.delete(upstream)
       }
       res.once("close", stop)
       upstream.once("timeout", () => {
-        upstream.destroy()
+        if (!stopped && timeoutMs === 60_000) setFailure(true)
+        stop()
       })
-      upstream.once("error", () => {
+      upstream.once("error", (error) => {
+        if (!stopped && retryableTransport(error)) setFailure(true)
         this.active.delete(upstream)
         this.deny(res, 502)
       })
       upstream.once("response", (response) => {
+        if (!stopped && retryableStatus(response.statusCode ?? 0)) setFailure(true)
         if (
           response.statusCode !== 200 ||
           !response.headers["content-type"]?.startsWith("text/event-stream")
@@ -288,11 +308,13 @@ export class ModelGateway {
         res.on("drain", () => {
           response.resume()
         })
-        response.once("error", () => {
+        response.once("error", (error) => {
+          if (!stopped && retryableTransport(error)) setFailure(true)
           stop()
           res.destroy()
         })
         response.once("end", () => {
+          if (!stopped) setFailure(false)
           this.active.delete(upstream)
           res.end()
         })
@@ -303,11 +325,19 @@ export class ModelGateway {
     }
   }
 
-  private async forwardPi(data: Record<string, unknown>, res: ServerResponse): Promise<void> {
+  private async forwardPi(
+    data: Record<string, unknown>,
+    res: ServerResponse,
+    setFailure: (retryable: boolean) => void,
+  ): Promise<void> {
     const controller = new AbortController()
     this.controllers.add(controller)
     const stop = () => controller.abort()
-    const timer = setTimeout(stop, Math.max(1, Math.min(60_000, this.expiresAt - Date.now())))
+    const timeoutMs = Math.max(1, Math.min(60_000, this.expiresAt - Date.now()))
+    const timer = setTimeout(() => {
+      if (!controller.signal.aborted && timeoutMs === 60_000) setFailure(true)
+      stop()
+    }, timeoutMs)
     timer.unref()
     res.once("close", stop)
     try {
@@ -317,6 +347,9 @@ export class ModelGateway {
         controller.signal,
         undefined,
         this.adapterState,
+        () => {
+          if (!controller.signal.aborted) setFailure(true)
+        },
       )) {
         if (this.revoked || Date.now() >= this.expiresAt) controller.abort()
         controller.signal.throwIfAborted()
@@ -342,6 +375,8 @@ export class ModelGateway {
           })
         }
       }
+      controller.signal.throwIfAborted()
+      setFailure(false)
       res.end()
     } catch {
       this.deny(res, 502)

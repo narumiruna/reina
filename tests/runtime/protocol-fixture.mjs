@@ -26,7 +26,7 @@ if (task.includes("DETACHED") || task.includes("TIMEOUT")) {
     process.execPath,
     [
       "-e",
-      "const fs=require('node:fs');const beat=()=>fs.writeFileSync('/workspace/heartbeat',String(Date.now()));beat();setInterval(beat,5);process.send('ready',()=>process.disconnect());",
+      "const fs=require('node:fs');const beat=()=>fs.writeFileSync('/workspace/heartbeat',String(Date.now()),{mode:0o644});beat();setInterval(beat,5);process.send('ready',()=>process.disconnect());",
     ],
     { detached: true, stdio: ["ignore", "ignore", "ignore", "ipc"] },
   )

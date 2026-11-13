@@ -4,12 +4,27 @@ import { isAbsolute, join, resolve } from "node:path"
 import { DatabaseSync } from "node:sqlite"
 import { z } from "zod"
 import { safePath } from "../triage/policy.js"
+import {
+  REVIEW_RETRY_DELAYS,
+  type Review,
+  type ReviewInvalidation,
+  reviewSchema,
+  staleReview,
+} from "../triage/review.js"
 import { triageSchema } from "../triage/schema.js"
 import type { Approval, IssueRef, Job, JobState, Proposal } from "../types.js"
 
 const positiveId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
 const timestamp = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
 const digest = z.string().regex(/^[a-f0-9]{64}$/)
+const reviewCursorSchema = z
+  .string()
+  .max(33)
+  .regex(/^(?:[1-9][0-9]{0,15}:[1-9][0-9]{0,15})?$/)
+  .refine(
+    (value) =>
+      value === "" || value.split(":").every((id) => positiveId.safeParse(Number(id)).success),
+  )
 const gitSha = z.string().regex(/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i)
 const boundedText = (max: number) =>
   z
@@ -371,9 +386,11 @@ export class Store {
   private migrate(): void {
     const db = this.database()
     const version = db.prepare("PRAGMA user_version").get()?.user_version
-    if (version === 4) return
-    if (version === 1 || version === 2 || version === 3) {
-      this.transaction(() => {
+    if (version === 5) return
+    if (![0, 1, 2, 3, 4].includes(Number(version)))
+      throw new Error("Unsupported state database version")
+    this.transaction(() => {
+      if (version === 1 || version === 2 || version === 3) {
         if (version === 1)
           db.exec(
             "CREATE TABLE assessments (key TEXT PRIMARY KEY, created_at INTEGER NOT NULL) STRICT;",
@@ -385,12 +402,9 @@ export class Store {
         db.exec(`ALTER TABLE deliveries ADD COLUMN global_until INTEGER NOT NULL DEFAULT 0 CHECK(global_until >= 0);
           UPDATE deliveries SET global_until = available_at WHERE attempts > 0;
           PRAGMA user_version = 4;`)
-      })
-      return
-    }
-    if (version !== 0) throw new Error("Unsupported state database version")
-    this.transaction(() => {
-      db.exec(`
+      }
+      if (version === 0)
+        db.exec(`
         CREATE TABLE deliveries (
           id TEXT PRIMARY KEY, payload TEXT, status TEXT NOT NULL CHECK(status IN ('pending','complete','failed')),
           accepted_at INTEGER NOT NULL, available_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 8),
@@ -423,7 +437,20 @@ export class Store {
         CREATE TABLE assessments (key TEXT PRIMARY KEY, created_at INTEGER NOT NULL) STRICT;
         CREATE TABLE scan_cursor (id INTEGER PRIMARY KEY CHECK(id = 1), page INTEGER NOT NULL CHECK(page BETWEEN 1 AND 9007199254740991)) STRICT;
         INSERT INTO scan_cursor(id,page) VALUES(1,1);
-        PRAGMA user_version = 4;
+      `)
+      db.exec(`
+        CREATE TABLE reviews (
+          issue_key TEXT PRIMARY KEY,
+          revision TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('pending','running','assessed','complete','stale','failed')),
+          json TEXT NOT NULL CHECK(length(CAST(json AS BLOB)) <= 65536)
+        ) STRICT;
+        CREATE TABLE review_cursor (
+          id INTEGER PRIMARY KEY CHECK(id = 1),
+          issue_key TEXT NOT NULL
+        ) STRICT;
+        INSERT INTO review_cursor(id,issue_key) VALUES(1,'');
+        PRAGMA user_version = 5;
       `)
     })
   }
@@ -440,6 +467,32 @@ export class Store {
           })
         }
       }
+      const db = this.database()
+      for (const row of db.prepare("SELECT * FROM reviews WHERE state = 'running'").all()) {
+        const review = this.readReview(row)
+        const recovered = validate(
+          reviewSchema,
+          {
+            ...review,
+            state: review.attempts < 3 ? "pending" : "failed",
+            updatedAt: Math.max(Date.now(), review.updatedAt),
+            nextAttemptAt:
+              review.attempts < 3
+                ? Math.max(
+                    review.nextAttemptAt,
+                    Date.now() + (REVIEW_RETRY_DELAYS[review.attempts - 1] ?? 0),
+                  )
+                : 0,
+            error: "triage_interrupted",
+          },
+          "review",
+        )
+        db.prepare("UPDATE reviews SET state = ?, json = ? WHERE issue_key = ?").run(
+          recovered.state,
+          JSON.stringify(recovered),
+          key(recovered.ref),
+        )
+      }
     })
   }
 
@@ -453,6 +506,93 @@ export class Store {
     const value = validate(positiveId, page, "scan cursor")
     if (db.prepare("UPDATE scan_cursor SET page = ? WHERE id = 1").run(value).changes !== 1)
       throw new Error("Missing scan cursor record")
+  }
+
+  private readReview(row: Row): Review {
+    if (typeof row.json !== "string" || Buffer.byteLength(row.json) > 65_536)
+      throw new Error("Invalid persisted review record")
+    const review = parseRecord(reviewSchema, row.json, "review")
+    if (
+      row.issue_key !== key(review.ref) ||
+      row.revision !== review.revision ||
+      row.state !== review.state
+    )
+      throw new Error("Inconsistent review identity")
+    return review
+  }
+
+  review(ref: IssueRef): Review | undefined {
+    const row = this.database().prepare("SELECT * FROM reviews WHERE issue_key = ?").get(key(ref))
+    if (!row) return undefined
+    const review = this.readReview(row)
+    if (!sameRef(review.ref, ref)) throw new Error("Inconsistent review identity")
+    return review
+  }
+
+  saveReview(review: Review, expectedRevision?: string): boolean {
+    const db = this.database()
+    const value = validate(reviewSchema, review, "review")
+    if (expectedRevision !== undefined) validate(z.uuid(), expectedRevision, "review revision")
+    return this.transaction(() => {
+      const row = db.prepare("SELECT * FROM reviews WHERE issue_key = ?").get(key(value.ref))
+      if (!row) {
+        if (expectedRevision !== undefined) return false
+        db.prepare("INSERT INTO reviews(issue_key,revision,state,json) VALUES(?,?,?,?)").run(
+          key(value.ref),
+          value.revision,
+          value.state,
+          JSON.stringify(value),
+        )
+        return true
+      }
+      const previous = this.readReview(row)
+      if (expectedRevision === undefined || previous.revision !== expectedRevision) return false
+      if (
+        value.updatedAt < previous.updatedAt ||
+        !sameRef(value.ref, previous.ref) ||
+        (value.revision === previous.revision &&
+          (stable(value.binding) !== stable(previous.binding) ||
+            value.createdAt !== previous.createdAt ||
+            value.attempts < previous.attempts ||
+            (previous.state === "failed" &&
+              (value.state === "pending" || value.state === "running"))))
+      )
+        throw new Error("Invalid review cycle update")
+      db.prepare("UPDATE reviews SET revision = ?, state = ?, json = ? WHERE issue_key = ?").run(
+        value.revision,
+        value.state,
+        JSON.stringify(value),
+        key(value.ref),
+      )
+      return true
+    })
+  }
+
+  reviewBatch(limit: number): Review[] {
+    const db = this.database()
+    const count = validate(z.number().int().min(1).max(100), limit, "review batch limit")
+    return this.transaction(() => {
+      const cursor = validate(
+        reviewCursorSchema,
+        db.prepare("SELECT issue_key FROM review_cursor WHERE id = 1").get()?.issue_key,
+        "review cursor",
+      )
+      const rows = db
+        .prepare("SELECT * FROM reviews WHERE issue_key > ? ORDER BY issue_key LIMIT ?")
+        .all(cursor, count)
+      if (rows.length < count)
+        rows.push(
+          ...db
+            .prepare("SELECT * FROM reviews WHERE issue_key <= ? ORDER BY issue_key LIMIT ?")
+            .all(cursor, count - rows.length),
+        )
+      const reviews = rows.map((row) => this.readReview(row))
+      const last = reviews.at(-1)
+      db.prepare("UPDATE review_cursor SET issue_key = ? WHERE id = 1").run(
+        last ? key(last.ref) : "",
+      )
+      return reviews
+    })
   }
 
   assessed(assessmentKey: string): boolean {
@@ -471,7 +611,12 @@ export class Store {
     ).run(digest, Date.now())
   }
 
-  acceptDelivery(id: string, payload: unknown, revoked: IssueRef[] = []): boolean {
+  acceptDelivery(
+    id: string,
+    payload: unknown,
+    revoked: IssueRef[] = [],
+    reviews: ReviewInvalidation[] = [],
+  ): boolean {
     const db = this.database()
     deliveryId(id)
     return this.transaction(() => {
@@ -483,6 +628,27 @@ export class Store {
       ).run(id, json, now, now)
       // A received revocation must survive a crash before dispatch or publication recovery.
       for (const ref of revoked) this.invalidateRecords(ref)
+      for (const invalidation of reviews) {
+        const { ref, reason } = validate(
+          z.strictObject({
+            ref: refSchema,
+            reason: z.enum(["changed", "closed", "skipped", "unavailable"]),
+          }),
+          invalidation,
+          "review invalidation",
+        )
+        const row = db.prepare("SELECT * FROM reviews WHERE issue_key = ?").get(key(ref))
+        if (!row) continue
+        const current = this.readReview(row)
+        if (!sameRef(current.ref, ref)) throw new Error("Inconsistent review identity")
+        const review = validate(reviewSchema, staleReview(current, reason, now), "review")
+        db.prepare("UPDATE reviews SET revision = ?, state = ?, json = ? WHERE issue_key = ?").run(
+          review.revision,
+          review.state,
+          JSON.stringify(review),
+          key(ref),
+        )
+      }
       return true
     })
   }

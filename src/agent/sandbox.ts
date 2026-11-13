@@ -15,6 +15,11 @@ import { ARCHIVE_LIMIT, checkSnapshot, parseWorkspaceArchive } from "./archive.j
 import { ModelGateway } from "./model-gateway.js"
 import { PI_VERSION, PiStream, piArguments, trustedModels, trustedSettings } from "./pi.js"
 
+// An empty unauthorized request proves the socket boundary without racing an
+// early 401 against a forwarded body, and cannot make a provider request.
+export const GATEWAY_PROBE =
+  "import http from 'node:http'; const req=http.request('http://127.0.0.1:3210/v1/chat/completions',{method:'POST',headers:{'content-length':'0'}},res=>{res.resume();res.on('end',()=>process.exit(res.statusCode===401?0:1));});req.on('error',()=>process.exit(1));req.end();"
+
 interface CommandOptions {
   input?: Buffer
   signal?: AbortSignal
@@ -273,7 +278,7 @@ export class DockerRuntime implements AgentRuntime {
         "/usr/local/bin/node",
         "--input-type=module",
         "-e",
-        "import http from 'node:http'; const req=http.request('http://127.0.0.1:3210/v1/chat/completions',{method:'POST'},res=>{res.resume();res.on('end',()=>process.exit(res.statusCode===401?0:1));});req.on('error',()=>process.exit(1));req.end('{}');",
+        GATEWAY_PROBE,
       ])
       if (socket.exitCode !== 0) throw new Error("runtime_socket_unavailable")
       await this.importFiles(container.id, "workspace", {
@@ -563,6 +568,19 @@ export class DockerRuntime implements AgentRuntime {
           })
           const files = await parseWorkspaceArchive(archive.stdout)
           return { finalText, files }
+        } catch (error) {
+          if (
+            phase === "triage" &&
+            !signal.aborted &&
+            container.gateway?.retryableFailure &&
+            error instanceof Error &&
+            ["pi_agent_error", "pi_aborted", "pi_incomplete", "pi_exit_failure"].includes(
+              error.message,
+            )
+          ) {
+            throw new Error("model_request_transient")
+          }
+          throw error
         } finally {
           await this.remove(container)
         }
