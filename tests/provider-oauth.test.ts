@@ -460,7 +460,7 @@ afterEach(async () => {
   }
 })
 
-describe("installed SDK 1.5.0 OAuth through ProviderSetup", () => {
+describe("installed SDK 1.5.2 OAuth through ProviderSetup", () => {
   it.each(ids)("logs in and refreshes %s using only exact fixture requests", async (id) => {
     const { credential } = await login(id, id !== "anthropic")
     if (id !== "anthropic") {

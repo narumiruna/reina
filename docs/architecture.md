@@ -2,7 +2,7 @@
 
 ## Terminology
 
-The terminology reference is Reina's pinned `@earendil-works/pi-ai` **1.5.0** public types and
+The terminology reference is Reina's pinned `@earendil-works/pi-ai` **1.5.2** public types and
 provider factories, plus the worker's Pi coding agent and agent-core **1.5.0** packages.
 The SDK evidence is `dist/auth/types.d.ts`, `dist/models.d.ts`, `dist/types.d.ts`, and
 `dist/providers/*.js` in the installed pi-ai package.
@@ -21,7 +21,7 @@ authorities for Reina.
 - **Configure provider** starts credential setup for a built-in provider; it does not register a
   new SDK provider. **Select provider** is the picker, **Update credential** replaces a credential,
   and **Add custom provider** creates a custom connection. **Built-in provider** is the interface
-  descriptor; SDK names such as **OpenAI Codex (legacy)** remain unchanged.
+  descriptor; SDK names such as **OpenAI Codex** remain unchanged.
 - **Select authentication method** offers **Sign in with an account** and **Sign in with an API
   key** by default. Provider-specific actions use SDK `OAuthAuth.loginLabel` when present. SDK
   provider `name` and authentication-method `name` are distinct labels, not aliases. For example,
@@ -48,7 +48,7 @@ authorities for Reina.
 - **API** is the SDK `Model.api` identifier for the wire protocol, not a provider identity or
   endpoint. Keep **Base URL**, **Model ID**, **Display name**, **Context window (tokens)**, and
   **Maximum output tokens setting** for their respective fields. The last is `maxTokens`, not a
-  universal enforced cap: SDK 1.5.0 ignores it for Codex. The Codex warning and request, byte, and
+  universal enforced cap: SDK 1.5.2 ignores it for Codex. The Codex warning and request, byte, and
   time budgets below remain unchanged; these budgets are not upstream token or billing caps.
 - **Pi coding agent** means the CLI; **agent** means agent-core behavior. The **Reina controller**
   is the trusted workflow service; a **worker** is an isolated execution container. A Reina
@@ -129,7 +129,7 @@ to another account, API key, provider, environment variable, command, or host cr
 
 Requests use text and tools only; the Pi coding agent uses thinking level Off. This does not
 promise that provider reasoning is disabled. Other supported SDK adapters apply
-an output cap of 4,096 tokens or the lower saved limit. **Codex exception:** SDK 1.5.0 ignores
+an output cap of 4,096 tokens or the lower saved limit. **Codex exception:** SDK 1.5.2 ignores
 `maxTokens` and omits `max_output_tokens`. Reina does not inject unsupported wire fields, so an
 exact upstream 4,096-token cap is neither enforced nor claimed for Codex. Request-count, body-size,
 response-byte, and time budgets still apply, but are not token or billing caps. Production Codex
@@ -668,7 +668,7 @@ application type checking. Recheck this workaround when upgrading Probot or Node
    reconnect, cancellation, and token rotation with a supported account. Confirm Copilot's remote
    policy-change consent. Separately authorize bounded paid inference with the test-repository
    maintainer; verify the selected API/model, streaming/tool continuation, supported output caps,
-   quality, and billing. Codex requires explicit acceptance of SDK 1.5.0's unenforced upstream token
+   quality, and billing. Codex requires explicit acceptance of SDK 1.5.2's unenforced upstream token
    cap; byte/time/request budgets are not a 4,096-token or billing guarantee. Never request tokens
    or codes in chat. Configured credentials and fixture tests do not close this production gate.
 4. **Deployment operator:** provide private persistent storage, pinned images, and a patched Linux

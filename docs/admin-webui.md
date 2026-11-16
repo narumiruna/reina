@@ -361,7 +361,7 @@ or live acceptance. The [terminology reference](architecture.md#terminology) def
 
 ## Provider methods and limits
 
-Reina uses the pinned pi-ai 1.5.0 provider registry and authentication implementations, not an
+Reina uses the pinned pi-ai 1.5.2 provider registry and authentication implementations, not an
 independent token exchange. Account methods are limited to these headless flows:
 
 | SDK provider     | Account method   | Limit                                                                       |
@@ -385,7 +385,7 @@ its SDK protocol, endpoint, headers, and compatibility data. No extra callback l
 provider credential storage in the browser, or import of host Pi authentication files is added.
 Reina's Pocket ID sign-in grants administration only; it is not provider OAuth authorization.
 
-**Codex output-cap limitation:** SDK 1.5.0 ignores `maxTokens` for Codex and omits
+**Codex output-cap limitation:** SDK 1.5.2 ignores `maxTokens` for Codex and omits
 `max_output_tokens`. Reina preserves the supported SDK payload; it must not inject unsupported
 wire fields. The saved output limit does not enforce an exact upstream 4,096-token cap for Codex.
 Request-count, 1 MiB request-body, 4 MiB response-byte, 60-second request, and job-time budgets
@@ -667,7 +667,7 @@ The following work requires external owners and is not established by credential
    unverified until this owner-operated check. Do not share tokens or authorization codes in chat.
    - Separately authorize bounded paid inference and coordinate a disposable test repository with
      its maintainer. Verify text/tool streaming and continuation, supported output caps, quality,
-     and billing. For Codex, explicitly accept the SDK 1.5.0 upstream token-cap limitation above;
+     and billing. For Codex, explicitly accept the SDK 1.5.2 upstream token-cap limitation above;
      byte/time/request budgets do not establish a 4,096-token cap. No production dispatch is
      accepted from fixtures or a configured credential alone.
 3. **Deployment operator:** review the private backup, original encryption key, migration, and

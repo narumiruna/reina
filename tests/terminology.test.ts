@@ -58,7 +58,7 @@ describe("SDK terminology metadata", () => {
     }
     const codex = entries.find((item) => item.id === "openai-codex")
     expect(codex).toMatchObject({
-      name: "OpenAI Codex (legacy)",
+      name: "OpenAI Codex",
       authMethods: ["oauth"],
       authDetails: { oauth: { name: "OpenAI (ChatGPT Plus/Pro)", isSubscription: true } },
     })

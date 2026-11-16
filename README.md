@@ -202,7 +202,7 @@ The host gateway supports `openai-completions`, `openai-responses`, `anthropic-m
 `google-generative-ai`, and `openai-codex-responses`. Input is text/tool-only; the Pi coding agent
 uses thinking level Off (`--thinking off`), which does not promise that provider reasoning is disabled.
 Supported non-Codex SDK output caps are at most 4,096 tokens, or the lower saved limit.
-**Codex limitation:** SDK 1.5.0 ignores `maxTokens` and omits `max_output_tokens`. Reina does not
+**Codex limitation:** SDK 1.5.2 ignores `maxTokens` and omits `max_output_tokens`. Reina does not
 inject unsupported wire fields and does not enforce or claim an exact upstream 4,096-token cap
 for Codex. Request-count, body-size, response-byte, and time budgets still apply. The account owner
 must authorize bounded live acceptance, including billing and this limit, before production use.
