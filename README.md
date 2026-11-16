@@ -250,8 +250,8 @@ For this installation, add a new **issue comment** such as:
 
 Free-form instructions, including Chinese, are supported after the mention.
 `@reinabot[bot]` is also accepted. A bare `@reinabot` or `@reinabot help` replies with usage
-without starting a coding job. Mentions inside code fences, quotes, or HTML comments do not
-start requests. PR comments and mentions in the issue body are not command entrypoints.
+without starting a coding job. Mentions inside code fences (including fenced Markdown list
+examples), quotes, or HTML comments do not start requests. PR comments and mentions in the issue body are not command entrypoints.
 
 The requesting human must have current `write`, `maintain`, or `admin` repository permission.
 A valid request delegates one bounded attempt: Reina acknowledges it, assesses the issue,

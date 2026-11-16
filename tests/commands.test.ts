@@ -127,6 +127,12 @@ describe("trusted line-start mention commands", () => {
     ["@custom-reina help!\nPlease explain the usage.", "help"],
     ["<!-- hidden -->\n@custom-reina fix", "fix"],
     ["~~~\n<!--\n~~~\n@custom-reina fix", "fix"],
+    ["- ~~~text\n  @custom-reina hidden\n  ~~~\n\n@custom-reina fix", "fix"],
+    ["@custom-reina\n\n- ~~~text\n  fix the example\n  ~~~", "help"],
+    ["1. ```md\n   @custom-reina hidden\n   ```\n\n@custom-reina help", "help"],
+    ["10. ~~~\n    @custom-reina hidden\n    ~~~\n\n@custom-reina fix", "fix"],
+    ["- - ~~~\n    @custom-reina hidden\n    ~~~\n\n@custom-reina fix", "fix"],
+    ["-\t~~~\n\t@custom-reina hidden\n\t~~~\n\n@custom-reina fix", "fix"],
   ])("parses %j as %s", async (body, command) => {
     const { github, issue, candidate, rest } = setup(body)
     const result = await inspectRequest(github, issue, candidate, actor)
@@ -166,6 +172,17 @@ describe("trusted line-start mention commands", () => {
     "<!--\n-->@custom-reina fix",
     "<!-- open\n@custom-reina fix",
     "<!-- ``` -->\n> @custom-reina fix",
+    "- ~~~text\n  @custom-reina fix the typo\n  ~~~",
+    "+ ~~~text\n  @custom-reina fix the typo\n  ~~~",
+    "* ```md\n  @custom-reina fix the typo\n  ```",
+    "1. ~~~text\n   @custom-reina fix the typo\n   ~~~",
+    "1) ~~~text\n   @custom-reina fix the typo\n   ~~~",
+    "10. ~~~text\n    @custom-reina fix the typo\n    ~~~",
+    "- - ~~~\n    @custom-reina fix the typo\n    ~~~",
+    "  - ~~~text\n    @custom-reina fix the typo\n    ~~~",
+    "-\t~~~text\n\t@custom-reina fix the typo\n\t~~~",
+    "- ~~~\n       ~~~\n  @custom-reina fix",
+    "~~~\n~~~\u00a0\n@custom-reina fix",
   ])("ignores non-command evidence: %j", async (body) => {
     const { github, issue, candidate, rest } = setup(body)
     await expect(inspectRequest(github, issue, candidate, actor)).resolves.toBeUndefined()
@@ -174,7 +191,7 @@ describe("trusted line-start mention commands", () => {
 
   test("hidden instructions after a bare mention grant help only", async () => {
     const { github, issue, candidate } = setup(
-      "@custom-reina\n> fix\n```\nfix\n```\n<!-- fix -->\n`fix`",
+      "@custom-reina\n> fix\n```\nfix\n```\n<!-- fix -->\n`fix`\n- ~~~\n  fix\n  ~~~",
     )
     await expect(inspectRequest(github, issue, candidate, actor)).resolves.toEqual({
       command: "help",
