@@ -77,33 +77,33 @@ async function humanPermission(github: GitHub, actor: Actor): Promise<string> {
   return permission
 }
 
-function nonCommandLines(body: string): { excluded: Set<number>; quoted: Set<number> } {
+function nonCommandLines(body: string): { excluded: Set<number>; html: Set<number> } {
   const excluded = new Set<number>()
-  const quoted = new Set<number>()
+  const html = new Set<number>()
   const walker = new Parser().parse(body).walker()
   for (let step = walker.next(); step; step = walker.next()) {
     const { node, entering } = step
     if (!entering || !["code_block", "html_block", "block_quote"].includes(node.type)) continue
     for (let line = node.sourcepos[0][0]; line <= node.sourcepos[1][0]; line++) {
       excluded.add(line)
-      if (node.type === "block_quote") quoted.add(line)
+      if (node.type === "html_block") html.add(line)
     }
     // A protected container already covers all of its children.
     walker.resumeAt(node, false)
   }
-  return { excluded, quoted }
+  return { excluded, html }
 }
 
 /** Keep hidden text in place so removing markup cannot create a line-start command. */
 function commandLines(body: string): string[] {
   const lines: string[] = []
   let comment = false
-  let quotedParagraph = false
   let inlineTicks: number | undefined
-  const { excluded, quoted } = nonCommandLines(body)
+  const { excluded, html } = nonCommandLines(body)
   for (const [index, raw] of body.split(/\r\n?|\n/).entries()) {
-    if (quoted.has(index + 1)) quotedParagraph = true
-    if (excluded.has(index + 1)) continue
+    // HTML blocks can open comments that continue after the parsed block ends.
+    // Code and quote contents must not change the outer lexical state.
+    if (excluded.has(index + 1) && !html.has(index + 1)) continue
     const hiddenPrefix = comment
     let visible = ""
     let offset = 0
@@ -117,10 +117,7 @@ function commandLines(body: string): string[] {
       offset = end
       if (boundary !== -1) comment = !comment
     }
-    // A blockquote paragraph can continue lazily on lines without another > marker.
-    if (!visible.trim()) quotedParagraph = false
-    if (/^ {0,3}>/.test(visible)) quotedParagraph = true
-    if (hiddenPrefix || quotedParagraph || /^(?: {4}|\t)/.test(visible)) continue
+    if (excluded.has(index + 1) || hiddenPrefix || /^(?: {4}|\t)/.test(visible)) continue
     const insideCode = inlineTicks !== undefined
     for (const match of visible.matchAll(/`+/g)) {
       let escapes = 0

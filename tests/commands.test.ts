@@ -123,11 +123,15 @@ describe("trusted line-start mention commands", () => {
     ["<pre>\n@custom-reina hidden\n</pre>\n\n@custom-reina help", "help"],
     ["Previous discussion.\r\n@custom-reina create-pr", "fix"],
     ["> quoted mention\n\n@custom-reina fix", "fix"],
+    ["- > Example:\n# Request\n@custom-reina fix", "fix"],
+    ["> ```\n> quoted code\n@custom-reina fix", "fix"],
     ["```md\n@another-bot fix\n```\n@custom-reina fix", "fix"],
     ["> ```\n> @custom-reina fix\n\n@custom-reina help", "help"],
     ["@custom-reina help\nThanks!", "help"],
     ["@custom-reina help!\nPlease explain the usage.", "help"],
     ["<!-- hidden -->\n@custom-reina fix", "fix"],
+    ["<div><!--\n\nhidden\n-->\n@custom-reina fix", "fix"],
+    ["<div><!-- hidden -->\n\n@custom-reina fix", "fix"],
     ["~~~\n<!--\n~~~\n@custom-reina fix", "fix"],
     ["- ~~~text\n  @custom-reina hidden\n  ~~~\n\n@custom-reina fix", "fix"],
     ["@custom-reina\n\n- ~~~text\n  fix the example\n  ~~~", "help"],
@@ -135,6 +139,8 @@ describe("trusted line-start mention commands", () => {
     ["10. ~~~\n    @custom-reina hidden\n    ~~~\n\n@custom-reina fix", "fix"],
     ["- - ~~~\n    @custom-reina hidden\n    ~~~\n\n@custom-reina fix", "fix"],
     ["-\t~~~\n\t@custom-reina hidden\n\t~~~\n\n@custom-reina fix", "fix"],
+    ["- ~~~\n  example\n\nOutside the list.\n\n@custom-reina fix", "fix"],
+    ["@custom-reina\n<div><!--\n\nfix\n-->", "help"],
   ])("parses %j as %s", async (body, command) => {
     const { github, issue, candidate, rest } = setup(body)
     const result = await inspectRequest(github, issue, candidate, actor)
@@ -161,7 +167,6 @@ describe("trusted line-start mention commands", () => {
     "&commat;custom-reina fix",
     "> @custom-reina fix",
     "> Example request:\n@custom-reina fix the typo",
-    "> ```\n> quoted code\n@custom-reina fix",
     "`example\n@custom-reina fix the typo\n`",
     "prefix ``example\n@custom-reina fix the typo\n``",
     "  > @custom-reina fix",
@@ -175,6 +180,10 @@ describe("trusted line-start mention commands", () => {
     "<!--\n@custom-reina fix\n-->",
     "<!--\n-->@custom-reina fix",
     "<!-- open\n@custom-reina fix",
+    "<div><!--\n\n@custom-reina fix\n-->",
+    "<div><!--\r\n\r\n@custom-reina fix\r\n-->",
+    "<div><!--\n\n-->@custom-reina fix",
+    "<div><!-- @custom-reina fix -->",
     "<!-- ``` -->\n> @custom-reina fix",
     "- ~~~text\n  @custom-reina fix the typo\n  ~~~",
     "+ ~~~text\n  @custom-reina fix the typo\n  ~~~",
@@ -192,6 +201,7 @@ describe("trusted line-start mention commands", () => {
     "<pre>\n@custom-reina fix\n</pre>",
     "- ~~~text\r\n  @custom-reina fix\r\n  ~~~",
     "- > Example:\n  @custom-reina fix",
+    "- ~~~\n  example\n\nOutside the list.\n\n  ~~~\n@custom-reina fix\n  ~~~",
   ])("ignores non-command evidence: %j", async (body) => {
     const { github, issue, candidate, rest } = setup(body)
     await expect(inspectRequest(github, issue, candidate, actor)).resolves.toBeUndefined()

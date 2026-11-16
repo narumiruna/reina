@@ -514,7 +514,10 @@ from authenticated GitHub identity, not user configuration or webhook text. Code
 and HTML comments cannot mint requests. CommonMark source ranges exclude code blocks, raw HTML
 blocks, and Markdown blockquotes, including nested list continuations. Matching still uses the
 original lines, with inline-code and HTML-comment guards; stripping markup cannot create a command.
-The parser does not render HTML. Issue-body and PR-thread mentions are not entrypoints.
+Quote exclusion ends at the parsed quote boundary. HTML-block lines update comment state without
+becoming commands, so a comment that crosses a block boundary remains hidden. Code and quote
+contents do not change the outer lexical state. The parser does not render HTML. Issue-body and
+PR-thread mentions are not entrypoints.
 
 After raw-signature verification, intake stores only comment ID, original body SHA-256,
 creation/update timestamps, actor, and a digest of issue title/body. Raw bodies do not enter
