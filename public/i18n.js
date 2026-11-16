@@ -1,9 +1,10 @@
+import { en } from "./locales/en.js"
 import { tw } from "./locales/tw.js"
 
 export const locales = { en: "en", tw: "zh-Hant" }
 const storageKey = "reina.locale"
 
-// English source messages are the default catalog and the fallback for missing translations.
+// English is the default catalog and the fallback for missing translations.
 export function message(key, values = {}) {
   return key && typeof key === "object" ? key : { key, values }
 }
@@ -24,6 +25,12 @@ export function date(value) {
   return { date: value }
 }
 
+function lookup(key, locale) {
+  const catalog = locale === "tw" ? tw : en
+  if (Object.hasOwn(catalog, key)) return catalog[key]
+  return Object.hasOwn(en, key) ? en[key] : key
+}
+
 export function translate(value, locale = "en") {
   if (typeof value === "function") return translate(value(), locale)
   if (value && typeof value === "object") {
@@ -36,7 +43,7 @@ export function translate(value, locale = "en") {
         dateStyle: "medium",
         timeStyle: "short",
       }).format(new Date(value.date))
-    const template = locale === "tw" && Object.hasOwn(tw, value.key) ? tw[value.key] : value.key
+    const template = lookup(value.key, locale)
     return template.replace(/\{(\w+)\}/g, (placeholder, key) => {
       if (!Object.hasOwn(value.values, key)) return placeholder
       const part = value.values[key]
@@ -45,7 +52,7 @@ export function translate(value, locale = "en") {
     })
   }
   const key = String(value ?? "")
-  return locale === "tw" && Object.hasOwn(tw, key) ? tw[key] : key
+  return lookup(key, locale)
 }
 
 export function detectLocale(saved, languages = []) {

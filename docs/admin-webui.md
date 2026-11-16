@@ -18,13 +18,16 @@ an account or server setting. If storage is blocked, switching still works for t
 On the first visit, Reina uses the first supported browser language preference: English maps to
 `en`, and Chinese (`zh` and its variants) maps to `tw`. Other languages fall back to English.
 The page language and locale-sensitive dates and counts use `en` or `zh-Hant`; `tw` is the
-application locale ID, not an HTML language tag. Missing translations fall back to English.
+application locale ID, not an HTML language tag. The default and fallback catalog is
+`public/locales/en.js`; Traditional Chinese uses `public/locales/tw.js`. Unknown messages keep
+their source text.
 
 Names, repository identifiers, API protocols, secrets, and upstream provider prompts are not
 translated. Browser-native validation and file-picker text follow the browser language.
 GitHub publications, server logs, and documentation remain in English.
 
-For UI changes, keep the English source text and `public/locales/tw.js` entries together.
+For UI changes, keep the English source text and both locale catalogs in sync.
+`public/locales/en.js` and `public/locales/tw.js` must have the same keys.
 Mark static text with `data-i18n` (only direct text nodes are translated), and mark translated
 attributes with `data-i18n-aria-label` or `data-i18n-placeholder`. Dynamic text uses the bindings
 in `public/i18n.js`; use named `message()` placeholders for data and `raw()` for literal output.

@@ -286,14 +286,14 @@ describe("admin web boundary", () => {
     const login = await request("/login", "GET", undefined, { anonymous: true })
     expect(login.status).toBe(200)
     expect(login.text).toContain("Pocket ID")
-    for (const asset of ["app.js", "i18n.js", "locales/tw.js"]) {
+    for (const asset of ["app.js", "i18n.js", "locales/en.js", "locales/tw.js"]) {
       const response = await request(`/assets/${asset}`, "GET", undefined, { anonymous: true })
       expect(response.status).toBe(200)
       expect(response.headers["content-type"]).toBe("text/javascript; charset=utf-8")
       expect(response.headers["content-security-policy"]).toContain("script-src 'self'")
     }
     expect(
-      (await request("/assets/locales/en.js", "GET", undefined, { anonymous: true })).status,
+      (await request("/assets/locales/ja.js", "GET", undefined, { anonymous: true })).status,
     ).toBe(404)
     expect((await request("/assets/style.css", "GET", undefined, { anonymous: true })).status).toBe(
       200,

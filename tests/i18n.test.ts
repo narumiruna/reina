@@ -1,11 +1,30 @@
 import { readFileSync } from "node:fs"
 import { describe, expect, it } from "vitest"
 import { date, detectLocale, list, message, number, raw, translate } from "../public/i18n.js"
+import { en } from "../public/locales/en.js"
 import { tw } from "../public/locales/tw.js"
 
 const app = readFileSync(new URL("../public/app.js", import.meta.url), "utf8")
 
 describe("locale messages", () => {
+  it("keeps the English catalog complete and aligned with Traditional Chinese", () => {
+    expect(Object.keys(en).sort()).toEqual(Object.keys(tw).sort())
+    for (const [key, value] of Object.entries(en)) expect(value, key).toBe(key)
+  })
+
+  it("uses the English catalog for the default language and missing translations", () => {
+    const key = "test.catalog.fallback"
+    Object.defineProperty(en, key, { value: "English fallback", configurable: true })
+    try {
+      expect(translate(key)).toBe("English fallback")
+      expect(translate(key, "tw")).toBe("English fallback")
+      expect(translate(message(key), "tw")).toBe("English fallback")
+      expect(translate(key, "unknown")).toBe("English fallback")
+    } finally {
+      Reflect.deleteProperty(en, key)
+    }
+  })
+
   it("uses the saved locale, then the first supported browser preference, then English", () => {
     expect(detectLocale("en", ["zh-TW"])).toBe("en")
     expect(detectLocale("tw", ["en-US"])).toBe("tw")
