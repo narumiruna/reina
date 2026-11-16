@@ -6,4 +6,4 @@ Add permission-checked issue mentions and assignment requests that authorize one
 
 Retain request identities after delivery completion, bind requests before acknowledgement retries, apply delayed revocations only to older authority, and reject ambiguous same-second comment edits. Upgrade job state transactionally to schema 6; unknown pre-upgrade sources require a fresh human request.
 
-Ignore fenced command examples nested in Markdown lists and validate their closing indentation and whitespace without changing plain-text mention requests.
+Use CommonMark block source ranges to ignore code and quoted examples, including fences nested in Markdown list continuations, without changing plain-text mention requests.

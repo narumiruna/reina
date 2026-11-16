@@ -119,6 +119,8 @@ describe("trusted line-start mention commands", () => {
     ["@custom-reina[bot] 帮我修复这个问题", "fix"],
     ["@custom-reina：请修改文档", "fix"],
     ["@custom-reina\nPlease add a regression test.", "fix"],
+    ["@custom-reina\n- Update the docs\n- Add tests", "fix"],
+    ["<pre>\n@custom-reina hidden\n</pre>\n\n@custom-reina help", "help"],
     ["Previous discussion.\r\n@custom-reina create-pr", "fix"],
     ["> quoted mention\n\n@custom-reina fix", "fix"],
     ["```md\n@another-bot fix\n```\n@custom-reina fix", "fix"],
@@ -155,6 +157,8 @@ describe("trusted line-start mention commands", () => {
     "A discussion about @custom-reina fix",
     "- @custom-reina fix",
     "\\@custom-reina fix",
+    "&#x40;custom-reina fix",
+    "&commat;custom-reina fix",
     "> @custom-reina fix",
     "> Example request:\n@custom-reina fix the typo",
     "> ```\n> quoted code\n@custom-reina fix",
@@ -182,7 +186,12 @@ describe("trusted line-start mention commands", () => {
     "  - ~~~text\n    @custom-reina fix the typo\n    ~~~",
     "-\t~~~text\n\t@custom-reina fix the typo\n\t~~~",
     "- ~~~\n       ~~~\n  @custom-reina fix",
+    "- Example:\n    ~~~text\n  @custom-reina fix the typo\n    ~~~",
+    "- Example:\n  ~~~text\n  example\n~~~\n@custom-reina fix the typo",
     "~~~\n~~~\u00a0\n@custom-reina fix",
+    "<pre>\n@custom-reina fix\n</pre>",
+    "- ~~~text\r\n  @custom-reina fix\r\n  ~~~",
+    "- > Example:\n  @custom-reina fix",
   ])("ignores non-command evidence: %j", async (body) => {
     const { github, issue, candidate, rest } = setup(body)
     await expect(inspectRequest(github, issue, candidate, actor)).resolves.toBeUndefined()

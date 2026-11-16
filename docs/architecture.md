@@ -511,9 +511,10 @@ A second authorization path accepts a newly created issue comment that directly 
 authenticated App bot with instructions, or a verified assignment to that bot. A bare mention or
 `help` replies with usage and does not grant coding authority. The bot login and slug alias come
 from authenticated GitHub identity, not user configuration or webhook text. Code fences, quotes,
-and HTML comments cannot mint requests. Fenced blocks nested in Markdown lists retain their
-container indentation, including tab columns; only matching markers with valid indentation and
-ASCII space/tab suffixes can close them. Issue-body and PR-thread mentions are not entrypoints.
+and HTML comments cannot mint requests. CommonMark source ranges exclude code blocks, raw HTML
+blocks, and Markdown blockquotes, including nested list continuations. Matching still uses the
+original lines, with inline-code and HTML-comment guards; stripping markup cannot create a command.
+The parser does not render HTML. Issue-body and PR-thread mentions are not entrypoints.
 
 After raw-signature verification, intake stores only comment ID, original body SHA-256,
 creation/update timestamps, actor, and a digest of issue title/body. Raw bodies do not enter

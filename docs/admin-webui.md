@@ -776,6 +776,33 @@ before its changes were committed. The deployed controller image at this checkpo
   provide an assignable dedicated bot account and authorize separate-identity support.
   A login is sufficient for that handoff; do not send account tokens or passwords.
 
+### Schema-6 deployment acceptance (2026-11-16 UTC)
+
+Commit `af853188641df94e1ce63937848e4836e3fded9a` was deployed after the review follow-up,
+using a consistent stopped-instance backup and a retained rollback image. Controller image
+`sha256:29edd479eb1a2d733d1896167b2769d1eafd7aba2751d415ed5161581f02a45a`
+matched all 15 changed compiled modules. Migration advanced job schema 5 to 6 with cutoff
+`1794854848596`; all five historical jobs retained their state, proposal, artifact, and commit
+identities. Settings schema 3 and the encrypted trusted-dispatch settings were unchanged.
+
+The fresh [request on issue #29](https://github.com/narumiruna/reina/issues/29#issuecomment-6925805076)
+produced [draft PR #30](https://github.com/narumiruna/reina/pull/30) from
+`reinabot[bot]` without an approval label. Job `243ad984-8a6f-47e9-bff8-1628f62e1f59`
+reached `pr_ready`; receipt key
+`0f81f3c975d0caa1ce1640f6ed47e66443dd2b3039d727e3fb55ab91086d3f52` remained after
+completion with zero retries. Artifact
+`bf9612389a19177affed2fb5bd5b4ffa24b56611b41614a3ddeeb38efd97dd9f` matched the exact
+remote files and modes at head `8abf2deb3ce68ce14d213853d1dabf329a7c3f31` on base
+`f449ce0b90a2813fc6408cccd4d90f8edf1bb8c6`. The existing tests were preserved, two positive
+boundary cases were added, and the empty Changeset contained exactly `---\n---\n`.
+All three independent verification commands exited `0` in the expected immutable worker.
+[GitHub Actions run 43934040450](https://github.com/narumiruna/reina/actions/runs/43934040450)
+passed both `ci` and `runtime` on the exact head.
+
+This checkpoint predates the later CommonMark parser follow-up. It verifies the schema-6
+migration and fresh request pipeline, not a live native-assignment success or deployment of
+later commits. Native assignment still requires an eligible GitHub identity.
+
 ### Issue-triage acceptance handoff
 
 This is an owner-operated acceptance procedure, not permission for live writes or paid inference.
