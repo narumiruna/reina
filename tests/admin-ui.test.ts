@@ -2,6 +2,9 @@ import { readFileSync } from "node:fs"
 import { setImmediate } from "node:timers/promises"
 import { runInNewContext } from "node:vm"
 import { describe, expect, it } from "vitest"
+import { createI18n, date, list, message, number, raw } from "../public/i18n.js"
+import en from "../public/locales/en.json" with { type: "json" }
+import tw from "../public/locales/tw.json" with { type: "json" }
 
 const script = readFileSync(new URL("../public/app.js", import.meta.url), "utf8")
 const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8")
@@ -11,10 +14,20 @@ class Element {
   id = ""
   name = ""
   value = ""
-  textContent = ""
+  nodeType = 1
+  childNodes: Array<Element | { nodeType: number; textContent: string }> = []
   dataset: Record<string, string> = {}
   attributes = new Map<string, string>()
-  children: Element[] = []
+  get children(): Element[] {
+    return this.childNodes.filter((node): node is Element => node instanceof Element)
+  }
+  get textContent(): string {
+    return this.childNodes.map((node) => node.textContent).join("")
+  }
+  set textContent(value: string) {
+    for (const child of this.children) child.parent = null
+    this.childNodes = [{ nodeType: 3, textContent: value }]
+  }
   parent: Element | null = null
   hidden = false
   disabled = false
@@ -23,6 +36,7 @@ class Element {
   open = false
   type = ""
   validationMessage = ""
+  userInteracted = false
   listeners = new Map<string, Array<(event: EventFixture) => void>>()
   classes = new Set<string>()
   classList = {
@@ -52,6 +66,11 @@ class Element {
   get validity() {
     return { valid: !this.validationMessage }
   }
+  get labels(): Element[] {
+    let root: Element = this
+    while (root.parent) root = root.parent
+    return root.querySelectorAll("label").filter((label) => label.getAttribute("for") === this.id)
+  }
   setAttribute(name: string, value: string) {
     this.attributes.set(name, value)
   }
@@ -65,31 +84,35 @@ class Element {
     this.listeners.set(name, [...(this.listeners.get(name) || []), listener])
   }
   fire(name: string) {
+    if (["input", "change", "blur"].includes(name)) this.userInteracted = true
     for (const listener of this.listeners.get(name) || [])
       listener({ currentTarget: this, preventDefault() {} })
   }
   append(...children: Element[]) {
     for (const child of children) {
       child.parent = this
-      this.children.push(child)
+      this.childNodes.push(child)
     }
   }
   replaceChildren(...children: Element[]) {
     for (const child of this.children) child.parent = null
-    this.children = []
+    this.childNodes = []
     this.append(...children)
   }
   after(child: Element) {
     if (!this.parent) throw new Error("Missing parent")
     child.parent = this.parent
-    this.parent.children.splice(this.parent.children.indexOf(this) + 1, 0, child)
+    this.parent.childNodes.splice(this.parent.childNodes.indexOf(this) + 1, 0, child)
   }
   matches(selector: string): boolean {
     return selector.split(",").some((part) => {
       const tokens = part.trim().split(/\s+/)
       const last = tokens.pop() || ""
       const match =
+        last === "*" ||
         last === this.tag ||
+        (last === ":user-invalid" && this.userInteracted && !this.validity.valid) ||
+        (last.startsWith("[data-i18n") && this.attributes.has(last.slice(1, -1))) ||
         (last === "dialog[open]" && this.tag === "dialog" && this.open) ||
         (last.startsWith(".") && this.classes.has(last.slice(1))) ||
         (last === "[data-close]" && Boolean(this.dataset.close))
@@ -129,16 +152,28 @@ class Element {
     }
     return valid
   }
+  reset() {
+    for (const control of this.querySelectorAll("input, select, textarea"))
+      control.value =
+        control.getAttribute("value") || (control.tag === "textarea" ? control.textContent : "")
+  }
+  showModal() {
+    this.open = true
+  }
+  close() {
+    this.open = false
+    this.fire("close")
+  }
   focus() {}
 }
 
 type EventFixture = { currentTarget: Element; preventDefault(): void }
 
-function documentFixture() {
+function documentFixture(markup = html) {
   const root = new Element("document")
   const stack = [root]
   // Parse the real markup so hidden state, names, defaults, and help text stay coupled to HTML.
-  for (const match of html.matchAll(
+  for (const match of markup.matchAll(
     /<!--[\s\S]*?-->|<![^>]*>|<\/([\w-]+)\s*>|<([\w-]+)([^>]*)>|([^<]+)/g,
   )) {
     if (match[1]) {
@@ -160,8 +195,12 @@ function documentFixture() {
     } else if (match[4]) {
       const parent = stack.at(-1)
       if (parent) {
-        parent.textContent += match[4]
-        if (parent.tag === "textarea" || parent.tag === "option") parent.value += match[4]
+        parent.childNodes.push({ nodeType: 3, textContent: match[4] })
+        if (
+          parent.tag === "textarea" ||
+          (parent.tag === "option" && parent.getAttribute("value") === null)
+        )
+          parent.value += match[4]
       }
     }
   }
@@ -173,6 +212,7 @@ function documentFixture() {
     return element
   }
   return {
+    documentElement: root.querySelector("html"),
     body: root.querySelector("body"),
     activeElement: root.querySelector("body"),
     getElementById,
@@ -225,7 +265,7 @@ async function settle() {
   for (let index = 0; index < 8; index++) await setImmediate()
 }
 
-async function ui(initial = initialSettings()) {
+async function ui(initial = initialSettings(), locale = "en") {
   const document = documentFixture()
   const $ = document.getElementById
   const state = {
@@ -234,11 +274,26 @@ async function ui(initial = initialSettings()) {
     rejectRuntimeSave: false,
     selected: repositoryB,
     requests: [] as Array<{ path: string; data: Record<string, unknown> | undefined }>,
+    responses: {} as Record<string, unknown>,
   }
   const location = { href: "https://reina.example/#runtime", hash: "#runtime" }
+  const stored = new Map([["reina.locale", locale]])
+  const storage = {
+    getItem: (key: string) => stored.get(key) ?? null,
+    setItem: (key: string, value: string) => stored.set(key, value),
+  }
+  const i18n = createI18n({ document, storage })
+  const timers = new Map<number, { callback: () => void; delay: number }>()
+  let timerId = 0
   runInNewContext(
-    script,
+    script.replace(/^import[^\n]+\n/, ""),
     {
+      createI18n: () => i18n,
+      date,
+      list,
+      message,
+      number,
+      raw,
       document,
       location,
       URL,
@@ -255,14 +310,18 @@ async function ui(initial = initialSettings()) {
           this.value = value
         }
       },
-      setTimeout: () => 1,
-      clearTimeout() {},
+      setTimeout: (callback: () => void, delay: number) => {
+        timers.set(++timerId, { callback, delay })
+        return timerId
+      },
+      clearTimeout: (id: number) => timers.delete(id),
       fetch: async (path: string, options: { method: string; body?: string }) => {
         const data = options.body ? JSON.parse(options.body) : undefined
         state.requests.push({ path, data })
         let result: unknown = {}
         let ok = true
-        if (path === "/api/settings") {
+        if (Object.hasOwn(state.responses, path)) result = structuredClone(state.responses[path])
+        else if (path === "/api/settings") {
           if (state.failRefresh) throw new Error("Offline fixture")
           result = structuredClone(state.settings)
         } else if (path === "/api/github/connect") {
@@ -294,6 +353,20 @@ async function ui(initial = initialSettings()) {
   return {
     $,
     state,
+    stored,
+    document,
+    i18n,
+    runTimers(delay: number) {
+      for (const [id, timer] of [...timers]) {
+        if (timer.delay !== delay) continue
+        timers.delete(id)
+        timer.callback()
+      }
+    },
+    switchLanguage(locale: string) {
+      $("language-select").value = locale
+      $("language-select").fire("change")
+    },
     async refresh() {
       $("refresh-settings").fire("click")
       await settle()
@@ -615,5 +688,359 @@ describe("admin Runtime identity reconciliation", () => {
       "still require review and a separate",
     )
     expect($("github-connect-status").getAttribute("role")).toBe("status")
+  })
+})
+
+describe("UI language selection", () => {
+  it("covers all marked static text and accessible attributes in both pages", () => {
+    for (const page of ["index", "login"]) {
+      const markup = readFileSync(new URL(`../public/${page}.html`, import.meta.url), "utf8")
+      const document = documentFixture(markup)
+      for (const element of document.querySelectorAll("[data-i18n]")) {
+        const key = element.getAttribute("data-i18n")
+        expect(key).toMatch(/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/)
+        expect(Object.hasOwn(en, key), key).toBe(true)
+        expect(Object.hasOwn(tw, key), key).toBe(true)
+        const part = element.childNodes.find(
+          (child) => child.nodeType === 3 && child.textContent.trim(),
+        )
+        expect(part?.textContent.trim(), key).toBe(en[key])
+      }
+      for (const name of ["aria-label", "placeholder"]) {
+        for (const element of document.querySelectorAll(`[data-i18n-${name}]`)) {
+          const key = element.getAttribute(`data-i18n-${name}`)
+          expect(Object.hasOwn(en, key), key).toBe(true)
+          expect(Object.hasOwn(tw, key), key).toBe(true)
+          expect(element.getAttribute(name), key).toBe(en[key])
+        }
+      }
+      expect(
+        document.getElementById("language-select").children.map((child) => child.value),
+      ).toEqual(["en", "tw"])
+    }
+  })
+
+  it.each([
+    [false, false],
+    [false, true],
+    [true, false],
+    [true, true],
+  ])("keeps secret labels named when saved flags are %s/%s", async (client, webhook) => {
+    const initial = initialSettings()
+    initial.githubApp.clientSecretConfigured = client
+    initial.githubApp.webhookSecretConfigured = webhook
+    const { $, switchLanguage, state } = await ui(initial)
+    const requests = state.requests.length
+    for (const locale of ["en", "tw", "en"]) {
+      switchLanguage(locale)
+      for (const changedApp of [false, true, false]) {
+        $("github-app-id").value = changedApp ? "999" : "123"
+        $("github-app-id").fire("input")
+        for (const [id, name, configured] of [
+          ["github-client-secret", "Client secret", client],
+          ["github-webhook-secret", "Webhook secret", webhook],
+        ] as const) {
+          const required = changedApp || !configured
+          const suffix =
+            locale === "en"
+              ? required
+                ? " (required)"
+                : " (optional replacement)"
+              : required
+                ? "（必填）"
+                : "（選填，可取代原值）"
+          expect($(`${id}-label`).textContent).toBe(`${name}${suffix}`)
+          expect($(id).required).toBe(required)
+        }
+      }
+    }
+    expect(state.requests).toHaveLength(requests)
+  })
+
+  it("switches static and dynamic text, title, and labels without resetting drafts or fetching", async () => {
+    const { $, document, state, stored, switchLanguage, openGithub } = await ui()
+    await openGithub()
+    policyDraft($)
+    $("github-client-secret").value = "unsaved-secret"
+    $("github-repository-select").value = String(repositoryB.id)
+    const requests = state.requests.length
+    const originalTitle = document.querySelector("title")?.textContent
+    switchLanguage("tw")
+    expect(stored.get("reina.locale")).toBe("tw")
+    expect($("language-select").value).toBe("tw")
+    expect($("save-runtime").textContent).toBe("儲存並套用設定")
+    expect($("runtime-status").textContent).toBe("設定尚未完成。請完成執行環境設定以繼續。")
+    expect($("runtime-connection-status").textContent).toContain("已連接的儲存庫：example/alpha")
+    expect($("github-repository-select").children[0].textContent).toBe("選擇儲存庫")
+    expect($("github-repository-select").value).toBe(String(repositoryB.id))
+    expect($("provider-search").getAttribute("placeholder")).toBe("依名稱或 ID 搜尋")
+    expect($("nav-runtime").textContent).toContain("執行環境")
+    expect(document.querySelector("title")?.textContent).toBe("執行環境 · Reina")
+    expect($("runtime-image").value).toBe(`sha256:${"a".repeat(64)}`)
+    expect($("runtime-forbidden-paths").value).toBe("draft/private/**")
+    expect($("github-client-secret").value).toBe("unsaved-secret")
+    expect(state.requests).toHaveLength(requests)
+    switchLanguage("en")
+    expect(document.querySelector("title")?.textContent).toBe(originalTitle)
+    expect($("save-runtime").textContent).toBe("Save and apply configuration")
+    expect($("github-repository-select").value).toBe(String(repositoryB.id))
+    expect(state.requests).toHaveLength(requests)
+  })
+
+  it("preserves names and open dialog drafts while localizing card actions and confirmation text", async () => {
+    const initial = {
+      ...initialSettings(),
+      user: { name: "models-title" },
+      selectedModelId: "model-1",
+      providers: [
+        {
+          id: "provider-1",
+          name: "models-title",
+          api: "openai-completions",
+          baseUrl: "https://api.example.com",
+          hasCredential: true,
+          hasApiKey: true,
+          authType: "api_key",
+          models: [
+            {
+              id: "model-1",
+              name: "models-title",
+              modelId: "models-title",
+              contextWindow: 128000,
+              maxTokens: 4096,
+            },
+          ],
+        },
+      ],
+    }
+    const { $, switchLanguage, state } = await ui(initial, "tw")
+    expect($("user-name").textContent).toBe("models-title")
+    expect($("provider-list").querySelector("h3")?.textContent).toBe("models-title")
+    expect($("model-list").querySelector("h3")?.textContent).toBe("models-title")
+    const edit = $("provider-list").querySelector("button")
+    expect(edit?.textContent).toBe("編輯")
+    expect(edit?.getAttribute("aria-label")).toBe("編輯 models-title")
+    edit?.fire("click")
+    $("provider-name").value = "Unfinished draft"
+    $("provider-key").value = "private-draft"
+    const requests = state.requests.length
+    switchLanguage("en")
+    expect($("provider-dialog").open).toBe(true)
+    expect($("provider-name").value).toBe("Unfinished draft")
+    expect($("provider-key").value).toBe("private-draft")
+    expect($("provider-title").textContent).toBe("Edit custom provider")
+    expect(state.requests).toHaveLength(requests)
+    $("provider-dialog").close()
+    $("model-list").querySelectorAll("button")[1].fire("click")
+    switchLanguage("tw")
+    expect($("delete-title").textContent).toBe("刪除 models-title？")
+    expect($("delete-description").textContent).toContain("清除目前的選取")
+  })
+
+  it("localizes provider progress and choice placeholders while preserving provider prompt data", async () => {
+    const initial = {
+      ...initialSettings(),
+      providers: [
+        {
+          id: "provider-1",
+          name: "OpenAI",
+          sdkProviderId: "openai",
+          authType: "api_key",
+          hasCredential: true,
+          models: [],
+        },
+      ],
+    }
+    const { $, state, switchLanguage } = await ui(initial, "tw")
+    state.responses["/api/provider-setups"] = {
+      id: "flow-1",
+      providerId: "openai",
+      authType: "api_key",
+      status: "prompt",
+      event: {
+        type: "info",
+        message: "Continue account authorization.",
+        links: [{ url: "https://example.com/authorize", label: "Authorization" }],
+      },
+      prompt: {
+        id: "prompt-1",
+        type: "select",
+        message: "Models",
+        options: [{ id: "models", label: "Models", description: "Models" }],
+      },
+    }
+    $("provider-list").querySelector("button")?.fire("click")
+    $("update-credential").fire("click")
+    await settle()
+    expect($("auth-prompt-form").hidden).toBe(false)
+    expect($("auth-prompt-label").textContent).toBe("Models")
+    expect($("auth-prompt-select").children.map((child) => child.textContent)).toEqual([
+      "選擇選項",
+      "Models — Models",
+    ])
+    expect($("auth-event").textContent).toContain("請繼續完成帳號授權。")
+    expect($("auth-event").querySelector("a")?.textContent).toBe("授權")
+    $("auth-prompt-select").value = "models"
+    const requests = state.requests.length
+    switchLanguage("en")
+    expect($("auth-prompt-select").value).toBe("models")
+    expect($("auth-prompt-select").children[0].textContent).toBe("Choose an option")
+    expect($("auth-prompt-label").textContent).toBe("Models")
+    expect($("auth-event").textContent).toContain("Continue account authorization.")
+    expect(state.requests).toHaveLength(requests)
+  })
+
+  it("updates custom validation messages and inline errors when switching language", async () => {
+    const { $, save, switchLanguage } = await ui()
+    $("runtime-commands").value = "invalid-json"
+    await save()
+    expect($("runtime-commands").validationMessage).toContain("Enter a JSON array")
+    switchLanguage("tw")
+    expect($("runtime-commands").validationMessage).toContain("請輸入")
+    expect($("runtime-commands-error").textContent).toContain("錯誤：請輸入")
+    $("runtime-commands").fire("input")
+    expect($("runtime-commands-error").textContent).toBe("")
+  })
+
+  it.each([false, true])(
+    "updates validation announcements after a language switch (announced: %s)",
+    async (announced) => {
+      const { $, i18n, runTimers, switchLanguage, state } = await ui()
+      const control = $("runtime-commands")
+      control.fire("input")
+      i18n.setValidity(control, message("validation-value-invalid"))
+      control.fire("blur")
+      const label = control.labels[0]
+      expect(label.textContent).toBe("Verification commands (required)")
+      expect($("page-status").textContent).toBe("")
+      const requests = state.requests.length
+      if (announced) {
+        runTimers(500)
+        expect($("page-status").textContent).toBe(
+          "Verification commands (required): Check this value and try again.",
+        )
+      }
+      switchLanguage("tw")
+      if (!announced) runTimers(500)
+      expect(label.textContent).toBe("驗證指令（必填）")
+      expect(control.validationMessage).toBe("請檢查此值後再試一次。")
+      expect($("page-status").textContent).toBe("驗證指令（必填）：請檢查此值後再試一次。")
+      switchLanguage("en")
+      expect($("page-status").textContent).toBe(
+        "Verification commands (required): Check this value and try again.",
+      )
+      expect(state.requests).toHaveLength(requests)
+    },
+  )
+
+  it.each([false, true])(
+    "clears corrected validation announcements (announced: %s)",
+    async (announced) => {
+      const { $, i18n, runTimers, switchLanguage, state } = await ui()
+      const control = $("runtime-commands")
+      control.fire("input")
+      i18n.setValidity(control, message("validation-value-invalid"))
+      control.fire("blur")
+      if (announced) {
+        runTimers(500)
+        expect($("page-status").textContent).toContain("Check this value")
+      }
+      const requests = state.requests.length
+      control.value = '[["npm","test"]]'
+      control.fire("input")
+      expect(control.getAttribute("aria-invalid")).toBe("false")
+      expect(control.getAttribute("aria-describedby")).not.toContain(control.dataset.error)
+      expect($("runtime-commands-error").textContent).toBe("")
+      for (const locale of ["tw", "en"]) {
+        switchLanguage(locale)
+        runTimers(500)
+        expect($("page-status").textContent).toBe("")
+        expect($("page-status").classes.has("error")).toBe(false)
+      }
+      expect(state.requests).toHaveLength(requests)
+    },
+  )
+
+  it("keeps a newer request error when an announced field is corrected", async () => {
+    const { $, i18n, runTimers, switchLanguage, state, refresh } = await ui()
+    const control = $("runtime-commands")
+    control.fire("input")
+    i18n.setValidity(control, message("validation-value-invalid"))
+    control.fire("blur")
+    runTimers(500)
+    state.failRefresh = true
+    await refresh()
+    expect($("page-status").textContent).toBe(en["error-settings-load"])
+    control.fire("input")
+    expect($("page-status").textContent).toBe(en["error-settings-load"])
+    switchLanguage("tw")
+    expect($("page-status").textContent).toBe(tw["error-settings-load"])
+    expect($("page-status").classes.has("error")).toBe(true)
+  })
+
+  it.each([false, true])(
+    "clears validation announcements on a dialog reset (announced: %s)",
+    async (announced) => {
+      const { $, i18n, runTimers, switchLanguage } = await ui({
+        ...initialSettings(),
+        providers: [
+          {
+            id: "provider-1",
+            name: "Example",
+            api: "openai-completions",
+            baseUrl: "https://api.example.com",
+            hasCredential: true,
+            hasApiKey: true,
+            authType: "api_key",
+            models: [],
+          },
+        ],
+      })
+      $("provider-list").querySelector("button")?.fire("click")
+      expect($("provider-dialog").open).toBe(true)
+      const control = $("provider-name")
+      control.fire("input")
+      i18n.setValidity(control, message("validation-value-invalid"))
+      control.fire("blur")
+      if (announced) {
+        runTimers(500)
+        expect($("provider-status").textContent).toContain("Check this value")
+      }
+      $("provider-dialog").close()
+      for (const locale of ["tw", "en"]) {
+        switchLanguage(locale)
+        runTimers(500)
+        expect($("provider-status").textContent).toBe("")
+        expect($("provider-status").classes.has("error")).toBe(false)
+      }
+    },
+  )
+
+  it("localizes login errors and still switches when storage is blocked", () => {
+    const markup = readFileSync(new URL("../public/login.html", import.meta.url), "utf8")
+    const document = documentFixture(markup)
+    const storage = {
+      getItem() {
+        throw new Error("Blocked")
+      },
+      setItem() {
+        throw new Error("Blocked")
+      },
+    }
+    runInNewContext(script.replace(/^import[^\n]+\n/, ""), {
+      createI18n: () => createI18n({ document, storage, navigator: { languages: ["zh-TW"] } }),
+      message,
+      document,
+      URLSearchParams,
+      location: { search: "?error=access_denied" },
+    })
+    expect(document.getElementById("login-error").textContent).toContain("沒有 Reina 存取權")
+    expect(document.querySelector("h1")?.textContent).toBe("歡迎使用 Reina")
+    expect(document.documentElement?.lang).toBe("zh-Hant")
+    const select = document.getElementById("language-select")
+    select.value = "en"
+    expect(() => select.fire("change")).not.toThrow()
+    expect(document.querySelector("h1")?.textContent).toBe("Welcome to Reina")
+    expect(document.getElementById("login-error").textContent).toContain("does not have access")
   })
 })

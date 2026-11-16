@@ -6,6 +6,8 @@ COPY package.json package-lock.json ./
 RUN npm ci --ignore-scripts --no-audit --no-fund
 COPY tsconfig.json ./
 COPY src ./src
+COPY public ./public
+COPY scripts/build-web.mjs ./scripts/build-web.mjs
 RUN npm run build && npm prune --omit=dev --ignore-scripts --no-audit --no-fund
 
 FROM node:26.13.0-bookworm-slim@sha256:add5c17c14752c54d2f3d519ec46a3815684d41c33f198bcb09fb998f7dcbf68

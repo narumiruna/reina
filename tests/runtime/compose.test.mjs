@@ -181,8 +181,11 @@ test("Compose prepares a worker, shares runtime binds, and preserves private sta
         assert.equal(statSync(directory).mode & 0o777, 0o700);
         assert.equal(statSync(directory).uid, 0);
       }
-      for (const file of ['.env', '.git', 'src', 'node_modules/typescript']) {
-        assert.equal(existsSync('/app/' + file), false);
+      for (const file of [
+        '.env', '.git', 'src', 'node_modules/typescript',
+        'node_modules/esbuild', 'node_modules/i18next',
+      ]) {
+        assert.equal(existsSync('/app/' + file), false, 'Production image must not include ' + file);
       }
       const store = new Store(process.env.REINA_STATE_DIR);
       const model = await fakeModel();

@@ -1,5 +1,5 @@
 import { generateKeyPairSync } from "node:crypto"
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import http, { type Server } from "node:http"
 import os from "node:os"
 import path from "node:path"
@@ -286,9 +286,31 @@ describe("admin web boundary", () => {
     const login = await request("/login", "GET", undefined, { anonymous: true })
     expect(login.status).toBe(200)
     expect(login.text).toContain("Pocket ID")
-    expect((await request("/assets/app.js", "GET", undefined, { anonymous: true })).status).toBe(
-      200,
-    )
+    for (const asset of ["app.js", "i18n.js", "locales/en.json", "locales/tw.json"]) {
+      const response = await request(`/assets/${asset}`, "GET", undefined, { anonymous: true })
+      expect(response.status).toBe(200)
+      expect(response.headers["content-type"]).toBe(
+        asset.endsWith(".json")
+          ? "application/json; charset=utf-8"
+          : "text/javascript; charset=utf-8",
+      )
+      if (asset.endsWith(".json")) {
+        expect(JSON.parse(response.text)).toEqual(
+          JSON.parse(readFileSync(new URL(`../public/${asset}`, import.meta.url), "utf8")),
+        )
+      }
+      expect(response.headers["content-security-policy"]).toContain("script-src 'self'")
+      if (asset === "i18n.js") {
+        expect(response.text).toBe(
+          readFileSync(new URL("../dist/browser/i18n.js", import.meta.url), "utf8"),
+        )
+        expect(response.text).not.toMatch(/^import\s/m)
+      }
+    }
+    for (const asset of ["locales/ja.json", "locales/en.js", "locales/tw.js"])
+      expect(
+        (await request(`/assets/${asset}`, "GET", undefined, { anonymous: true })).status,
+      ).toBe(404)
     expect((await request("/assets/style.css", "GET", undefined, { anonymous: true })).status).toBe(
       200,
     )

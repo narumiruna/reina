@@ -136,7 +136,12 @@ export class AdminWeb {
   private async asset(res: ServerResponse, path: string, type: string): Promise<void> {
     let data = this.assets.get(path)
     if (!data) {
-      data = readFile(new URL(`../../public/${path}`, import.meta.url))
+      data = readFile(
+        new URL(
+          path === "i18n.js" ? "../../dist/browser/i18n.js" : `../../public/${path}`,
+          import.meta.url,
+        ),
+      )
       this.assets.set(path, data)
     }
     res.writeHead(200, { "content-type": `${type}; charset=utf-8` }).end(await data)
@@ -207,8 +212,20 @@ export class AdminWeb {
       await this.asset(res, "style.css", "text/css")
       return true
     }
-    if (req.method === "GET" && url.pathname === "/assets/app.js") {
-      await this.asset(res, "app.js", "text/javascript")
+    if (
+      req.method === "GET" &&
+      [
+        "/assets/app.js",
+        "/assets/i18n.js",
+        "/assets/locales/en.json",
+        "/assets/locales/tw.json",
+      ].includes(url.pathname)
+    ) {
+      await this.asset(
+        res,
+        url.pathname.slice("/assets/".length),
+        url.pathname.endsWith(".json") ? "application/json" : "text/javascript",
+      )
       return true
     }
     if (req.method === "GET" && url.pathname === "/login") {

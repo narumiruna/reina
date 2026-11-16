@@ -317,7 +317,19 @@
     flex-direction: column;
     min-inline-size: 0;
   }
+  .language-picker {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.8rem;
+  }
+  .language-picker select {
+    inline-size: auto;
+    min-block-size: 2.5rem;
+    padding: 0.4rem 1.8rem 0.4rem 0.6rem;
+  }
   .topbar {
+    flex-wrap: wrap;
     min-block-size: 5rem;
     display: flex;
     align-items: center;
@@ -1027,6 +1039,11 @@
     background: radial-gradient(ellipse at 50% 30%, #231c2e 0, transparent 60%), var(--bg);
   }
   .login-brand {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 1rem;
     padding: 2rem 2.5rem;
   }
   .login-main {
@@ -1139,7 +1156,9 @@
       display: none;
     }
     .identity {
-      inline-size: 100%;
+      flex: 1 1 auto;
+      min-inline-size: 0;
+      flex-wrap: wrap;
     }
     #logout-form {
       margin-inline-start: auto;
