@@ -731,6 +731,48 @@ These checks used dummy identities and local provider responses. They do not est
 GitHub permissions/delivery ordering, real provider compatibility or cost, semantic triage quality,
 production backup restoration, or production-host runtime acceptance. Complete the handoff below.
 
+### Live mention-request acceptance (2026-11-16 UTC)
+
+The following evidence is from the local Compose deployment targeting `narumiruna/reina`,
+not from dummy GitHub fixtures. These checks ran against the local implementation worktree
+before its changes were committed. The deployed controller image at this checkpoint was
+`sha256:b06c62356a1a32b72b068017bbc328d860ffeac0a67054f8d5601020a807332d`.
+
+- **Mention help:** [source comment](https://github.com/narumiruna/reina/issues/25#issuecomment-6923246046)
+  received [the App's usage reply](https://github.com/narumiruna/reina/issues/25#issuecomment-6923551218).
+  GitHub recorded an initial delivery timeout before intake. One official GitHub redelivery of
+  the same GUID produced the reply; no synthetic event or database reset was used.
+- **Mention to draft PR:** [the human request](https://github.com/narumiruna/reina/issues/25#issuecomment-6922680761)
+  produced [draft PR #26](https://github.com/narumiruna/reina/pull/26), authored by `reinabot[bot]`
+  (user ID `355975874`), without a separate `bot:approved` label.
+  Job `bf733a5c-9411-4fbb-8474-9e392b60b92c` reached `pr_ready` with artifact hash
+  `56cba3cb85db2178c0595d6cb06f2123a8451d69d519bb7c025862135b4a39f2`.
+  Head `89234d93fe618c9d814c095978809db729170e1c` targets main
+  `a17718c2b7b203b088263f70d435098e21c7cee1`. The two added files are
+  `tests/branch-names.test.ts` and `.changeset/branch-name-tests.md`, both mode `100644`.
+  The latter contains exactly `---\n---\n`, the required empty Changeset for this test-only change.
+- **Independent verification:** `npm run check`,
+  `npm test -- --configLoader runner --cache=false`, and `npm run build` all exited `0` in
+  worker image `sha256:94911eea56d364acbb1571f550050235e122872d694cbf8bb53a5be03892765e`.
+  [GitHub Actions run 43911419491](https://github.com/narumiruna/reina/actions/runs/43911419491)
+  also passed both `ci` (including Changesets) and `runtime` on that exact head.
+  At this checkpoint, the local worktree passed 1,947 unit tests, the build, Changesets validation,
+  and all 19 Linux runtime tests with zero skips. No verification gate was removed or narrowed.
+  PR #26 was later merged; these results describe its original draft head.
+- **Publication recovery:** earlier test PR #24 established recovery from saved validated
+  artifacts without repeating coding. Git data JSON omitted the final LF from the commit
+  message while retaining it in the hashed Git object. The publisher now accepts only that
+  exact normalization. PR #24 and its issue #23 were closed as superseded. Reina did not merge
+  any PR or delete any branch during these checks.
+- **Blocked native assignment:** the repository owner's assignee check succeeds, but the
+  App bot's check returns `404`; a real assignment attempt returned `403`, and GraphQL
+  returned `FORBIDDEN`. Existing App write permissions do not make this identity assignable.
+  The assignment handler is covered by regression tests, but no live native-assignment success
+  is claimed. It currently uses the verified App bot ID; no alternate account setting was added.
+  To continue, the App owner must obtain GitHub assignment eligibility for this identity or
+  provide an assignable dedicated bot account and authorize separate-identity support.
+  A login is sufficient for that handoff; do not send account tokens or passwords.
+
 ### Issue-triage acceptance handoff
 
 This is an owner-operated acceptance procedure, not permission for live writes or paid inference.
@@ -743,8 +785,12 @@ Current issue-triage test evidence must be recorded separately from the historic
    - Expected: one mutable summary per issue with kind and host outcome. Needs-info gets
      `bot:needs-info`; a human decision gets `bot:needs-human`. `bot:triaged` follows confirmed
      summary/outcome publication. `fix_available` follows a separate immutable proposal.
-     No coding starts without fresh approval of that exact proposal. Then approve and inspect
-     one draft PR. Evidence/base/policy changes and 24-hour candidate renewal need new approval.
+     The label-based path needs fresh approval of that exact proposal. A permitted human's
+     explicit mention request, or supported bot assignment, can instead delegate one policy-bound
+     attempt without an additional label. Both paths publish the immutable proposal before coding.
+     Inspect one draft PR. Evidence/base/policy changes and 24-hour renewal need a new human
+     request or approval. Native assignment must first pass GitHub's assignee-eligibility check;
+     the current `reinabot[bot]` App is rejected by GitHub.
 2. **Repository maintainer and operator**
    - Prerequisites: authorize disposable edit, failure, and restart scenarios; retain saved state.
    - Actions: edit the issue; add/edit/delete a human comment; close or add `bot:skip`; check
@@ -760,7 +806,8 @@ Current issue-triage test evidence must be recorded separately from the historic
      remain suppressed after restart or label removal, separate from successful 24-hour renewal.
    - For a same-owner rename, update the configured repository name. Confirm that live numeric
      identity checks permit recovery, the summary is reused, and any replacement proposal needs
-     fresh approval. Do not use this path for owner transfers or cross-repository moves.
+     a fresh human request or approval. Do not use this path for owner transfers or
+     cross-repository moves.
 3. **Provider account owner**
    - Prerequisites: supported entitled account, explicit usage/cost authorization, and acceptance
      of the Codex cap limitation where applicable.

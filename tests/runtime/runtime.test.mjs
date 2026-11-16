@@ -220,6 +220,184 @@ test("actual Pi 1.5.0 makes a tool call through only the mounted Unix gateway an
   assert.deepEqual(await activeContainers(), [])
 })
 
+test("actual Pi 1.5.0 creates a new regular file and verifies its frozen artifact independently", {
+  timeout: 60000,
+}, async () => {
+  const commands = [
+    [
+      "node",
+      "-e",
+      "const fs=require('node:fs'),a=require('node:assert/strict');a.equal(fs.readFileSync('src/created.txt','utf8'),'after 日本語\\n');a.equal(fs.statSync('src/created.txt').mode&0o7777,0o644);a.equal(fs.readFileSync('src/message.txt','utf8'),'before\\n');a.equal(fs.existsSync('/run/reina-model.sock'),false);fs.writeFileSync('src/created.txt','verification mutation');",
+    ],
+  ]
+  const creation = new DockerRuntime({ ...config, commands })
+  try {
+    await creation.preflight()
+    assert.equal(Object.hasOwn(baseline.files, "src/created.txt"), false)
+    const start = model.calls.length
+    const result = await creation.code(baseline, "CASE:CREATE", controller().signal)
+    assert.equal(result.finalText, "completed\u2028safely\u2029日本語")
+    assert.deepEqual(result.files["src/created.txt"], {
+      mode: "100644",
+      content: Buffer.from("after 日本語\n"),
+    })
+    assert.deepEqual(result.files["src/message.txt"], baseline.files["src/message.txt"])
+    assert.equal(Object.hasOwn(baseline.files, "src/created.txt"), false)
+    const calls = model.calls.slice(start)
+    assert.equal(calls.length, 2)
+    assert.ok(
+      calls[1].messages.some(
+        (message) => message.role === "tool" && message.tool_call_id === "call_fixture",
+      ),
+    )
+    const proposal = {
+      baseSha: baseline.sha,
+      baseBranch: baseline.branch,
+      image: config.image,
+      decision: { affectedFiles: ["src/created.txt"] },
+    }
+    const artifact = validateArtifact(baseline, result.files, proposal, config)
+    assert.deepEqual(artifact.files, [
+      {
+        path: "src/created.txt",
+        mode: "100644",
+        content: Buffer.from("after 日本語\n").toString("base64"),
+      },
+    ])
+    const frozen = JSON.stringify(artifact)
+    const candidate = {
+      ...baseline,
+      files: {
+        ...baseline.files,
+        "src/created.txt": {
+          mode: artifact.files[0].mode,
+          content: Buffer.from(artifact.files[0].content, "base64"),
+        },
+      },
+    }
+    const records = await creation.verify(candidate, commands, controller().signal)
+    assert.equal(records.length, 1)
+    assert.equal(records[0].exitCode, 0)
+    assert.deepEqual(records[0].argv, commands[0])
+    assert.equal(records[0].image, config.image)
+    assert.equal(candidate.files["src/created.txt"].content.toString(), "after 日本語\n")
+    assert.equal(JSON.stringify(artifact), frozen)
+    artifact.verification = records
+    assert.notEqual(artifactHash(artifact), artifact.hash)
+    assert.equal(model.calls.length - start, 2)
+    assert.deepEqual(await activeContainers(), [])
+  } finally {
+    await creation.cleanup()
+  }
+})
+
+test("verification strips its internal phase and executes bounded scratch fixtures without relaxing isolation", {
+  timeout: 60000,
+}, async () => {
+  const literal = "literal ; $(exit 9) ' \" * $REINA_PHASE"
+  const script = `
+    const a = require('node:assert/strict'), fs = require('node:fs');
+    const os = require('node:os'), path = require('node:path'), cp = require('node:child_process');
+    a.equal(process.env.REINA_PHASE, undefined);
+    a.deepEqual(process.argv.slice(1), [${JSON.stringify(literal)}]);
+    a.equal(process.cwd(), '/workspace');
+    a.equal(os.tmpdir(), '/run/reina-verify-tmp');
+    a.equal(fs.realpathSync(os.tmpdir()), '/run/reina-verify-tmp');
+    const stat = fs.statSync(os.tmpdir());
+    a.equal(stat.uid, 1000); a.equal(stat.gid, 1000); a.equal(stat.mode & 0o7777, 0o700);
+    for (const dir of [os.tmpdir(), '/tmp']) {
+      const quota = fs.statfsSync(dir);
+      a.equal(quota.type, 0x01021994);
+      a.equal(quota.blocks * quota.bsize, 64 * 1024 * 1024);
+    }
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'exec-fixture-'));
+    const noexec = fs.mkdtempSync('/tmp/noexec-fixture-');
+    try {
+      a.equal(fs.realpathSync(scratch).startsWith('/workspace/'), false);
+      const fixture = '#!/usr/local/bin/node\\nrequire("node:assert/strict").equal(process.env.REINA_PHASE,undefined);process.stdout.write("scratch executed");\\n';
+      const executable = path.join(scratch, 'fixture');
+      fs.writeFileSync(executable, fixture, { mode: 0o700 });
+      a.equal(cp.execFileSync(executable, [], { encoding: 'utf8' }), 'scratch executed');
+      const blocked = path.join(noexec, 'fixture');
+      fs.writeFileSync(blocked, fixture, { mode: 0o700 });
+      a.throws(() => cp.execFileSync(blocked), { code: 'EACCES' });
+    } finally {
+      fs.rmSync(scratch, { recursive: true }); fs.rmSync(noexec, { recursive: true });
+    }
+    a.equal(fs.readlinkSync('node_modules'), '/opt/deps/node_modules');
+    a.equal(require('is-number')(42), true);
+    a.equal(fs.existsSync('node_modules/lifecycle-ran'), false);
+    a.throws(() => fs.mkdirSync('node_modules/.vite-temp'), { code: 'EROFS' });
+    for (const file of ['node_modules/forbidden', '/opt/deps/node_modules/is-number/index.js', '/rootfs-write', '/opt/reina/bridge.mjs']) {
+      a.throws(() => fs.writeFileSync(file, 'blocked'), { code: 'EROFS' });
+    }
+    a.equal(require('is-number')(42), true);
+    for (const file of ['/run/reina-model.sock', '/var/run/docker.sock']) a.equal(fs.existsSync(file), false);
+    a.deepEqual(fs.readdirSync('/tmp/reina-agent'), []);
+    for (const name of ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'REINA_MODEL_KEY', 'PRIVATE_KEY', 'WEBHOOK_SECRET', 'GITHUB_TOKEN', 'GH_TOKEN', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY']) a.equal(process.env[name], undefined);
+    a.equal(JSON.stringify(process.env).includes('host-only-test-key'), false);
+    a.deepEqual(Object.keys(os.networkInterfaces()), ['lo']);
+    a.equal(fs.readFileSync('src/message.txt', 'utf8'), 'after 日本語\\n');
+    fs.writeFileSync('src/message.txt', 'verification mutation');
+  `
+  const commands = [
+    ["node", "-e", script, literal],
+    [
+      "node",
+      "-e",
+      "const a=require('node:assert/strict');a.equal(process.env.REINA_PHASE,undefined);a.equal(require('node:os').tmpdir(),'/run/reina-verify-tmp');a.equal(require('node:fs').readFileSync('src/message.txt','utf8'),'verification mutation');",
+    ],
+  ]
+  const candidate = {
+    ...baseline,
+    files: {
+      ...baseline.files,
+      "src/message.txt": { mode: "100644", content: Buffer.from("after 日本語\n") },
+    },
+  }
+  const artifact = validateArtifact(
+    baseline,
+    candidate.files,
+    {
+      baseSha: baseline.sha,
+      baseBranch: baseline.branch,
+      image: config.image,
+      decision: { affectedFiles: ["src/message.txt"] },
+    },
+    config,
+  )
+  const frozen = JSON.stringify(artifact)
+  const initial = model.calls.length
+  const stateDir = path.join(directory, `verification-${randomUUID()}`)
+  const owner = createHash("sha256")
+    .update(`${stateDir}:${config.repository.id}`)
+    .digest("hex")
+    .slice(0, 24)
+  const verification = new DockerRuntime({ ...config, stateDir, commands })
+  try {
+    await verification.preflight()
+    const records = await verification.verify(candidate, commands, controller().signal)
+    assert.equal(records.length, commands.length)
+    assert.deepEqual(
+      records.map((record) => record.argv),
+      commands,
+    )
+    assert.ok(records.every((record) => record.exitCode === 0 && record.image === config.image))
+    assert.equal(candidate.files["src/message.txt"].content.toString(), "after 日本語\n")
+    assert.equal(baseline.files["src/message.txt"].content.toString(), "before\n")
+    assert.equal(JSON.stringify(artifact), frozen)
+    artifact.verification = records
+    assert.notEqual(artifactHash(artifact), artifact.hash)
+    assert.equal(model.calls.length, initial)
+    assert.equal(
+      (await checked(["ps", "-aq", "--filter", `label=io.reina.owner=${owner}`])).stdout.length,
+      0,
+    )
+  } finally {
+    await verification.cleanup()
+  }
+})
+
 test("prepared images reject non-registry dependencies and wrong tarball integrity", {
   timeout: 60000,
 }, async () => {

@@ -18,6 +18,7 @@ export interface Issue {
   labels: string[]
   state: "open" | "closed"
   pullRequest: boolean
+  assignees?: Actor[]
 }
 
 export interface SourceFile {
@@ -68,12 +69,17 @@ export interface Actor {
 
 export interface LabelEvent {
   id: string
-  event: "labeled" | "unlabeled" | "closed" | "reopened"
-  // Issue lifecycle events have no label.
+  event: "labeled" | "unlabeled" | "closed" | "reopened" | "assigned" | "unassigned"
+  // Issue lifecycle and assignment events have no label.
   label: string
   actor: Actor
+  assignee?: Actor
   createdAt: number
 }
+
+export type ExecutionRequest =
+  | { kind: "comment"; commentId: number; bodyHash: string; createdAt: number; updatedAt: number }
+  | { kind: "assignment"; eventId: string; assigneeId: number; createdAt: number }
 
 export interface Approval {
   eventId: string
@@ -81,6 +87,7 @@ export interface Approval {
   proposalRevision: string
   createdAt: number
   permission: string
+  request?: ExecutionRequest
 }
 
 export type JobState =

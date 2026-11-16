@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import type { Probot } from "probot"
 import { z } from "zod"
@@ -20,10 +21,48 @@ const envelope = z.object({
     .optional(),
   sender: z.object({ id, login: z.string().max(100), type: z.string().max(32) }).optional(),
   issue: z
-    .object({ id, number: id, pull_request: z.unknown().transform(Boolean).optional() })
+    .object({
+      id,
+      number: id,
+      pull_request: z.unknown().transform(Boolean).optional(),
+      updated_at: z.string().max(64).optional(),
+      title: z.string().max(65_536).optional(),
+      body: z.string().max(131_072).nullable().optional(),
+      contentHash: z
+        .string()
+        .regex(/^[a-f0-9]{64}$/)
+        .optional(),
+    })
+    .transform(({ title, body, ...issue }) => ({
+      ...issue,
+      ...(title === undefined
+        ? {}
+        : {
+            contentHash: createHash("sha256")
+              .update(JSON.stringify([title, body ?? ""]))
+              .digest("hex"),
+          }),
+    }))
     .optional(),
   label: z.object({ name: z.string().max(100) }).optional(),
-  comment: z.object({ user: z.object({ id }) }).optional(),
+  assignee: z.object({ id, login: z.string().max(100), type: z.string().max(32) }).optional(),
+  comment: z
+    .object({
+      id: id.optional(),
+      user: z.object({ id }),
+      body: z.string().max(65_536).optional(),
+      bodyHash: z
+        .string()
+        .regex(/^[a-f0-9]{64}$/)
+        .optional(),
+      created_at: z.string().max(64).optional(),
+      updated_at: z.string().max(64).optional(),
+    })
+    .transform(({ body, ...comment }) => ({
+      ...comment,
+      ...(body === undefined ? {} : { bodyHash: createHash("sha256").update(body).digest("hex") }),
+    }))
+    .optional(),
   ref: z.string().max(300).optional(),
   repositories_removed: z.array(z.object({ id })).max(1_000).optional(),
 })
@@ -79,14 +118,39 @@ export function webhookWork(
   )
     return
   if (name === "issue_comment" && data.comment?.user.id === botId) return
-  if (
+  if (name === "issues" && ["assigned", "unassigned"].includes(action)) {
+    if (data.assignee?.id !== botId) return
+  } else if (
     name === "issues" &&
     !["opened", "edited", "reopened", "closed", "labeled", "unlabeled", "deleted"].includes(action)
-  )
+  ) {
     return
+  }
+  const comment = data.comment
+  const createdAt = Date.parse(comment?.created_at ?? "")
+  const updatedAt = Date.parse(comment?.updated_at ?? "")
+  const assignedAt = Date.parse(data.issue.updated_at ?? "")
+  const request =
+    name === "issue_comment" &&
+    action === "created" &&
+    data.sender?.type === "User" &&
+    comment?.id &&
+    comment.bodyHash &&
+    Number.isFinite(createdAt) &&
+    Number.isFinite(updatedAt)
+      ? {
+          kind: "comment" as const,
+          commentId: comment.id,
+          bodyHash: comment.bodyHash,
+          createdAt,
+          updatedAt,
+        }
+      : name === "issues" && action === "assigned" && Number.isFinite(assignedAt)
+        ? { kind: "assignment" as const, assigneeId: botId, createdAt: assignedAt }
+        : undefined
   const label = data.label?.name
   const cancel =
-    ["closed", "deleted"].includes(action) ||
+    ["closed", "deleted", "unassigned"].includes(action) ||
     (action === "unlabeled" && label === "bot:approved") ||
     (action === "labeled" && label === "bot:skip")
   return {
@@ -95,6 +159,10 @@ export function webhookWork(
     action,
     label,
     actor: data.sender,
+    ...(action !== "deleted" && Number.isFinite(name === "issue_comment" ? updatedAt : assignedAt)
+      ? { changedAt: name === "issue_comment" ? updatedAt : assignedAt }
+      : {}),
+    ...(request ? { request, requestIssueHash: data.issue.contentHash } : {}),
     material: name === "issue_comment" || action === "edited" || action === "reopened",
     cancel,
   }

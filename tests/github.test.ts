@@ -222,6 +222,8 @@ class MockAPI {
           const commit = {
             ...params,
             sha,
+            // Git data JSON omits the final LF, although it is part of the hashed Git object.
+            message: params.message.replace(/\n$/, ""),
             tree: { sha: params.tree },
             parents: params.parents.map((parent) => ({ sha: parent })),
           }
@@ -446,6 +448,30 @@ describe("bounded GitHub reads", () => {
     api.refs.set("main", "2".repeat(40))
     expect((await github.snapshotAt("main", fixture.baseSha)).sha).toBe(fixture.baseSha)
     expect(api.rest.git.getRef).not.toHaveBeenCalled()
+  })
+
+  test("reuses one verified immutable snapshot without sharing mutable buffers", async () => {
+    const { api, github } = setup()
+    const first = await github.snapshotAt("main", fixture.baseSha)
+    first.files["README.md"].content.fill(0)
+    first.files["README.md"].mode = "100755"
+    first.files["injected.ts"] = { content: Buffer.from("untrusted"), mode: "100644" }
+    const second = await github.snapshotAt("main", fixture.baseSha)
+    expect(second.files["README.md"].content.toString()).toBe(fixture.baseContent)
+    expect(second.files["README.md"].mode).toBe("100644")
+    expect(second.files["injected.ts"]).toBeUndefined()
+    expect(api.rest.git.getBlob).toHaveBeenCalledTimes(1)
+    expect(api.rest.repos.get).toHaveBeenCalledTimes(2)
+  })
+
+  test("cached snapshots still require live repository and installation access", async () => {
+    const { api, github } = setup()
+    await github.snapshotAt("main", fixture.baseSha)
+    api.auth.installationId++
+    await expect(github.snapshotAt("main", fixture.baseSha)).rejects.toMatchObject({
+      code: "github_installation_not_allowed",
+    })
+    expect(api.rest.git.getBlob).toHaveBeenCalledTimes(1)
   })
 
   test.each([
@@ -912,6 +938,34 @@ describe("live proposal publication authority", () => {
     await expect(revalidate(github, await github.issue(12), p, approval)).rejects.toMatchObject({
       code: "approval_proposal_comment_changed",
     })
+  })
+})
+
+describe("static direct-request replies", () => {
+  test("reconciles an accepted reply after response loss and restart without another POST", async () => {
+    const { api, publisher } = setup()
+    api.fail("issues.createComment", "after")
+    await publisher.respond(proposal().ref, "comment-300", "Request accepted.")
+    const restarted = new Publisher(api.client(), repository, bot.id)
+    await restarted.respond(proposal().ref, "comment-300", "Request accepted.")
+    expect(api.rest.issues.createComment).toHaveBeenCalledTimes(1)
+    expect(api.comments.filter((comment) => comment.body.includes("reina:request:"))).toHaveLength(
+      1,
+    )
+  })
+
+  test("does not recreate a response after issue closure or accept a conflicting App marker", async () => {
+    const { api, publisher } = setup()
+    await publisher.respond(proposal().ref, "comment-300", "Request accepted.")
+    await expect(
+      publisher.respond(proposal().ref, "comment-300", "Changed response."),
+    ).rejects.toMatchObject({ code: "publication_comment_conflict" })
+    api.issue.state = "closed"
+    const restarted = new Publisher(api.client(), repository, bot.id)
+    await expect(
+      restarted.respond(proposal().ref, "comment-300", "Request accepted."),
+    ).rejects.toMatchObject({ code: "publication_issue_not_eligible" })
+    expect(api.rest.issues.createComment).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -1412,6 +1466,41 @@ describe("trusted draft publication and recovery", () => {
       })
       expect(api.rest.pulls.create).not.toHaveBeenCalled()
       if (phase === "before branch") expect(api.rest.git.createRef).not.toHaveBeenCalled()
+    },
+  )
+
+  test("accepts Git data final-LF normalization without changing the commit inputs", async () => {
+    const { api, publisher } = setup()
+    const result = await publisher.publish(job(), proposal(), () => {})
+    const input = api.rest.git.createCommit.mock.calls[0]?.[0]
+    expect(input?.message.endsWith("\n")).toBe(true)
+    const stored = api.commits.get(result.publication?.commitSha ?? "")
+    expect(stored?.message).toBe(input?.message.slice(0, -1))
+    expect(api.rest.git.createRef).toHaveBeenCalledTimes(1)
+    expect(api.rest.pulls.create).toHaveBeenCalledTimes(1)
+  })
+
+  test.each(["body", "extra-newline", "trailing-space", "crlf"])(
+    "rejects commit %s changes rather than broadly trimming metadata",
+    async (change) => {
+      const { api, publisher } = setup()
+      const create = api.rest.git.createCommit.getMockImplementation()
+      if (!create) throw new Error("fixture_commit_missing")
+      api.rest.git.createCommit.mockImplementationOnce(async (params) => {
+        const response = await create(params)
+        if (change === "body")
+          response.data.message = response.data.message.replace("Reina job:", "Other job:")
+        if (change === "extra-newline") response.data.message += "\n\n"
+        if (change === "trailing-space") response.data.message += " "
+        if (change === "crlf")
+          response.data.message = response.data.message.replaceAll("\n", "\r\n")
+        return response
+      })
+      await expect(publisher.publish(job(), proposal(), () => {})).rejects.toMatchObject({
+        code: "publication_commit_mismatch",
+      })
+      expect(api.rest.git.createRef).not.toHaveBeenCalled()
+      expect(api.rest.pulls.create).not.toHaveBeenCalled()
     },
   )
 

@@ -1,6 +1,6 @@
 import { artifactHash } from "../agent/validate.js"
 import { REVIEW_LABELS, type Review } from "../triage/review.js"
-import type { Artifact, Job, Proposal, Repository } from "../types.js"
+import type { Artifact, IssueRef, Job, Proposal, Repository } from "../types.js"
 import {
   branchFor,
   decodeBase64,
@@ -74,9 +74,12 @@ export function proposalBody(proposal: Proposal): string {
     ...proposal.decision.risks.map((risk) => quote(risk)),
     "This is a read-only assessment. No code has been changed or verified.",
     `Expires: ${new Date(proposal.expiresAt).toISOString()}.`,
-    "A maintainer with write access must add bot:approved after this comment. " +
-      "Remove and re-add the label if it is already present. Adding bot:skip excludes this issue.",
-    "Approval is for this revision only. A changed issue, base, scope, or policy requires a new proposal.",
+    "A maintainer with write access can add bot:approved after this comment. " +
+      "Remove and re-add the label if it is already present. " +
+      "An explicit human mention request or assignment also authorizes one policy-bound attempt " +
+      "without an additional approval label. Adding bot:skip excludes this issue.",
+    "Authorization is for one attempt only. A changed issue, base, scope, or policy requires a new proposal " +
+      "and a fresh human request or approval.",
   ].join("\n\n")
 }
 
@@ -276,6 +279,62 @@ export class Publisher {
       save?.(proposal)
     }
     return { commentId: numericId(comment.id), publishedAt }
+  }
+
+  /** Reconcile a static request acknowledgement before attempting another comment write. */
+  async respond(ref: IssueRef, requestId: string, message: string): Promise<void> {
+    if (!sameRepository(this.github.repository, ref) || !/^[a-z0-9-]{1,200}$/i.test(requestId))
+      throw new GitHubError("publication_request_mismatch")
+    const issue = await this.github.issue(ref.number)
+    if (
+      issue.ref.issueId !== ref.issueId ||
+      issue.state !== "open" ||
+      issue.pullRequest ||
+      issue.labels.includes("bot:skip")
+    )
+      throw new GitHubError("publication_issue_not_eligible")
+    const marker = `<!-- reina:request:${ref.id}:${ref.issueId}:${requestId} -->`
+    const body = boundedBody(`${marker}\n\n${message}`)
+    const reconcile = async () => {
+      const comments = await this.github.comments(ref.number)
+      const matches = comments.filter(
+        (comment) =>
+          comment.user?.id === this.github.botId &&
+          comment.user.type === "Bot" &&
+          comment.body?.startsWith(marker),
+      )
+      if (matches.length > 1 || (matches[0] && matches[0].body !== body))
+        throw new GitHubError("publication_comment_conflict")
+      return matches[0]
+    }
+    let comment = await reconcile()
+    if (!comment) {
+      if (this.attemptedComments.has(marker))
+        throw new GitHubOutcomeUnknown("github_comment_outcome_unknown")
+      this.attemptedComments.add(marker)
+      try {
+        comment = (
+          await githubWrite(() =>
+            this.github.client.rest.issues.createComment({
+              ...this.github.coordinates,
+              issue_number: ref.number,
+              body,
+            }),
+          )
+        ).data
+      } catch (error) {
+        if (error instanceof GitHubWriteRejected) this.attemptedComments.delete(marker)
+        if (error instanceof GitHubDeferred) throw error
+        comment = await reconcile()
+        if (!comment) throw new GitHubOutcomeUnknown("github_comment_outcome_unknown")
+      }
+    }
+    if (
+      comment.user?.id !== this.github.botId ||
+      comment.user.type !== "Bot" ||
+      comment.body !== body
+    )
+      throw new GitHubError("publication_comment_conflict")
   }
 
   async review(
@@ -501,7 +560,8 @@ export class Publisher {
       commit.tree.sha !== createdTree.sha ||
       commit.parents.length !== 1 ||
       commit.parents[0].sha !== proposal.baseSha ||
-      commit.message !== message ||
+      // Git data JSON omits one final LF even when the raw Git object retains it.
+      (commit.message !== message && commit.message !== message.slice(0, -1)) ||
       [commit.author, commit.committer].some(
         (person) =>
           person.name !== identity.name ||

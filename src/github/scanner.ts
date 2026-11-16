@@ -253,11 +253,14 @@ export async function boundedList<T>(
 }
 
 export class GitHub {
+  private cachedSnapshot?: Snapshot
+
   constructor(
     readonly client: GitHubClient,
     readonly repository: Repository,
     readonly botId: number,
     private readonly installation?: InstallationIdentity,
+    readonly botLogin?: string,
   ) {
     numericId(repository.id)
     numericId(repository.installationId)
@@ -397,6 +400,12 @@ export class GitHub {
     ) {
       throw new GitHubIssueDeferred("github_context_limit")
     }
+    const assignees = data.assignees?.map((assignee) => {
+      if (!assignee?.login || !assignee.type) throw new GitHubError("github_invalid_assignees")
+      return { id: numericId(assignee.id), login: assignee.login, type: assignee.type }
+    })
+    if (assignees && new Set(assignees.map((assignee) => assignee.id)).size !== assignees.length)
+      throw new GitHubError("github_invalid_assignees")
     return {
       ref: { ...this.repository, number, issueId },
       title: data.title,
@@ -411,6 +420,7 @@ export class GitHub {
       labels: data.labels.map((label) => (typeof label === "string" ? label : (label.name ?? ""))),
       state: data.state === "open" ? "open" : "closed",
       pullRequest: data.pull_request !== undefined,
+      ...(assignees !== undefined ? { assignees } : {}),
     }
   }
 
@@ -430,7 +440,13 @@ export class GitHub {
 
   async snapshotAt(branch: string, sha: string): Promise<Snapshot> {
     await this.check()
-    return this.readSnapshot(branch, sha)
+    if (this.cachedSnapshot?.branch !== branch || this.cachedSnapshot.sha !== sha)
+      this.cachedSnapshot = await this.readSnapshot(branch, sha)
+    // Immutable Git objects can be reused, but callers must not mutate the trusted cache.
+    const files: Record<string, SourceFile> = Object.create(null)
+    for (const [path, file] of Object.entries(this.cachedSnapshot.files))
+      files[path] = { mode: file.mode, content: Buffer.from(file.content) }
+    return { branch, sha, files }
   }
 
   private async readSnapshot(branch: string, sha: string): Promise<Snapshot> {
@@ -568,10 +584,23 @@ export class GitHub {
         throw new GitHubError("github_ambiguous_history")
       ids.add(id)
       const labeled = event.event === "labeled" || event.event === "unlabeled"
-      if (!labeled && event.event !== "closed" && event.event !== "reopened") continue
+      const assigned = event.event === "assigned" || event.event === "unassigned"
+      if (!labeled && !assigned && event.event !== "closed" && event.event !== "reopened") continue
       const createdAt = Date.parse(event.created_at)
       const label = labeled && "label" in event ? event.label?.name : ""
-      if ((labeled && !label) || !event.actor || !Number.isFinite(createdAt)) {
+      const assignee = assigned && "assignee" in event ? event.assignee : undefined
+      if (
+        (labeled && !label) ||
+        !event.actor ||
+        !Number.isFinite(createdAt) ||
+        (assigned &&
+          (!assignee?.login ||
+            !assignee.type ||
+            !event.actor.login ||
+            !event.actor.type ||
+            createdAt < 0 ||
+            (typeof event.id === "number" && !Number.isSafeInteger(event.id))))
+      ) {
         throw new GitHubError("github_ambiguous_history")
       }
       if (createdAt < previousTime) throw new GitHubError("github_ambiguous_history")
@@ -582,6 +611,15 @@ export class GitHub {
         label: label ?? "",
         createdAt,
         actor: { id: numericId(event.actor.id), login: event.actor.login, type: event.actor.type },
+        ...(assignee
+          ? {
+              assignee: {
+                id: numericId(assignee.id),
+                login: assignee.login,
+                type: assignee.type,
+              },
+            }
+          : {}),
       })
     }
     return labels

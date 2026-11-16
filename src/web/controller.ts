@@ -169,7 +169,7 @@ export class Controller {
         config,
         this.store,
         runtime,
-        boundaryFactory(app, config, botId),
+        boundaryFactory(app, config, botId, bot.login),
         botId,
         this.log,
       )

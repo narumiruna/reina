@@ -52,6 +52,23 @@ const approvalSchema: z.ZodType<Approval> = z.strictObject({
   proposalRevision: digest,
   createdAt: timestamp,
   permission: boundedText(30),
+  request: z
+    .discriminatedUnion("kind", [
+      z.strictObject({
+        kind: z.literal("comment"),
+        commentId: positiveId,
+        bodyHash: digest,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+      z.strictObject({
+        kind: z.literal("assignment"),
+        eventId: boundedText(200),
+        assigneeId: positiveId,
+        createdAt: timestamp,
+      }),
+    ])
+    .optional(),
 })
 const proposalSchema: z.ZodType<Proposal> = z
   .strictObject({
@@ -660,6 +677,85 @@ export class Store {
     ).run(digest, Date.now())
   }
 
+  private duplicateRequest(payload: unknown): boolean {
+    if (typeof payload !== "object" || payload === null || !("request" in payload)) return false
+    const candidate = payload as Record<string, unknown>
+    const ref = refSchema.safeParse(candidate.ref)
+    const actor = actorSchema.safeParse(candidate.actor)
+    if (!ref.success || !actor.success || !candidate.request || !candidate.requestIssueHash)
+      return false
+    const db = this.database()
+    for (const row of db.prepare("SELECT payload FROM deliveries WHERE status = 'pending'").all()) {
+      if (typeof row.payload !== "string") continue
+      const pending = JSON.parse(row.payload)
+      if (
+        pending?.request &&
+        pending.ref &&
+        pending.actor &&
+        stable(pending.request) === stable(candidate.request) &&
+        stable(pending.ref) === stable(ref.data) &&
+        stable(pending.actor) === stable(actor.data) &&
+        pending.requestIssueHash === candidate.requestIssueHash
+      )
+        return true
+    }
+    for (const row of db
+      .prepare("SELECT json FROM approvals WHERE issue_key = ?")
+      .all(key(ref.data))) {
+      const approval = parseRecord(approvalSchema, row.json, "approval")
+      if (!approval.request) continue
+      const source =
+        approval.request.kind === "comment"
+          ? approval.request
+          : {
+              kind: "assignment",
+              assigneeId: approval.request.assigneeId,
+              createdAt: approval.request.createdAt,
+            }
+      if (
+        stable(source) === stable(candidate.request) &&
+        stable(approval.actor) === stable(actor.data)
+      )
+        return true
+    }
+    return false
+  }
+
+  private obsoleteChange(payload: unknown): boolean {
+    if (typeof payload !== "object" || payload === null) return false
+    const candidate = payload as Record<string, unknown>
+    const ref = refSchema.safeParse(candidate.ref)
+    const changedAt = timestamp.safeParse(candidate.changedAt)
+    if (
+      candidate.kind !== "issue" ||
+      (!candidate.material && !candidate.cancel) ||
+      !ref.success ||
+      !changedAt.success
+    )
+      return false
+    const db = this.database()
+    for (const row of db.prepare("SELECT payload FROM deliveries WHERE status = 'pending'").all()) {
+      if (typeof row.payload !== "string") continue
+      const pending = JSON.parse(row.payload)
+      const pendingRef = refSchema.safeParse(pending?.ref)
+      if (
+        pendingRef.success &&
+        sameRef(pendingRef.data, ref.data) &&
+        pending.actor?.type === "User" &&
+        typeof pending.request?.createdAt === "number" &&
+        pending.request.createdAt > changedAt.data
+      )
+        return true
+    }
+    for (const row of db
+      .prepare("SELECT json FROM approvals WHERE issue_key = ?")
+      .all(key(ref.data))) {
+      const approval = parseRecord(approvalSchema, row.json, "approval")
+      if (approval.request && approval.createdAt > changedAt.data) return true
+    }
+    return false
+  }
+
   acceptDelivery(
     id: string,
     payload: unknown,
@@ -672,10 +768,31 @@ export class Store {
       if (db.prepare("SELECT id FROM deliveries WHERE id = ?").get(id)) return false
       const json = encodePayload(payload)
       const now = Date.now()
+      if (this.duplicateRequest(payload) || this.obsoleteChange(payload)) {
+        db.prepare(
+          "INSERT INTO deliveries(id,payload,status,accepted_at,available_at) VALUES(?,NULL,'complete',?,?)",
+        ).run(id, now, now)
+        return false
+      }
       db.prepare(
         "INSERT INTO deliveries(id,payload,status,accepted_at,available_at) VALUES(?,?,'pending',?,?)",
       ).run(id, json, now, now)
       // A received revocation must survive a crash before dispatch or publication recovery.
+      // Older direct requests cannot later create replacement proposals from a deferred inbox item.
+      if (revoked.length) {
+        for (const row of db
+          .prepare("SELECT id,payload FROM deliveries WHERE status = 'pending' AND id != ?")
+          .all(id)) {
+          if (typeof row.payload !== "string") continue
+          const pending = JSON.parse(row.payload)
+          if (typeof pending !== "object" || pending === null || !pending.request) continue
+          const pendingRef = refSchema.safeParse(pending.ref)
+          if (pendingRef.success && revoked.some((ref) => sameRef(ref, pendingRef.data)))
+            db.prepare(
+              "UPDATE deliveries SET status = 'complete', payload = NULL WHERE id = ?",
+            ).run(row.id as string)
+        }
+      }
       for (const ref of revoked) this.invalidateRecords(ref)
       for (const invalidation of reviews) {
         const { ref, reason } = validate(
@@ -722,6 +839,30 @@ export class Store {
         encodePayload(payload)
         return { id: row.id, payload }
       })
+  }
+
+  bindRequest(
+    id: string,
+    binding: { fingerprint: string; baseSha: string; baseBranch: string; policyHash: string },
+  ): void {
+    deliveryId(id)
+    this.transaction(() => {
+      const db = this.database()
+      const row = db
+        .prepare("SELECT payload FROM deliveries WHERE id = ? AND status = 'pending'")
+        .get(id)
+      if (typeof row?.payload !== "string") throw new Error("job_cancelled")
+      const payload = JSON.parse(row.payload)
+      if (
+        !payload.request ||
+        (payload.requestBinding && stable(payload.requestBinding) !== stable(binding))
+      )
+        throw new Error("proposal_stale")
+      db.prepare("UPDATE deliveries SET payload = ? WHERE id = ? AND status = 'pending'").run(
+        encodePayload({ ...payload, requestBinding: binding }),
+        id,
+      )
+    })
   }
 
   completeDelivery(id: string): void {
@@ -843,7 +984,7 @@ export class Store {
     }
   }
 
-  claim(proposal: Proposal, approval: Approval): Job | undefined {
+  claim(proposal: Proposal, approval: Approval, requestDeliveryId?: string): Job | undefined {
     const db = this.database()
     const proposalResult = proposalSchema.safeParse(proposal)
     const approvalResult = approvalSchema.safeParse(approval)
@@ -853,6 +994,37 @@ export class Store {
     return this.transaction(() => {
       const stored = this.proposal(value.ref)
       const now = Date.now()
+      if (authority.request) {
+        if (!requestDeliveryId) return undefined
+        deliveryId(requestDeliveryId)
+        const row = db
+          .prepare("SELECT payload FROM deliveries WHERE id = ? AND status = 'pending'")
+          .get(requestDeliveryId)
+        if (typeof row?.payload !== "string") return undefined
+        const pending = JSON.parse(row.payload)
+        const pendingRef = refSchema.safeParse(pending.ref)
+        const binding = {
+          fingerprint: value.fingerprint,
+          baseSha: value.baseSha,
+          baseBranch: value.baseBranch,
+          policyHash: value.policyHash,
+        }
+        if (
+          !pendingRef.success ||
+          !sameRef(pendingRef.data, value.ref) ||
+          pending.actor === undefined ||
+          pending.request === undefined ||
+          pending.requestBinding === undefined ||
+          stable(pending.actor) !== stable(authority.actor) ||
+          stable(pending.requestBinding) !== stable(binding) ||
+          (authority.request.kind === "comment"
+            ? stable(pending.request) !== stable(authority.request)
+            : pending.request?.kind !== "assignment" ||
+              pending.request.assigneeId !== authority.request.assigneeId ||
+              pending.request.createdAt !== authority.request.createdAt)
+        )
+          return undefined
+      }
       if (
         !stored ||
         stable(stored) !== stable(value) ||
@@ -864,7 +1036,14 @@ export class Store {
         authority.proposalRevision !== value.revision ||
         authority.actor.type !== "User" ||
         !["write", "maintain", "admin"].includes(authority.permission) ||
-        authority.createdAt <= value.publishedAt ||
+        (authority.request
+          ? authority.createdAt !== authority.request.createdAt ||
+            authority.createdAt + 86_400_000 <= now ||
+            authority.eventId !==
+              (authority.request.kind === "comment"
+                ? `comment:${authority.request.commentId}`
+                : `assignment:${authority.request.eventId}`)
+          : authority.createdAt <= value.publishedAt) ||
         authority.createdAt >= value.expiresAt ||
         authority.createdAt > now ||
         db.prepare("SELECT event_id FROM approvals WHERE event_id = ?").get(authority.eventId) ||

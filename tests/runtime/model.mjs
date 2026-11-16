@@ -51,11 +51,17 @@ export async function fakeModel() {
         `data: ${JSON.stringify({ id: "chatcmpl-fixture", object: "chat.completion.chunk", created: 1, model: "fixture", choices: [{ index: 0, delta, finish_reason }] })}\n\n`,
       )
     const called = body.messages.some((message) => message.role === "tool")
-    if (!called && (task.includes("CASE:CODE") || task.includes("CASE:TRIAGE"))) {
-      const name = task.includes("CASE:CODE") ? "write" : "read"
+    if (
+      !called &&
+      (task.includes("CASE:CODE") || task.includes("CASE:CREATE") || task.includes("CASE:TRIAGE"))
+    ) {
+      const name = task.includes("CASE:TRIAGE") ? "read" : "write"
       const args =
         name === "write"
-          ? { path: "src/message.txt", content: "after 日本語\n" }
+          ? {
+              path: task.includes("CASE:CREATE") ? "src/created.txt" : "src/message.txt",
+              content: "after 日本語\n",
+            }
           : { path: "src/message.txt" }
       send({
         role: "assistant",

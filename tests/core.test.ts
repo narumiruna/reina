@@ -136,6 +136,30 @@ function approval(value: Proposal, eventId = "approval-1"): Approval {
     permission: "write",
   }
 }
+function acceptRequest(store: Store, value: Proposal, authority: Approval, id = "direct-source") {
+  const request = required(authority.request)
+  const candidate =
+    request.kind === "comment"
+      ? request
+      : { kind: request.kind, assigneeId: request.assigneeId, createdAt: request.createdAt }
+  store.acceptDelivery(id, {
+    kind: "issue",
+    ref: value.ref,
+    actor: authority.actor,
+    action: request.kind === "comment" ? "created" : "assigned",
+    material: request.kind === "comment",
+    cancel: false,
+    request: candidate,
+    requestBinding: {
+      fingerprint: value.fingerprint,
+      baseSha: value.baseSha,
+      baseBranch: value.baseBranch,
+      policyHash: value.policyHash,
+    },
+  })
+  return id
+}
+
 function artifact(): Artifact {
   return {
     files: [
@@ -192,6 +216,67 @@ describe("atomic revocation and persistent GitHub cooldown", () => {
     expect(restored.proposal(job.ref)).toBeUndefined()
     expect(restored.proposals()).toEqual([])
     expect(restored.deliveries()).toHaveLength(1)
+  })
+
+  test("material revocation durably consumes older direct deliveries but keeps unrelated work", () => {
+    let store = openStore()
+    const ref = issue().ref
+    const request = { kind: "assignment", assigneeId: 99, createdAt: Date.now() }
+    store.acceptDelivery("older-direct", { kind: "issue", ref, request })
+    store.deferDelivery("older-direct", 60_000, "issue")
+    store.acceptDelivery("other-direct", { kind: "issue", ref: issue(2).ref, request })
+    store.acceptDelivery("legacy-work", { kind: "issue", ref })
+    store.acceptDelivery("material-revocation", { kind: "issue", ref, material: true }, [ref])
+    store.close()
+    store = openStore()
+    expect(store.acceptDelivery("older-direct", { kind: "issue", ref, request })).toBe(false)
+    expect(
+      store
+        .deliveries()
+        .map((delivery) => delivery.id)
+        .sort(),
+    ).toEqual(["legacy-work", "material-revocation", "other-direct"])
+  })
+
+  test("older signed changes preserve newer deferred requests, but same-time changes revoke", () => {
+    const store = openStore()
+    const ref = issue().ref
+    const createdAt = Date.now()
+    store.acceptDelivery("newer-request", {
+      kind: "issue",
+      ref,
+      actor: { id: 42, login: "maintainer", type: "User" },
+      request: { kind: "assignment", assigneeId: 99, createdAt },
+    })
+    store.deferDelivery("newer-request", 60_000, "issue")
+    expect(
+      store.acceptDelivery(
+        "older-edit",
+        {
+          kind: "issue",
+          ref,
+          material: true,
+          changedAt: createdAt - 1,
+        },
+        [ref],
+      ),
+    ).toBe(false)
+    expect(
+      store.acceptDelivery(
+        "ambiguous-edit",
+        {
+          kind: "issue",
+          ref,
+          material: true,
+          changedAt: createdAt,
+        },
+        [ref],
+      ),
+    ).toBe(true)
+    store.close()
+    const restored = openStore()
+    vi.setSystemTime(createdAt + 60_001)
+    expect(restored.deliveries().map((item) => item.id)).toEqual(["ambiguous-edit"])
   })
 
   test("invalid revocation rolls back both inbox and authority changes", () => {
@@ -865,6 +950,47 @@ describe("durable store", () => {
     expect(store.acceptDelivery("local", payload)).toBe(false)
   })
 
+  test("a direct inbox binding is immutable and survives deferral and restart", () => {
+    let store = openStore()
+    const value = proposal()
+    const createdAt = value.createdAt
+    const payload = {
+      kind: "issue",
+      ref: value.ref,
+      request: {
+        kind: "comment",
+        commentId: 300,
+        bodyHash: "c".repeat(64),
+        createdAt,
+        updatedAt: createdAt,
+      },
+    }
+    const binding = {
+      fingerprint: value.fingerprint,
+      baseSha: value.baseSha,
+      baseBranch: value.baseBranch,
+      policyHash: value.policyHash,
+    }
+    store.acceptDelivery("bound-request", payload)
+    store.bindRequest("bound-request", binding)
+    store.bindRequest("bound-request", binding)
+    for (const changed of [
+      { ...binding, fingerprint: "d".repeat(64) },
+      { ...binding, baseSha: "e".repeat(40) },
+      { ...binding, baseBranch: "other" },
+      { ...binding, policyHash: "f".repeat(64) },
+    ])
+      expect(() => store.bindRequest("bound-request", changed)).toThrow("proposal_stale")
+    store.deferDelivery("bound-request", 0, "issue")
+    store.close()
+    store = openStore()
+    expect(store.deliveries()).toEqual([
+      { id: "bound-request", payload: { ...payload, requestBinding: binding } },
+    ])
+    store.completeDelivery("bound-request")
+    expect(() => store.bindRequest("bound-request", binding)).toThrow("job_cancelled")
+  })
+
   test("issue-local retries exhaust the eight-attempt limit durably", () => {
     vi.useFakeTimers()
     let store = openStore()
@@ -1070,6 +1196,122 @@ describe("durable store", () => {
       expect(store.claim(value, invalid)).toBeUndefined()
     expect(store.claim({ ...value, commands: [["npm", "test"]] }, authority)).toBeUndefined()
     expect(store.claim(value, authority)).toBeDefined()
+  })
+
+  test.each(["comment", "assignment"] as const)(
+    "%s requests can precede publication but each source is consumed once across restart",
+    (kind) => {
+      let store = openStore()
+      const value = proposal()
+      const createdAt = value.createdAt - 1_000
+      const request: NonNullable<Approval["request"]> =
+        kind === "comment"
+          ? { kind, commentId: 300, bodyHash: "c".repeat(64), createdAt, updatedAt: createdAt }
+          : { kind, eventId: "2000", assigneeId: 99, createdAt }
+      const authority: Approval = {
+        ...approval(value),
+        eventId: kind === "comment" ? "comment:300" : "assignment:2000",
+        createdAt,
+        request,
+      }
+      store.saveProposal(value)
+      expect(store.claim(value, authority)).toBeUndefined()
+      expect(store.claim(value, authority, "missing-source")).toBeUndefined()
+      const completed = acceptRequest(store, value, authority, "completed-source")
+      store.completeDelivery(completed)
+      expect(store.claim(value, authority, completed)).toBeUndefined()
+      const wrongSource = acceptRequest(
+        store,
+        value,
+        { ...authority, request: { ...request, createdAt: createdAt - 1 } },
+        "mismatched-source",
+      )
+      expect(store.claim(value, authority, wrongSource)).toBeUndefined()
+      store.completeDelivery(wrongSource)
+      for (const [index, changed] of [
+        { ...value, fingerprint: "d".repeat(64) },
+        { ...value, baseSha: "e".repeat(40) },
+        { ...value, baseBranch: "other" },
+        { ...value, policyHash: "f".repeat(64) },
+      ].entries()) {
+        const wrongBinding = acceptRequest(store, changed, authority, `mismatched-binding-${index}`)
+        expect(store.deliveries()).toContainEqual({
+          id: wrongBinding,
+          payload: expect.objectContaining({ requestBinding: expect.any(Object) }),
+        })
+        expect(store.claim(value, authority, wrongBinding)).toBeUndefined()
+        store.completeDelivery(wrongBinding)
+      }
+      const source = acceptRequest(store, value, authority)
+      const { request: _request, ...labelAuthority } = authority
+      expect(store.claim(value, labelAuthority, source)).toBeUndefined()
+      for (const invalid of [
+        { ...authority, eventId: "unbound-source" },
+        { ...authority, createdAt: createdAt + 1 },
+        { ...authority, permission: "read" },
+        { ...authority, actor: { ...authority.actor, type: "Bot" } },
+        { ...authority, actor: { id: 51, login: "outsider", type: "User" } },
+      ])
+        expect(store.claim(value, invalid, source)).toBeUndefined()
+      const job = required(store.claim(value, authority, source))
+      expect(job.approval).toEqual(authority)
+      expect(job.approval.createdAt).toBeLessThan(required(value.publishedAt))
+      advance(store, job, "failed", { error: "fixture_failure" })
+      store.close()
+      store = openStore()
+      expect(store.job(job.id)?.approval).toEqual(authority)
+      expect(store.claim(value, authority, source)).toBeUndefined()
+      const replacement = proposal(1, value.createdAt + 1_000)
+      store.saveProposal(replacement)
+      expect(
+        store.claim(replacement, { ...authority, proposalRevision: replacement.revision }, source),
+      ).toBeUndefined()
+      expect(store.jobs()).toHaveLength(1)
+    },
+  )
+
+  test("a direct request does not relax publication, expiry, or source-time checks", () => {
+    const store = openStore()
+    const value = proposal()
+    const createdAt = value.createdAt - 1_000
+    const authority: Approval = {
+      ...approval(value),
+      eventId: "comment:300",
+      createdAt,
+      request: {
+        kind: "comment",
+        commentId: 300,
+        bodyHash: "c".repeat(64),
+        createdAt,
+        updatedAt: createdAt,
+      },
+    }
+    const {
+      commentId: _id,
+      publishedAt: _published,
+      commentIntent: _intent,
+      ...unpublished
+    } = value
+    const source = acceptRequest(store, value, authority)
+    store.saveProposal(unpublished)
+    expect(store.claim(unpublished, authority, source)).toBeUndefined()
+    store.saveProposal(value)
+    for (const time of [Date.now() + 1_000, Date.now() - 86_400_000]) {
+      const invalid: Approval = {
+        ...authority,
+        createdAt: time,
+        request: {
+          kind: "comment",
+          commentId: 300,
+          bodyHash: "c".repeat(64),
+          createdAt: time,
+          updatedAt: time,
+        },
+      }
+      const invalidSource = acceptRequest(store, value, invalid, `invalid-source-${time}`)
+      expect(store.claim(value, invalid, invalidSource)).toBeUndefined()
+    }
+    expect(store.claim(value, authority, source)).toBeDefined()
   })
 
   test("atomically consumes each approval once and permits only one active job per issue", async () => {

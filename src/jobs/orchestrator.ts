@@ -1,6 +1,7 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { z } from "zod"
-import { authorize } from "../github/approval.js"
+import { authorize, authorizeRequest } from "../github/approval.js"
+import { inspectRequest } from "../github/commands.js"
 import type { Publisher } from "../github/publisher.js"
 import {
   errorStatus,
@@ -12,7 +13,16 @@ import {
 } from "../github/scanner.js"
 import { fingerprint, makeProposal, policyHash } from "../triage/policy.js"
 import type { Review, ReviewInvalidation } from "../triage/review.js"
-import type { AgentRuntime, Config, Issue, IssueRef, Job, Logger, Proposal } from "../types.js"
+import type {
+  AgentRuntime,
+  Config,
+  ExecutionRequest,
+  Issue,
+  IssueRef,
+  Job,
+  Logger,
+  Proposal,
+} from "../types.js"
 import type { Store } from "./store.js"
 import { IssueTriage } from "./triage.js"
 import { Worker } from "./worker.js"
@@ -37,6 +47,35 @@ export const workSchema = z.discriminatedUnion("kind", [
     action: z.string(),
     label: z.string().optional(),
     actor: actorSchema.optional(),
+    request: z
+      .discriminatedUnion("kind", [
+        z.object({
+          kind: z.literal("comment"),
+          commentId: z.number().int().positive(),
+          bodyHash: z.string().regex(/^[a-f0-9]{64}$/),
+          createdAt: z.number().int().nonnegative(),
+          updatedAt: z.number().int().nonnegative(),
+        }),
+        z.object({
+          kind: z.literal("assignment"),
+          assigneeId: z.number().int().positive(),
+          createdAt: z.number().int().nonnegative(),
+        }),
+      ])
+      .optional(),
+    changedAt: z.number().int().nonnegative().optional(),
+    requestIssueHash: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+    requestBinding: z
+      .object({
+        fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+        baseSha: z.string().regex(/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/),
+        baseBranch: z.string().min(1).max(255),
+        policyHash: z.string().regex(/^[a-f0-9]{64}$/),
+      })
+      .optional(),
     material: z.boolean(),
     cancel: z.boolean(),
   }),
@@ -461,9 +500,64 @@ export class Orchestrator {
       await publisher.labels(issue.ref.number, [], ["fix_available", "bot:approved", "bot:working"])
       return
     }
+    if (
+      work.request &&
+      work.requestIssueHash !==
+        createHash("sha256")
+          .update(JSON.stringify([issue.title, issue.body]))
+          .digest("hex")
+    )
+      throw new Error("proposal_stale")
+    const direct =
+      work.request && work.actor
+        ? await inspectRequest(github, issue, work.request, work.actor)
+        : undefined
+    if (this.stopped) return
+    if (direct?.command === "help") {
+      const mention = `@${github.botLogin?.replace(/\[bot\]$/i, "") ?? "<app-slug>"}`
+      await publisher.respond(
+        issue.ref,
+        `comment-${direct.commentId}`,
+        `Use \`${mention} <instructions>\` to request a code change and a draft PR in this repository. ` +
+          `For example: \`${mention} fix the typo described in this issue\`. ` +
+          "A request requires current write, maintain, or admin permission. " +
+          "Only policy-allowed changes can run. Add bot:skip to stop work. Reina never merges PRs.",
+      )
+      return
+    }
+    if (direct?.command === "fix") {
+      const request = direct.request
+      await publisher.respond(
+        issue.ref,
+        request.kind === "comment"
+          ? `comment-${request.commentId}`
+          : `assignment-${request.eventId}`,
+        "Request accepted. Reina will assess this issue and, if the change is within the configured " +
+          "scope and passes isolated verification, create a draft PR in this repository. " +
+          "No additional bot:approved label is required for this request. " +
+          "Add bot:skip, edit/delete the request, or unassign Reina to revoke the applicable request. " +
+          "Reina does not merge PRs.",
+      )
+    }
     let proposal = this.store.proposal(issue.ref)
     const head = await github.head()
     if (this.stopped) return
+    if (direct?.command === "fix") {
+      const binding = {
+        fingerprint: fingerprint(issue, this.botId),
+        baseSha: head.sha,
+        baseBranch: head.branch,
+        policyHash: policyHash(this.config),
+      }
+      if (
+        work.requestBinding &&
+        Object.entries(binding).some(
+          ([field, value]) => work.requestBinding?.[field as keyof typeof binding] !== value,
+        )
+      )
+        throw new Error("proposal_stale")
+      this.store.bindRequest(correlationId, binding)
+    }
     if (
       proposal &&
       (proposal.fingerprint !== fingerprint(issue, this.botId) ||
@@ -492,7 +586,12 @@ export class Orchestrator {
         this.controllerRefs.delete(key(issue.ref))
       }
     }
-    if (this.stopped || signal.aborted || review?.state !== "complete") return
+    if (this.stopped || signal.aborted) return
+    if (review?.state !== "complete") {
+      if (direct?.command === "fix" && review?.state === "pending")
+        throw new GitHubIssueDeferred("triage_retry_pending", review.nextAttemptAt)
+      return
+    }
     const existing = this.store
       .jobs()
       .find((job) => key(job.ref) === key(issue.ref) && job.state === "pr_ready")
@@ -519,6 +618,10 @@ export class Orchestrator {
     }
     if (proposal && !issue.labels.includes("fix_available")) {
       await publisher.labels(issue.ref.number, ["fix_available"], [])
+    }
+    if (proposal && direct?.command === "fix") {
+      await this.executeRequest(work, direct.request, proposal, github, publisher, correlationId)
+      return
     }
     if (proposal && work.action === "labeled" && work.label === "bot:approved") {
       if (!work.actor) throw new Error("actor_missing")
@@ -576,6 +679,41 @@ export class Orchestrator {
     this.store.saveProposal(proposal)
     await publisher.labels(issue.ref.number, ["fix_available"], ["bot:failed", "bot:working"])
     this.event("proposal_created", issue.ref, { correlationId, proposalId: proposal.revision })
+    if (direct?.command === "fix") {
+      await this.executeRequest(work, direct.request, proposal, github, publisher, correlationId)
+    }
+  }
+
+  private async executeRequest(
+    work: Extract<Work, { kind: "issue" }>,
+    request: ExecutionRequest,
+    proposal: Proposal,
+    github: GitHub,
+    publisher: Publisher,
+    correlationId: string,
+  ): Promise<void> {
+    if (this.stopped || !work.actor) return
+    const issue = await github.issue(work.ref.number)
+    const head = await github.head()
+    if (
+      this.stopped ||
+      fingerprint(issue, this.botId) !== proposal.fingerprint ||
+      head.sha !== proposal.baseSha ||
+      head.branch !== proposal.baseBranch
+    )
+      throw new Error("proposal_stale")
+    const approval = await authorizeRequest(github, issue, proposal, request, work.actor)
+    if (this.stopped) return
+    const job = this.store.claim(proposal, approval, correlationId)
+    if (!job) return
+    this.event("approved", issue.ref, {
+      correlationId,
+      jobId: job.id,
+      proposalId: proposal.revision,
+      actorId: approval.actor.id,
+      source: request.kind,
+    })
+    await this.execute(job, proposal, github, publisher)
   }
 
   private async execute(
