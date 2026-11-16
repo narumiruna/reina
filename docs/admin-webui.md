@@ -7,6 +7,29 @@ bootstrap settings remain in the private environment file.
 The UI can start without GitHub credentials, repository IDs, a model, or a ready worker.
 Dispatch stays disabled and webhooks return HTTP 503 until the controller is ready.
 
+## Interface language
+
+The login and admin pages support **English** (`en`) and **正體中文** (`tw`). Use the
+**Language / 語言** selector to switch without reloading the page or discarding unsaved form input.
+The preference is stored in this browser under the local storage key `reina.locale`; it is not
+an account or server setting. If storage is blocked, switching still works for the current page.
+
+On the first visit, Reina uses the first supported browser language preference: English maps to
+`en`, and Chinese (`zh` and its variants) maps to `tw`. Other languages fall back to English.
+The page language and locale-sensitive dates and counts use `en` or `zh-Hant`; `tw` is the
+application locale ID, not an HTML language tag. Missing translations fall back to English.
+
+Names, repository identifiers, API protocols, secrets, and upstream provider prompts are not
+translated. Browser-native validation and file-picker text follow the browser language.
+GitHub publications, server logs, and documentation remain in English.
+
+For UI changes, keep the English source text and `public/locales/tw.js` entries together.
+Mark static text with `data-i18n` (only direct text nodes are translated), and mark translated
+attributes with `data-i18n-aria-label` or `data-i18n-placeholder`. Dynamic text uses the bindings
+in `public/i18n.js`; use named `message()` placeholders for data and `raw()` for literal output.
+Do not translate form values or render translations as HTML. The credential-free tests check
+catalog coverage, matching placeholders, locale persistence, and switching with drafts intact.
+
 ## Bootstrap and ingress
 
 Follow [Compose startup](../README.md#run-with-docker-compose-linux). Keep `.env` untracked and

@@ -1,3 +1,6 @@
+import { createI18n, date, list, message, number, raw } from "./i18n.js"
+
+const { setText, setAttribute, setValidity, option } = createI18n()
 const $ = (id) => document.getElementById(id)
 
 if (document.body.dataset.page === "login") {
@@ -8,9 +11,10 @@ if (document.body.dataset.page === "login") {
   }
   const code = new URLSearchParams(location.search).get("error")
   if (code) {
-    $("login-error").textContent = Object.hasOwn(messages, code)
-      ? messages[code]
-      : messages.login_failed
+    setText(
+      $("login-error"),
+      Object.hasOwn(messages, code) ? messages[code] : messages.login_failed,
+    )
     $("login-error").hidden = false
   }
 } else if (document.body.dataset.page === "admin") {
@@ -152,20 +156,25 @@ function initializeAdmin() {
   function node(tag, className, text) {
     const element = document.createElement(tag)
     if (className) element.className = className
-    if (text !== undefined) element.textContent = text
+    if (text !== undefined) setText(element, text)
     return element
   }
 
   function button(text, className, onClick, context) {
     const element = node("button", className, text)
     element.type = "button"
-    if (context) element.setAttribute("aria-label", `${text} ${context}`)
+    if (context)
+      setAttribute(
+        element,
+        "aria-label",
+        message("{action} {context}", { action: message(text), context }),
+      )
     element.addEventListener("click", onClick)
     return element
   }
 
   function status(target, message = "", kind = "") {
-    target.textContent = message
+    setText(target, message)
     target.classList.remove("error", "pending")
     if (kind) target.classList.add(kind)
   }
@@ -351,7 +360,7 @@ function initializeAdmin() {
               )
                 continue
               if (control.closest("details")) control.closest("details").open = true
-              control.setCustomValidity("Check this value and try again.")
+              setValidity(control, "Check this value and try again.")
               invalidControls.push(control)
             }
           }
@@ -479,12 +488,18 @@ function initializeAdmin() {
     secret.closest(".field").hidden = inherited
     secret.required = !configured
     if (inherited) secret.value = ""
-    $("runtime-secret-label").textContent = configured
-      ? "Webhook secret (optional replacement)"
-      : "Webhook secret (required for first save)"
-    $("runtime-secret-hint").textContent = configured
-      ? "Secret configured. Leave blank to keep it, or enter at least 32 characters to replace it. Use the same secret in your GitHub App webhook configuration. The saved secret is never displayed."
-      : "Write-only. Enter at least 32 characters for the first save. Use the same secret in your GitHub App webhook configuration. Saved secrets are never displayed."
+    setText(
+      $("runtime-secret-label"),
+      configured
+        ? "Webhook secret (optional replacement)"
+        : "Webhook secret (required for first save)",
+    )
+    setText(
+      $("runtime-secret-hint"),
+      configured
+        ? "Secret configured. Leave blank to keep it, or enter at least 32 characters to replace it. Use the same secret in your GitHub App webhook configuration. The saved secret is never displayed."
+        : "Write-only. Enter at least 32 characters for the first save. Use the same secret in your GitHub App webhook configuration. Saved secrets are never displayed.",
+    )
   }
 
   function renderSettings() {
@@ -498,10 +513,10 @@ function initializeAdmin() {
     const models = providers.flatMap((provider) =>
       provider.models.map((model) => ({ ...model, provider })),
     )
-    $("user-name").textContent = settings.user.name
-    $("user-avatar").textContent = (Array.from(settings.user.name.trim())[0] || "R").toUpperCase()
-    $("provider-count").textContent = String(providers.length)
-    $("model-count").textContent = String(models.length)
+    setText($("user-name"), raw(settings.user.name))
+    setText($("user-avatar"), raw((Array.from(settings.user.name.trim())[0] || "R").toUpperCase()))
+    setText($("provider-count"), String(providers.length))
+    setText($("model-count"), String(models.length))
     $("provider-empty").hidden = providers.length > 0
     $("models-empty").hidden = models.length > 0
     $("provider-list").replaceChildren(...providers.map(renderProvider))
@@ -527,27 +542,41 @@ function initializeAdmin() {
         "Check GitHub App credentials and server sandbox configuration.",
     }
     const runtimeText = states[runtime.state] || "Runtime configuration"
-    $("runtime-status").textContent =
-      `${runtimeText}. ${reasons[runtime.reason] || (selected ? `Selected model: ${selected.name}.` : "No model selected.")}`
+    setText(
+      $("runtime-status"),
+      message("{state}. {reason}", {
+        state: message(runtimeText),
+        reason: reasons[runtime.reason]
+          ? message(reasons[runtime.reason])
+          : selected
+            ? message("Selected model: {name}.", { name: selected.name })
+            : message("No model selected."),
+      }),
+    )
     $("runtime-settings-link").hidden = runtime.reason !== "configure_runtime"
-    $("github-badge").textContent = settings.github.configured ? "Key configured" : "Not configured"
+    setText($("github-badge"), settings.github.configured ? "Key configured" : "Not configured")
     $("github-badge").classList.toggle("good", settings.github.configured)
-    $("github-fingerprint").textContent = settings.github.configured
-      ? settings.github.fingerprint || "Fingerprint unavailable"
-      : "No key uploaded"
+    setText(
+      $("github-fingerprint"),
+      settings.github.configured
+        ? settings.github.fingerprint
+          ? raw(settings.github.fingerprint)
+          : "Fingerprint unavailable"
+        : "No key uploaded",
+    )
     const uploaded = settings.github.uploadedAt
-    $("github-uploaded").textContent =
-      uploaded && Number.isFinite(new Date(uploaded).getTime())
-        ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(
-            new Date(uploaded),
-          )
-        : "—"
-    $("key-form-title").textContent = settings.github.configured
-      ? "Replace private key"
-      : "Upload private key"
-    $("upload-key").textContent = settings.github.configured
-      ? "Replace private key"
-      : "Upload private key"
+    setText(
+      $("github-uploaded"),
+      uploaded && Number.isFinite(new Date(uploaded).getTime()) ? date(uploaded) : "—",
+    )
+    setText(
+      $("key-form-title"),
+      settings.github.configured ? "Replace private key" : "Upload private key",
+    )
+    setText(
+      $("upload-key"),
+      settings.github.configured ? "Replace private key" : "Upload private key",
+    )
     renderGithubSettings()
     updateControls()
   }
@@ -593,8 +622,10 @@ function initializeAdmin() {
       $("runtime-image").value = ""
       $("runtime-forbidden-paths").value = ""
       $("runtime-repository-review").hidden = false
-      $("runtime-repository-review").textContent =
-        "Repository or App identity changed. Stored Runtime settings were not changed. The worker image and forbidden paths were cleared in this form. Review the allowed paths, verification commands, and limits for this target before saving and applying."
+      setText(
+        $("runtime-repository-review"),
+        "Repository or App identity changed. Stored Runtime settings were not changed. The worker image and forbidden paths were cleared in this form. Review the allowed paths, verification commands, and limits for this target before saving and applying.",
+      )
     }
     if (appChanged) {
       githubAppFormInitialized = false
@@ -612,9 +643,15 @@ function initializeAdmin() {
       if (positiveId(appId)) $("runtime-app-id").value = String(appId)
       else if (appChanged) $("runtime-app-id").value = ""
     }
-    $("runtime-connection-status").textContent = connection
-      ? `Connected repository: ${connection.repository.owner}/${connection.repository.name}. Identity is supplied by Connect GitHub. An exact match to the complete saved Runtime configuration can restart scans and use model quota. New or changed worker settings and policy require Runtime Save and apply. Coding still requires explicit approval.`
-      : "No connected repository. Connect GitHub to select a verified repository, or use Advanced GitHub identity to enter a manual target."
+    setText(
+      $("runtime-connection-status"),
+      connection
+        ? message(
+            "Connected repository: {repository}. Identity is supplied by Connect GitHub. An exact match to the complete saved Runtime configuration can restart scans and use model quota. New or changed worker settings and policy require Runtime Save and apply. Coding still requires explicit approval.",
+            { repository: `${connection.repository.owner}/${connection.repository.name}` },
+          )
+        : "No connected repository. Connect GitHub to select a verified repository, or use Advanced GitHub identity to enter a manual target.",
+    )
     runtimeConnectionBinding = nextBinding
     runtimeServiceAppId = serviceAppId
   }
@@ -629,7 +666,12 @@ function initializeAdmin() {
     ]) {
       const required = !sameApp || !configured
       $(id).required = required
-      $(`${id}-label`).textContent = `${label} (${required ? "required" : "optional replacement"})`
+      setText(
+        $(`${id}-label`),
+        message(required ? "{label} (required)" : "{label} (optional replacement)", {
+          label: message(label),
+        }),
+      )
     }
   }
 
@@ -648,25 +690,37 @@ function initializeAdmin() {
     const app = settings.githubApp
     const connection = settings.githubConnection
     $("github-service-notice").hidden = app?.configured === true
-    $("github-connection-badge").textContent = connection ? "Repository connected" : "Not connected"
+    setText($("github-connection-badge"), connection ? "Repository connected" : "Not connected")
     $("github-connection-badge").classList.toggle("good", Boolean(connection))
     $("github-connection-metadata").hidden = !connection
     if (connection) {
       const repository = connection.repository
-      $("github-current-repository").textContent =
-        `${repository.owner}/${repository.name} · Repository ID ${repository.id} · Installation ID ${repository.installationId} · App ID ${connection.appId}`
-      $("github-current-user").textContent =
-        `${connection.user.login} · User ID ${connection.user.id}`
+      setText(
+        $("github-current-repository"),
+        message(
+          "{repository} · Repository ID {repositoryId} · Installation ID {installationId} · App ID {appId}",
+          {
+            repository: `${repository.owner}/${repository.name}`,
+            repositoryId: repository.id,
+            installationId: repository.installationId,
+            appId: connection.appId,
+          },
+        ),
+      )
+      setText(
+        $("github-current-user"),
+        message("{login} · User ID {id}", { login: connection.user.login, id: connection.user.id }),
+      )
       const connectedAt = new Date(connection.connectedAt)
-      $("github-connected-at").textContent = Number.isFinite(connectedAt.getTime())
-        ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(
-            connectedAt,
-          )
-        : "Date unavailable"
+      setText(
+        $("github-connected-at"),
+        Number.isFinite(connectedAt.getTime()) ? date(connectedAt) : "Date unavailable",
+      )
     }
-    $("github-connect").textContent = connection
-      ? "Connect GitHub / change repository"
-      : "Connect GitHub"
+    setText(
+      $("github-connect"),
+      connection ? "Connect GitHub / change repository" : "Connect GitHub",
+    )
     if (app?.configured !== true) {
       $("github-connect").setAttribute("aria-controls", "github-service-setup")
       $("github-connect").setAttribute("aria-expanded", String($("github-service-setup").open))
@@ -674,11 +728,24 @@ function initializeAdmin() {
       $("github-connect").removeAttribute("aria-controls")
       $("github-connect").removeAttribute("aria-expanded")
     }
-    $("github-callback-url").textContent = app?.callbackUrl || "Unavailable in this service version"
-    $("github-setup-url").textContent = app?.setupUrl || "Unavailable in this service version"
-    $("github-service-status").textContent = app
-      ? `Client secret: ${app.clientSecretConfigured ? "configured" : "not configured"}. Webhook secret: ${app.webhookSecretConfigured ? "configured" : "not configured"}. Private key: ${app.privateKeyConfigured ? "configured" : "not configured"}.`
-      : "Service App status is unavailable. Ask the service operator to update Reina before using Connect GitHub."
+    setText(
+      $("github-callback-url"),
+      app?.callbackUrl ? raw(app.callbackUrl) : "Unavailable in this service version",
+    )
+    setText(
+      $("github-setup-url"),
+      app?.setupUrl ? raw(app.setupUrl) : "Unavailable in this service version",
+    )
+    setText(
+      $("github-service-status"),
+      app
+        ? message("Client secret: {client}. Webhook secret: {webhook}. Private key: {key}.", {
+            client: message(app.clientSecretConfigured ? "configured" : "not configured"),
+            webhook: message(app.webhookSecretConfigured ? "configured" : "not configured"),
+            key: message(app.privateKeyConfigured ? "configured" : "not configured"),
+          })
+        : "Service App status is unavailable. Ask the service operator to update Reina before using Connect GitHub.",
+    )
     if (!githubAppFormInitialized) {
       if (positiveId(app?.appId)) $("github-app-id").value = String(app.appId)
       githubAppFormInitialized = true
@@ -695,8 +762,8 @@ function initializeAdmin() {
     const select = $("github-repository-select")
     const previous = select.value
     select.replaceChildren(
-      new Option("Choose a repository", ""),
-      ...repositories.map((repository) => new Option(repository.fullName, String(repository.id))),
+      option("Choose a repository", ""),
+      ...repositories.map((repository) => option(raw(repository.fullName), String(repository.id))),
     )
     select.value = previous
     if (select.selectedIndex < 0) select.value = ""
@@ -704,21 +771,35 @@ function initializeAdmin() {
     $("github-install").hidden = !authorized
     $("github-install-help").hidden = !authorized
     $("github-cancel").hidden = state === "idle"
-    const user = githubView?.user?.login ? ` as ${githubView.user.login}` : ""
+    const user = githubView?.user?.login
+      ? message(" as {login}", { login: githubView.user.login })
+      : ""
     const missing = missingGithubSetupFields().map(([label]) => label)
     const messages = {
       idle:
         settings.githubApp?.configured === true
           ? "Choose Connect GitHub to authorize an account and select a repository. Your saved repository, if any, stays unchanged until you choose Use repository."
           : missing.length
-            ? `Missing service settings: ${missing.join(", ")}. Choose Connect GitHub to open the required setup fields.`
+            ? message(
+                "Missing service settings: {fields}. Choose Connect GitHub to open the required setup fields.",
+                { fields: list(missing.map((label) => message(label))) },
+              )
             : "GitHub service status is unavailable. Refresh settings or contact the service operator.",
       connecting:
         "GitHub authorization has started. Complete authorization on GitHub, or cancel this attempt and connect again.",
       select_repository: canSelect
-        ? `GitHub authorized${user}. Choose a repository, then choose Use repository to save it. Use Install / manage App to add repositories.`
-        : `GitHub authorized${user}, but no repositories are available. Install the App or request organization approval, then refresh repositories.`,
-      install_required: `GitHub authorized${user}. No App installation with an available repository was found. Install the App or request organization approval, then refresh repositories.`,
+        ? message(
+            "GitHub authorized{user}. Choose a repository, then choose Use repository to save it. Use Install / manage App to add repositories.",
+            { user },
+          )
+        : message(
+            "GitHub authorized{user}, but no repositories are available. Install the App or request organization approval, then refresh repositories.",
+            { user },
+          ),
+      install_required: message(
+        "GitHub authorized{user}. No App installation with an available repository was found. Install the App or request organization approval, then refresh repositories.",
+        { user },
+      ),
     }
     const code = githubCallbackError || (expired ? "github_connect_expired" : null)
     status(
@@ -828,13 +909,13 @@ function initializeAdmin() {
     const mark = node(
       "span",
       "provider-mark",
-      Array.from(provider.name).slice(0, 2).join("").toUpperCase(),
+      raw(Array.from(provider.name).slice(0, 2).join("").toUpperCase()),
     )
     mark.setAttribute("aria-hidden", "true")
     const title = node("div")
     title.append(
-      node("h3", "", provider.name),
-      node("p", "mono", provider.sdkProviderId || provider.baseUrl),
+      node("h3", "", raw(provider.name)),
+      node("p", "mono", raw(provider.sdkProviderId || provider.baseUrl)),
     )
     identity.append(mark, title)
     top.append(
@@ -847,7 +928,17 @@ function initializeAdmin() {
       node(
         "p",
         "",
-        `${provider.sdkProviderId ? "Built-in provider" : apiNames[provider.api] || provider.api} · ${provider.models.length} saved ${provider.models.length === 1 ? "model" : "models"}`,
+        message(
+          provider.models.length === 1
+            ? "{provider} · {count} saved model"
+            : "{provider} · {count} saved models",
+          {
+            provider: provider.sdkProviderId
+              ? message("Built-in provider")
+              : apiNames[provider.api] || provider.api,
+            count: number(provider.models.length),
+          },
+        ),
       ),
     )
     const actions = node("div", "card-actions")
@@ -859,14 +950,19 @@ function initializeAdmin() {
         () =>
           confirmDelete({
             path: `/api/providers/${encodeURIComponent(provider.id)}`,
-            title: `Delete saved connection to ${provider.name}?`,
+            title: message("Delete saved connection to {name}?", { name: provider.name }),
             description:
               "This deletes the saved connection, its credential, and all its saved models. If one is selected, the selection is cleared. Built-in providers remain in the catalog. This cannot be undone.",
             success: "Saved connection deleted.",
           }),
         provider.name,
       ),
-      button("＋ Save model", "secondary", () => openModel(provider), `for ${provider.name}`),
+      button(
+        "＋ Save model",
+        "secondary",
+        () => openModel(provider),
+        message("for {name}", { name: provider.name }),
+      ),
     )
     bottom.append(info, actions)
     item.append(top, bottom)
@@ -878,15 +974,22 @@ function initializeAdmin() {
     const item = node("li", `model-row${selected ? " is-selected" : ""}`)
     const info = node("div", "model-info")
     const title = node("div", "model-title")
-    title.append(node("h3", "", model.name))
+    title.append(node("h3", "", raw(model.name)))
     if (selected) title.append(node("span", "badge selected", "Selected model"))
     info.append(
       title,
-      node("code", "", model.modelId),
+      node("code", "", raw(model.modelId)),
       node(
         "p",
         "model-meta",
-        `${model.provider.name} · Context window: ${model.contextWindow.toLocaleString()} tokens · ${model.provider.sdkProviderId === "openai-codex" ? "Maximum output tokens setting: ignored by SDK 1.5.0" : `Maximum output tokens: ${model.maxTokens.toLocaleString()}`}`,
+        message("{provider} · Context window: {context} tokens · {output}", {
+          provider: model.provider.name,
+          context: number(model.contextWindow),
+          output:
+            model.provider.sdkProviderId === "openai-codex"
+              ? message("Maximum output tokens setting: ignored by SDK 1.5.0")
+              : message("Maximum output tokens: {count}", { count: number(model.maxTokens) }),
+        }),
       ),
     )
     const actions = node("div", "card-actions")
@@ -895,7 +998,7 @@ function initializeAdmin() {
         "Edit",
         "quiet",
         () => openModel(model.provider, model),
-        `${model.name} from ${model.provider.name}`,
+        message("{model} from {provider}", { model: model.name, provider: model.provider.name }),
       ),
       button(
         "Delete",
@@ -903,13 +1006,13 @@ function initializeAdmin() {
         () =>
           confirmDelete({
             path: `/api/models/${encodeURIComponent(model.id)}`,
-            title: `Delete ${model.name}?`,
+            title: message("Delete {name}?", { name: model.name }),
             description: selected
               ? "This deletes the saved model and clears the current selection. The provider and its credential will remain."
               : "This deletes the saved model. The provider and its credential will remain.",
             success: "Model deleted.",
           }),
-        `${model.name} from ${model.provider.name}`,
+        message("{model} from {provider}", { model: model.name, provider: model.provider.name }),
       ),
     )
     const use = button(
@@ -920,7 +1023,9 @@ function initializeAdmin() {
         if (!model.provider.hasCredential) {
           status(
             $("page-status"),
-            `Add a credential to ${model.provider.name} before selecting this model.`,
+            message("Add a credential to {name} before selecting this model.", {
+              name: model.provider.name,
+            }),
             "error",
           )
           return
@@ -929,10 +1034,13 @@ function initializeAdmin() {
           path: "/api/selection",
           method: "PUT",
           data: { modelId: model.id },
-          success: `${model.name} selected. Check runtime status to confirm that the configuration is applied.`,
+          success: message(
+            "{name} selected. Check runtime status to confirm that the configuration is applied.",
+            { name: model.name },
+          ),
         })
       },
-      `${model.name} from ${model.provider.name}`,
+      message("{model} from {provider}", { model: model.name, provider: model.provider.name }),
     )
     if (selected) use.setAttribute("aria-disabled", "true")
     actions.append(use)
@@ -952,9 +1060,12 @@ function initializeAdmin() {
       $(`nav-${name}`).removeAttribute("aria-current")
     }
     $("add-provider").hidden = page !== "models"
-    $("page-title").textContent = pages[page][0]
-    $("page-description").textContent = pages[page][1]
-    document.title = `${pages[page][0]} · Reina`
+    setText($("page-title"), pages[page][0])
+    setText($("page-description"), pages[page][1])
+    setText(
+      document.querySelector("title"),
+      message("{page} · Reina", { page: message(pages[page][0]) }),
+    )
     $(`nav-${page}`).setAttribute("aria-current", "page")
     if (focus) $("page-title").focus()
     if (page === "github") {
@@ -965,8 +1076,8 @@ function initializeAdmin() {
 
   function populateApiOptions(preferred = "") {
     $("provider-api").replaceChildren(
-      new Option("Select an API", ""),
-      ...Object.entries(apiNames).map(([id, name]) => new Option(name, id)),
+      option("Select an API", ""),
+      ...Object.entries(apiNames).map(([id, name]) => option(name, id)),
     )
     $("provider-api").value = preferred
   }
@@ -974,8 +1085,8 @@ function initializeAdmin() {
   async function loadCatalog() {
     if (catalog) return
     if (catalogRequest) return catalogRequest
-    $("provider-catalog-status").textContent = "Loading catalog…"
-    $("model-catalog-status").textContent = "Loading catalog…"
+    setText($("provider-catalog-status"), "Loading catalog…")
+    setText($("model-catalog-status"), "Loading catalog…")
     catalogRequest = (async () => {
       try {
         const result = await request("/api/catalog")
@@ -983,14 +1094,17 @@ function initializeAdmin() {
         catalog = result
       } catch (error) {
         if (error.code !== "unauthorized") {
-          $("provider-catalog-status").textContent =
-            "Catalog unavailable. Retry, or go back to choose another method. Custom endpoints are available only with API keys."
+          setText(
+            $("provider-catalog-status"),
+            "Catalog unavailable. Retry, or go back to choose another method. Custom endpoints are available only with API keys.",
+          )
           $("retry-provider-catalog").hidden = false
-          $("model-catalog-status").textContent = settings?.providers.find(
-            (provider) => provider.id === modelProviderId,
-          )?.sdkProviderId
-            ? "Catalog unavailable. Close and reopen to retry. Built-in providers require a catalog model."
-            : "Catalog unavailable. Enter a custom model below, or close and reopen to retry."
+          setText(
+            $("model-catalog-status"),
+            settings?.providers.find((provider) => provider.id === modelProviderId)?.sdkProviderId
+              ? "Catalog unavailable. Close and reopen to retry. Built-in providers require a catalog model."
+              : "Catalog unavailable. Enter a custom model below, or close and reopen to retry.",
+          )
         }
       } finally {
         catalogRequest = null
@@ -1006,7 +1120,7 @@ function initializeAdmin() {
   function announceSearch(target, message) {
     clearTimeout(searchAnnouncement)
     searchAnnouncement = setTimeout(() => {
-      if (target.closest("dialog")?.open) target.textContent = message
+      if (target.closest("dialog")?.open) setText(target, message)
     }, 350)
   }
 
@@ -1020,34 +1134,47 @@ function initializeAdmin() {
         `${provider.name} ${provider.id}`.toLowerCase().includes(query),
     )
     $("provider-preset").replaceChildren(
-      ...options.map((provider) => new Option(`${provider.name} — ${provider.id}`, provider.id)),
+      ...options.map((provider) => option(raw(`${provider.name} — ${provider.id}`), provider.id)),
     )
     $("provider-preset").value = previous || ""
     $("provider-preset").disabled = !options.length
     $("continue-provider").disabled = false
     updateProviderSignInLabel()
     $("retry-provider-catalog").hidden = true
-    const message = options.length
-      ? `${options.length} providers. Select a provider to configure.`
+    const resultMessage = options.length
+      ? message("{count} providers. Select a provider to configure.", {
+          count: number(options.length),
+        })
       : query
         ? "No matching providers. Try another search."
         : "No providers support this method in Reina. Go back to choose another method."
-    announceSearch($("provider-catalog-status"), message)
+    announceSearch($("provider-catalog-status"), resultMessage)
   }
 
   function updateProviderSignInLabel() {
     if (!setup) return
     const provider = catalog?.providers.find((item) => item.id === $("provider-preset").value)
     const details = provider?.authDetails?.[setup?.authType]
-    $("continue-provider").textContent = provider
-      ? details?.loginLabel ||
-        (setup.authType === "oauth" ? "Sign in with an account" : "Sign in with an API key")
-      : "Continue"
-    $("auth-provider-description").textContent =
-      (setup.authType === "oauth"
-        ? "Providers available for sign in with an account. OpenAI Codex is separate from OpenAI API keys."
-        : "Providers available for sign in with an API key. Built-in providers use their own setup prompts.") +
-      (details?.name ? ` Authentication method: ${details.name}.` : "")
+    setText(
+      $("continue-provider"),
+      provider
+        ? (details?.loginLabel ? raw(details.loginLabel) : null) ||
+            (setup.authType === "oauth" ? "Sign in with an account" : "Sign in with an API key")
+        : "Continue",
+    )
+    setText(
+      $("auth-provider-description"),
+      message("{description}{method}", {
+        description: message(
+          setup.authType === "oauth"
+            ? "Providers available for sign in with an account. OpenAI Codex is separate from OpenAI API keys."
+            : "Providers available for sign in with an API key. Built-in providers use their own setup prompts.",
+        ),
+        method: details?.name
+          ? message(" Authentication method: {name}.", { name: details.name })
+          : "",
+      }),
+    )
   }
 
   function prepareModelCatalog() {
@@ -1066,9 +1193,8 @@ function initializeAdmin() {
       `${model.name} ${model.id} ${model.catalogProvider}`.toLowerCase().includes(query),
     )
     $("model-preset").replaceChildren(
-      ...modelOptions.map(
-        (model, index) =>
-          new Option(`${model.name} — ${model.id} · ${model.catalogProvider}`, String(index)),
+      ...modelOptions.map((model, index) =>
+        option(raw(`${model.name} — ${model.id} · ${model.catalogProvider}`), String(index)),
       ),
     )
     $("model-preset").selectedIndex = -1
@@ -1077,7 +1203,9 @@ function initializeAdmin() {
     announceSearch(
       $("model-catalog-status"),
       modelOptions.length
-        ? `${modelOptions.length} models. Select a catalog model, then review it before saving.`
+        ? message("{count} models. Select a catalog model, then review it before saving.", {
+            count: number(modelOptions.length),
+          })
         : settings?.providers.find((provider) => provider.id === modelProviderId)?.sdkProviderId
           ? "No matching catalog models. Try another search. Built-in providers require a catalog model."
           : "No matching models. Try another search or enter a custom model below.",
@@ -1101,12 +1229,23 @@ function initializeAdmin() {
     resetValidation($("auth-method-form"))
     $("provider-search").value = ""
     if (setup.pinned) {
-      $("auth-credential-title").textContent = provider.name
-      $("auth-credential-status").textContent =
-        `${credentialStatus(provider)} — ${provider.authDetails?.[provider.authType]?.name || (provider.authType === "oauth" ? "Account" : "API key")}. Updating keeps this saved connection and authentication method. Models and selection save separately.`
-      $("update-credential").textContent = provider.hasCredential
-        ? "Update credential"
-        : "Add credential"
+      setText($("auth-credential-title"), raw(provider.name))
+      setText(
+        $("auth-credential-status"),
+        message(
+          "{status} — {method}. Updating keeps this saved connection and authentication method. Models and selection save separately.",
+          {
+            status: message(credentialStatus(provider)),
+            method:
+              provider.authDetails?.[provider.authType]?.name ||
+              message(provider.authType === "oauth" ? "Account" : "API key"),
+          },
+        ),
+      )
+      setText(
+        $("update-credential"),
+        provider.hasCredential ? "Update credential" : "Add credential",
+      )
       $("remove-credential").hidden = !provider.hasCredential
       setSetupStage("credential", false)
     } else if (provider) {
@@ -1124,9 +1263,12 @@ function initializeAdmin() {
     $("provider-name").value = provider?.name || ""
     $("provider-url").value = provider?.baseUrl || ""
     $("provider-key").value = ""
-    $("provider-key-hint").textContent = provider?.hasApiKey
-      ? "API key configured. Leave blank to keep it, or enter a new key to replace it. Changing the endpoint requires a new key. The saved key is never returned."
-      : "Write-only. A key is needed to use a model. You can save the provider without one."
+    setText(
+      $("provider-key-hint"),
+      provider?.hasApiKey
+        ? "API key configured. Leave blank to keep it, or enter a new key to replace it. Changing the endpoint requires a new key. The saved key is never returned."
+        : "Write-only. A key is needed to use a model. You can save the provider without one.",
+    )
   }
 
   const setupStages = {
@@ -1148,7 +1290,8 @@ function initializeAdmin() {
   function setSetupStage(stage, focus = true) {
     if (!setup) return
     setup.stage = stage
-    $("provider-title").textContent =
+    setText(
+      $("provider-title"),
       stage === "custom"
         ? providerEditId
           ? "Edit custom provider"
@@ -1157,10 +1300,13 @@ function initializeAdmin() {
           ? "Select provider"
           : providerEditId
             ? "Edit provider"
-            : "Configure provider"
+            : "Configure provider",
+    )
     for (const [key, [id]] of Object.entries(setupStages)) $(id).hidden = stage !== key
-    $("provider-step").textContent =
-      stage === "custom" && providerEditId ? "Edit custom provider" : setupStages[stage][1]
+    setText(
+      $("provider-step"),
+      stage === "custom" && providerEditId ? "Edit custom provider" : setupStages[stage][1],
+    )
     $("provider-back").hidden =
       stage === "method" ||
       stage === "credential" ||
@@ -1192,7 +1338,7 @@ function initializeAdmin() {
     $("auth-prompt-select").replaceChildren()
     $("auth-prompt-form").hidden = true
     $("auth-event").replaceChildren()
-    $("auth-progress").textContent = ""
+    setText($("auth-progress"), "")
     $("auth-link-help").hidden = true
   }
 
@@ -1227,7 +1373,7 @@ function initializeAdmin() {
     flow.promptId = null
     flow.eventKey = null
     const revision = ++flow.revision
-    $("auth-progress").textContent = "Starting provider sign-in…"
+    setText($("auth-progress"), "Starting provider sign-in…")
     try {
       const view = await request("/api/provider-setups", {
         method: "POST",
@@ -1261,11 +1407,14 @@ function initializeAdmin() {
     $("auth-prompt-form").hidden = true
     $("auth-event").replaceChildren()
     $("auth-link-help").hidden = true
-    $("auth-progress").textContent = "Sign-in stopped. Go back to try again."
+    setText($("auth-progress"), "Sign-in stopped. Go back to try again.")
     if (error.code !== "unauthorized")
       status(
         $("provider-status"),
-        `${errorMessage(error)} Existing credentials and model selection were not changed by this attempt.`,
+        message(
+          "{error} Existing credentials and model selection were not changed by this attempt.",
+          { error: message(errorMessage(error)) },
+        ),
         "error",
       )
   }
@@ -1306,14 +1455,15 @@ function initializeAdmin() {
     if (event.type === "device_code") {
       output.append(
         node("p", "hint", "Enter this code on the provider's verification page:"),
-        node("output", "device-code mono", event.userCode),
+        node("output", "device-code mono", raw(event.userCode)),
       )
       addLink(event.verificationUri, "Open verification page")
-      if (event.instructions) output.append(node("p", "hint", event.instructions))
+      if (event.instructions) output.append(node("p", "hint", raw(event.instructions)))
     } else if (event.type === "auth_url") {
       if (event.instructions) output.append(node("p", "hint", event.instructions))
       addLink(event.url, "Open authorization page")
     } else if (event.type === "info" || event.type === "progress") {
+      // These status messages and labels are fixed by Reina, not supplied by the provider.
       output.append(node("p", "hint", event.message))
       for (const link of event.links || []) addLink(link.url, link.label)
     }
@@ -1335,7 +1485,7 @@ function initializeAdmin() {
       flow.pending = true
       $("auth-prompt-input").value = ""
       $("auth-prompt-form").hidden = true
-      $("auth-progress").textContent = "Credential saved. Refreshing settings…"
+      setText($("auth-progress"), "Credential saved. Refreshing settings…")
       try {
         await refreshSettings(stillCompleting)
         if (!stillCompleting()) return
@@ -1377,9 +1527,12 @@ function initializeAdmin() {
       (!prompt || !["text", "secret", "manual_code", "select"].includes(prompt.type))
     )
       throw { code: "invalid_response" }
-    $("auth-progress").textContent = prompt
-      ? "Complete the provider prompt to continue."
-      : "Waiting for the provider. You can go back or cancel sign-in."
+    setText(
+      $("auth-progress"),
+      prompt
+        ? "Complete the provider prompt to continue."
+        : "Waiting for the provider. You can go back or cancel sign-in.",
+    )
     if (prompt?.id !== flow.promptId) {
       flow.promptId = prompt?.id || null
       $("auth-prompt-input").value = ""
@@ -1404,16 +1557,15 @@ function initializeAdmin() {
         select.disabled = !isSelect
         select.required = isSelect
         select.replaceChildren(
-          new Option("Choose an option", ""),
-          ...(prompt.options || []).map(
-            (option) =>
-              new Option(
-                option.description ? `${option.label} — ${option.description}` : option.label,
-                option.id,
-              ),
+          option("Choose an option", ""),
+          ...(prompt.options || []).map((choice) =>
+            option(
+              raw(choice.description ? `${choice.label} — ${choice.description}` : choice.label),
+              choice.id,
+            ),
           ),
         )
-        $("auth-prompt-label").textContent = prompt.message
+        setText($("auth-prompt-label"), raw(prompt.message))
         $("auth-prompt-label").htmlFor = isSelect ? select.id : input.id
         $("submit-auth-prompt").disabled = false
         ;(isSelect ? select : input).focus()
@@ -1446,17 +1598,23 @@ function initializeAdmin() {
     $("model-name").value = model?.name || ""
     $("model-id").value = model?.modelId || ""
     $("model-id").readOnly = Boolean(provider.sdkProviderId)
-    $("model-id-hint").textContent = provider.sdkProviderId
-      ? "Built-in providers use exact catalog model IDs. Select a catalog model before saving. Each model keeps its own API and endpoint."
-      : "The exact model identifier. Start with a letter or digit; use only letters, digits, dots, underscores, slashes, and hyphens."
-    $("model-presets").querySelector(".form-divider").textContent = provider.sdkProviderId
-      ? "Choose a catalog model, then review its name and limits below."
-      : "Or enter a custom model below"
+    setText(
+      $("model-id-hint"),
+      provider.sdkProviderId
+        ? "Built-in providers use exact catalog model IDs. Select a catalog model before saving. Each model keeps its own API and endpoint."
+        : "The exact model identifier. Start with a letter or digit; use only letters, digits, dots, underscores, slashes, and hyphens.",
+    )
+    setText(
+      $("model-presets").querySelector(".form-divider"),
+      provider.sdkProviderId
+        ? "Choose a catalog model, then review its name and limits below."
+        : "Or enter a custom model below",
+    )
     $("model-context").value = String(model?.contextWindow || 128000)
     $("model-output").value = String(model?.maxTokens || 4096)
     $("model-advanced").open = Boolean(model)
-    $("model-title").textContent = model ? "Edit model" : "Save model"
-    $("model-provider-name").textContent = provider.name
+    setText($("model-title"), model ? "Edit model" : "Save model")
+    setText($("model-provider-name"), raw(provider.name))
     $("model-presets").hidden = Boolean(model)
     $("model-search").value = ""
     status($("model-status"))
@@ -1473,8 +1631,8 @@ function initializeAdmin() {
   function confirmDelete(options) {
     if (busy) return
     pendingDelete = options
-    $("delete-title").textContent = options.title
-    $("delete-description").textContent = options.description
+    setText($("delete-title"), options.title)
+    setText($("delete-description"), options.description)
     status($("delete-status"))
     $("delete-dialog").showModal()
   }
@@ -1494,7 +1652,9 @@ function initializeAdmin() {
     const previous = control.getAttribute("aria-invalid") === "true"
     control.setAttribute("aria-invalid", String(invalid))
     const error = $(control.dataset.error)
-    error.textContent = invalid ? `Error: ${control.validationMessage}` : ""
+    setText(error, () =>
+      invalid ? message("Error: {error}", { error: raw(control.validationMessage) }) : "",
+    )
     const descriptions = (control.getAttribute("aria-describedby") || "")
       .split(/\s+/)
       .filter((id) => id && id !== error.id)
@@ -1513,7 +1673,10 @@ function initializeAdmin() {
         () =>
           status(
             target,
-            `${control.labels?.[0]?.textContent || "Field"}: ${control.validationMessage}`,
+            message("{field}: {error}", {
+              field: control.labels?.[0]?.textContent || message("Field"),
+              error: control.validationMessage,
+            }),
             "error",
           ),
         500,
@@ -1523,11 +1686,11 @@ function initializeAdmin() {
 
   function resetValidation(form) {
     for (const control of form.querySelectorAll("input, select, textarea")) {
-      control.setCustomValidity("")
+      setValidity(control, "")
       control.setAttribute("aria-invalid", "false")
       const errorId = control.dataset.error
       if (errorId) {
-        $(errorId).textContent = ""
+        setText($(errorId), "")
         const ids = (control.getAttribute("aria-describedby") || "")
           .split(/\s+/)
           .filter((id) => id && id !== errorId)
@@ -1546,12 +1709,12 @@ function initializeAdmin() {
     control.after(error)
     control.addEventListener("input", () => {
       edited.add(control)
-      control.setCustomValidity("")
+      setValidity(control, "")
       syncValidation(control)
     })
     control.addEventListener("change", () => {
       edited.add(control)
-      control.setCustomValidity("")
+      setValidity(control, "")
       syncValidation(control, false, true)
     })
     control.addEventListener("blur", () => {
@@ -1595,7 +1758,7 @@ function initializeAdmin() {
     $("provider-dialog").close("remove")
     confirmDelete({
       path: `/api/providers/${encodeURIComponent(provider.id)}/credential`,
-      title: `Remove ${provider.name} credential?`,
+      title: message("Remove {name} credential?", { name: provider.name }),
       description:
         "This removes the credential from Reina and stops affected work. The saved connection and models remain, but a model selected from this provider is deselected. It does not revoke access at the provider or log you out of Pocket ID. To use this provider again, add a new credential. This cannot be undone.",
       success: "Credential removed. Saved models remain.",
@@ -1634,7 +1797,7 @@ function initializeAdmin() {
     $("submit-auth-prompt").disabled = true
     $("auth-prompt-input").disabled = true
     $("auth-prompt-select").disabled = true
-    $("auth-progress").textContent = "Sending response to the provider…"
+    setText($("auth-progress"), "Sending response to the provider…")
     try {
       const response = request(`/api/provider-setups/${encodeURIComponent(flow.id)}/responses`, {
         method: "POST",
@@ -1714,7 +1877,8 @@ function initializeAdmin() {
       paths.some((path) => path.length > 256) ||
       new Set(paths.map((path) => path.toLowerCase())).size !== paths.length
     )
-      control.setCustomValidity(
+      setValidity(
+        control,
         "Enter 1–64 unique repository-relative patterns, one per line, with up to 256 characters each.",
       )
     return paths
@@ -1745,7 +1909,8 @@ function initializeAdmin() {
     } catch {
       // Parser messages can include input. Use a fixed, actionable message instead.
     }
-    $("runtime-commands").setCustomValidity(
+    setValidity(
+      $("runtime-commands"),
       'Enter a JSON array of 1–8 argv arrays, such as [["npm","run","ci"]]. Each command needs 1–32 non-empty string arguments, up to 4,096 characters each, without line breaks or null characters.',
     )
     return []
@@ -1756,14 +1921,15 @@ function initializeAdmin() {
     if (busy) return
     for (const id of ["runtime-app-id", "runtime-repository-id", "runtime-installation-id"]) {
       if (!Number.isSafeInteger(Number($(id).value)) || Number($(id).value) < 1)
-        $(id).setCustomValidity("Enter a whole number from 1 to 9,007,199,254,740,991.")
+        setValidity($(id), "Enter a whole number from 1 to 9,007,199,254,740,991.")
     }
     const allowedPaths = readRuntimePaths("runtime-allowed-paths")
     const forbiddenPaths = readRuntimePaths("runtime-forbidden-paths")
     const commands = readRuntimeCommands()
     const secret = $("runtime-webhook-secret")
     if (secret.value && (secret.value.trim() !== secret.value || /[\p{Cc}]/u.test(secret.value)))
-      secret.setCustomValidity(
+      setValidity(
+        secret,
         "Use at least 32 characters without leading or trailing spaces or control characters.",
       )
     if (!event.currentTarget.reportValidity()) return
@@ -1830,7 +1996,9 @@ function initializeAdmin() {
       status(
         $("github-app-status"),
         missing.length
-          ? `Complete the one-time service setup. Missing: ${missing.map(([label]) => label).join(", ")}.`
+          ? message("Complete the one-time service setup. Missing: {fields}.", {
+              fields: list(missing.map(([label]) => message(label))),
+            })
           : "Service App status is unavailable. Refresh settings before continuing.",
         "pending",
       )
@@ -1915,7 +2083,7 @@ function initializeAdmin() {
     if (busy) return
     const appId = Number($("github-app-id").value)
     if (!positiveId(appId))
-      $("github-app-id").setCustomValidity("Enter a whole number from 1 to 9,007,199,254,740,991.")
+      setValidity($("github-app-id"), "Enter a whole number from 1 to 9,007,199,254,740,991.")
     updateGithubSecretRequirements()
     const data = { appId }
     for (const [id, name, minimum] of [
@@ -1931,10 +2099,14 @@ function initializeAdmin() {
           value.trim() !== value ||
           /[\p{Cc}]/u.test(value))
       )
-        control.setCustomValidity(
+        setValidity(
+          control,
           name === "clientSecret"
             ? "Paste only the client secret value from GitHub (1–4,096 characters, without embedded control characters)."
-            : `Use ${minimum}–4,096 characters without leading or trailing spaces or control characters.`,
+            : message(
+                "Use {minimum}–4,096 characters without leading or trailing spaces or control characters.",
+                { minimum },
+              ),
         )
       if (value) data[name] = value
     }
@@ -1961,7 +2133,7 @@ function initializeAdmin() {
     const file = $("private-key").files?.[0]
     if (!file) return
     if (file.size > 32768 || file.size === 0) {
-      $("private-key").setCustomValidity("Select a non-empty PEM file no larger than 32 KiB.")
+      setValidity($("private-key"), "Select a non-empty PEM file no larger than 32 KiB.")
       syncValidation($("private-key"), true)
       $("private-key").reportValidity()
       return
@@ -2034,7 +2206,7 @@ function initializeAdmin() {
   $("use-model-preset").addEventListener("click", () => {
     const preset = modelOptions[Number($("model-preset").value)]
     if (!preset || $("model-preset").selectedIndex < 0) {
-      $("model-catalog-status").textContent = "Choose a model from the catalog first."
+      setText($("model-catalog-status"), "Choose a model from the catalog first.")
       $("model-preset").focus()
       return
     }

@@ -207,8 +207,11 @@ export class AdminWeb {
       await this.asset(res, "style.css", "text/css")
       return true
     }
-    if (req.method === "GET" && url.pathname === "/assets/app.js") {
-      await this.asset(res, "app.js", "text/javascript")
+    if (
+      req.method === "GET" &&
+      ["/assets/app.js", "/assets/i18n.js", "/assets/locales/tw.js"].includes(url.pathname)
+    ) {
+      await this.asset(res, url.pathname.slice("/assets/".length), "text/javascript")
       return true
     }
     if (req.method === "GET" && url.pathname === "/login") {
