@@ -8,6 +8,7 @@
 !public
 !public/**
 !scripts
+!scripts/build-web.mjs
 !scripts/container-entrypoint.sh
 !scripts/prepare-worker.mjs
 !worker

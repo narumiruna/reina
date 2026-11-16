@@ -12,7 +12,8 @@
     "url": "git+https://github.com/narumiruna/reina.git"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && npm run build:web",
+    "build:web": "node scripts/build-web.mjs",
     "start": "node dist/index.js",
     "check": "biome ci .",
     "test": "vitest run",
@@ -30,6 +31,7 @@
     "@changesets/cli": "^3.0.3",
     "@types/node": "26.6.6",
     "@types/picomatch": "4.0.3",
+    "esbuild": "0.28.2",
     "husky": "^9.1.7",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"
@@ -37,6 +39,7 @@
   "dependencies": {
     "@earendil-works/pi-ai": "1.5.0",
     "diff": "9.0.0",
+    "i18next": "27.1.2",
     "ipaddr.js": "2.5.0",
     "openid-client": "6.8.9",
     "picomatch": "4.0.7",

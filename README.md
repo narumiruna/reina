@@ -84,7 +84,10 @@ npm run ci
 npm run test:runtime
 ```
 
-`npm run ci` runs Biome, credential-free Vitest tests, and the TypeScript build. CI separately runs
+`npm run ci` runs Biome, credential-free Vitest tests, and the TypeScript and browser builds.
+Vitest prepares the browser bundle before tests. After changes to locale catalogs or
+`public/i18n.js`, run `npm run build:web` or `npm run build` before starting the local server.
+The i18next bundle is served locally; no CDN or translation service is used. CI separately runs
 `npm run check:changesets` on pull requests, except the generated `changeset-release/main` release
 PR, which has already consumed its changesets. Runtime tests use
 the real pinned Pi CLI, Docker, and a local protocol fixture, not a paid model or real GitHub App.

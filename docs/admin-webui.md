@@ -18,23 +18,38 @@ an account or server setting. If storage is blocked, switching still works for t
 On the first visit, Reina uses the first supported browser language preference: English maps to
 `en`, and Chinese (`zh` and its variants) maps to `tw`. Other languages fall back to English.
 The page language and locale-sensitive dates and counts use `en` or `zh-Hant`; `tw` is the
-application locale ID, not an HTML language tag. The default and fallback catalog is
-`public/locales/en.js`; Traditional Chinese uses `public/locales/tw.js`. Unknown messages keep
-their source text.
+application locale ID, not an HTML language tag. i18next uses `en` and `zh-Hant` internally.
+The default and fallback catalog is `public/locales/en.json`; Traditional Chinese uses
+`public/locales/tw.json`. A missing translation falls back to English. An unknown key is returned
+unchanged; English sentences are not translation keys.
 
 Names, repository identifiers, API protocols, secrets, and upstream provider prompts are not
 translated. Browser-native validation and file-picker text follow the browser language.
 GitHub publications, server logs, and documentation remain in English.
 
-For UI changes, keep the English source text and both locale catalogs in sync.
-`public/locales/en.js` and `public/locales/tw.js` must have the same keys.
-Mark static text with `data-i18n` (only direct text nodes are translated), and mark translated
-attributes with `data-i18n-aria-label` or `data-i18n-placeholder`. Dynamic text uses the bindings
-in `public/i18n.js`; use named `message()` placeholders for data and `raw()` for literal output.
+Store translations as plain JSON data, not executable JavaScript modules.
+Use stable semantic kebab-case keys, such as `models-title`, in both catalogs. Do not rename a
+key when only its wording changes. The catalogs must have the same keys. Use i18next interpolation,
+such as `{{name}}`. Pass a numeric `count` for plural messages. The configured plural separator
+is `-`, so plural keys also use kebab-case: `provider-saved-model-count-one` and
+`provider-saved-model-count-other`. i18next selects the form for each language.
+
+Mark static text with `data-i18n="models-title"`. The binding updates its first non-empty direct
+text node and keeps child elements intact. Keep complete sentences in one message instead of
+splitting them around markup. Use explicit attribute keys, such as
+`data-i18n-placeholder="provider-search-placeholder"`.
+For dynamic text, use `setText(element, message("model-delete-confirmation", { name }))`.
+Use `raw()` for literal output, including user names, IDs, and upstream prompts.
 Use a callback for text that reads a translated label or validation message. On a language change,
 source bindings update before text callbacks, so announcements do not keep text from the old language.
 Do not translate form values or render translations as HTML. The credential-free tests check
-catalog coverage, matching placeholders, locale persistence, and switching with drafts intact.
+catalog coverage, matching placeholders, plural forms, locale persistence, and switching with drafts intact.
+
+`npm run build:web` uses esbuild to bundle i18next, the catalogs, and the DOM bindings into
+`dist/browser/i18n.js`. The server serves this bundle at `/assets/i18n.js`; no CDN, remote translation
+service, or inline import map is used. `npm run build` includes this step, and Vitest global setup
+runs it before tests. After changing the catalogs or `public/i18n.js`, rebuild before starting
+the local server. The Docker build includes the browser sources and build script.
 
 ## Bootstrap and ingress
 
@@ -661,6 +676,22 @@ The following work requires external owners and is not established by credential
    proposal, add a new human approval, and verify one useful draft PR with no auto-merge. Also
    check denied approval, revocation, failure, and restart recovery. Bot-triggered CI must use
    disposable runners with no secrets, write tokens, privileged containers, or deployment access.
+
+### i18next local verification on 2026-11-16
+
+- `npm run ci`: all 1,763 tests, Biome, TypeScript, and the browser bundle build passed.
+  Changeset and whitespace checks passed. Chromium fixture checks passed for both languages,
+  draft inputs, delayed validation announcements, and narrow layouts under the self-only CSP.
+- The Docker build stage passed with `npm ci --ignore-scripts`. The generated browser bundle
+  worked after development dependencies were pruned.
+- `npm run test:runtime`: 16 passed and one failed. The Compose test stopped at container creation:
+  Docker reported that the staging volume path was `mounted on / but it is not a shared mount`.
+  The unchanged baseline at `5ab37cf` failed at the same step with the same error. No sandbox or
+  mount check was skipped or weakened.
+- The deployment operator must rerun the full runtime suite on a Docker host that supports the
+  required staging mount. This environment failure does not waive the production Linux release
+  gate or establish production runtime acceptance. These checks used no live provider or GitHub
+  credentials and made no paid requests.
 
 ### Issue-triage local verification on 2026-11-13
 

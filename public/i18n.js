@@ -1,10 +1,25 @@
-import { en } from "./locales/en.js"
-import { tw } from "./locales/tw.js"
+import { createInstance } from "i18next"
+import en from "./locales/en.json" with { type: "json" }
+import tw from "./locales/tw.json" with { type: "json" }
 
 export const locales = { en: "en", tw: "zh-Hant" }
 const storageKey = "reina.locale"
+const translations = createInstance()
+translations.init({
+  initAsync: false,
+  resources: { en: { translation: en }, "zh-Hant": { translation: tw } },
+  lng: "en",
+  fallbackLng: "en",
+  supportedLngs: Object.values(locales),
+  load: "currentOnly",
+  keySeparator: false,
+  nsSeparator: false,
+  pluralSeparator: "-",
+  // Text is assigned only through textContent, safe attributes, or setCustomValidity.
+  interpolation: { escapeValue: false, skipOnVariables: true },
+})
 
-// English is the default catalog and the fallback for missing translations.
+// Message descriptors let existing DOM bindings render in the current language.
 export function message(key, values = {}) {
   return key && typeof key === "object" ? key : { key, values }
 }
@@ -25,12 +40,6 @@ export function date(value) {
   return { date: value }
 }
 
-function lookup(key, locale) {
-  const catalog = locale === "tw" ? tw : en
-  if (Object.hasOwn(catalog, key)) return catalog[key]
-  return Object.hasOwn(en, key) ? en[key] : key
-}
-
 export function translate(value, locale = "en") {
   if (typeof value === "function") return translate(value(), locale)
   if (value && typeof value === "object") {
@@ -43,16 +52,15 @@ export function translate(value, locale = "en") {
         dateStyle: "medium",
         timeStyle: "short",
       }).format(new Date(value.date))
-    const template = lookup(value.key, locale)
-    return template.replace(/\{(\w+)\}/g, (placeholder, key) => {
-      if (!Object.hasOwn(value.values, key)) return placeholder
-      const part = value.values[key]
-      // Plain interpolation values are data, not translation keys.
-      return part && typeof part === "object" ? translate(part, locale) : String(part)
-    })
+    const values = Object.fromEntries(
+      Object.entries(value.values).map(([key, part]) => [
+        key,
+        part && typeof part === "object" ? translate(part, locale) : part,
+      ]),
+    )
+    return translations.t(value.key, { ...values, lng: locales[locale] || "en" })
   }
-  const key = String(value ?? "")
-  return lookup(key, locale)
+  return translations.t(String(value ?? ""), { lng: locales[locale] || "en" })
 }
 
 export function detectLocale(saved, languages = []) {
@@ -143,18 +151,19 @@ export function createI18n({
   }
 
   for (const element of document.querySelectorAll("[data-i18n]")) {
-    const parts = [...element.childNodes]
-      .filter((node) => node.nodeType === 3 && node.textContent.trim())
-      .map((node) => ({ node, source: node.textContent }))
+    const key = element.getAttribute("data-i18n")
+    const node = [...element.childNodes].find(
+      (part) => part.nodeType === 3 && part.textContent.trim(),
+    )
+    if (!node) continue
+    const source = node.textContent
     bind(element, "text", () => {
-      for (const { node, source } of parts) {
-        node.textContent = source.replace(/\S[\s\S]*\S|\S/, (key) => translate(key, locale))
-      }
+      node.textContent = source.replace(/\S[\s\S]*\S|\S/, () => translate(key, locale))
     })
   }
   for (const name of ["aria-label", "placeholder"]) {
     for (const element of document.querySelectorAll(`[data-i18n-${name}]`))
-      setAttribute(element, name, element.getAttribute(name))
+      setAttribute(element, name, element.getAttribute(`data-i18n-${name}`))
   }
   const select = document.getElementById("language-select")
   select?.addEventListener("change", () => setLocale(select.value))

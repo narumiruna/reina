@@ -3,7 +3,8 @@ import { setImmediate } from "node:timers/promises"
 import { runInNewContext } from "node:vm"
 import { describe, expect, it } from "vitest"
 import { createI18n, date, list, message, number, raw } from "../public/i18n.js"
-import { tw } from "../public/locales/tw.js"
+import en from "../public/locales/en.json" with { type: "json" }
+import tw from "../public/locales/tw.json" with { type: "json" }
 
 const script = readFileSync(new URL("../public/app.js", import.meta.url), "utf8")
 const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8")
@@ -695,15 +696,24 @@ describe("UI language selection", () => {
     for (const page of ["index", "login"]) {
       const markup = readFileSync(new URL(`../public/${page}.html`, import.meta.url), "utf8")
       const document = documentFixture(markup)
-      for (const element of document.querySelectorAll("[data-i18n]"))
-        for (const child of element.childNodes)
-          if (child.nodeType === 3 && /[A-Za-z]/.test(child.textContent))
-            expect(Object.hasOwn(tw, child.textContent.trim()), child.textContent).toBe(true)
-      for (const name of ["aria-label", "placeholder"])
-        for (const element of document.querySelectorAll(`[data-i18n-${name}]`))
-          expect(Object.hasOwn(tw, element.getAttribute(name)), element.getAttribute(name)).toBe(
-            true,
-          )
+      for (const element of document.querySelectorAll("[data-i18n]")) {
+        const key = element.getAttribute("data-i18n")
+        expect(key).toMatch(/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/)
+        expect(Object.hasOwn(en, key), key).toBe(true)
+        expect(Object.hasOwn(tw, key), key).toBe(true)
+        const part = element.childNodes.find(
+          (child) => child.nodeType === 3 && child.textContent.trim(),
+        )
+        expect(part?.textContent.trim(), key).toBe(en[key])
+      }
+      for (const name of ["aria-label", "placeholder"]) {
+        for (const element of document.querySelectorAll(`[data-i18n-${name}]`)) {
+          const key = element.getAttribute(`data-i18n-${name}`)
+          expect(Object.hasOwn(en, key), key).toBe(true)
+          expect(Object.hasOwn(tw, key), key).toBe(true)
+          expect(element.getAttribute(name), key).toBe(en[key])
+        }
+      }
       expect(
         document.getElementById("language-select").children.map((child) => child.value),
       ).toEqual(["en", "tw"])
@@ -743,12 +753,12 @@ describe("UI language selection", () => {
   it("preserves names and open dialog drafts while localizing card actions and confirmation text", async () => {
     const initial = {
       ...initialSettings(),
-      user: { name: "Models" },
+      user: { name: "models-title" },
       selectedModelId: "model-1",
       providers: [
         {
           id: "provider-1",
-          name: "Models",
+          name: "models-title",
           api: "openai-completions",
           baseUrl: "https://api.example.com",
           hasCredential: true,
@@ -757,8 +767,8 @@ describe("UI language selection", () => {
           models: [
             {
               id: "model-1",
-              name: "Models",
-              modelId: "Models",
+              name: "models-title",
+              modelId: "models-title",
               contextWindow: 128000,
               maxTokens: 4096,
             },
@@ -767,12 +777,12 @@ describe("UI language selection", () => {
       ],
     }
     const { $, switchLanguage, state } = await ui(initial, "tw")
-    expect($("user-name").textContent).toBe("Models")
-    expect($("provider-list").querySelector("h3")?.textContent).toBe("Models")
-    expect($("model-list").querySelector("h3")?.textContent).toBe("Models")
+    expect($("user-name").textContent).toBe("models-title")
+    expect($("provider-list").querySelector("h3")?.textContent).toBe("models-title")
+    expect($("model-list").querySelector("h3")?.textContent).toBe("models-title")
     const edit = $("provider-list").querySelector("button")
     expect(edit?.textContent).toBe("編輯")
-    expect(edit?.getAttribute("aria-label")).toBe("編輯 Models")
+    expect(edit?.getAttribute("aria-label")).toBe("編輯 models-title")
     edit?.fire("click")
     $("provider-name").value = "Unfinished draft"
     $("provider-key").value = "private-draft"
@@ -786,7 +796,7 @@ describe("UI language selection", () => {
     $("provider-dialog").close()
     $("model-list").querySelectorAll("button")[1].fire("click")
     switchLanguage("tw")
-    expect($("delete-title").textContent).toBe("刪除 Models？")
+    expect($("delete-title").textContent).toBe("刪除 models-title？")
     expect($("delete-description").textContent).toContain("清除目前的選取")
   })
 
@@ -861,7 +871,7 @@ describe("UI language selection", () => {
       const { $, i18n, runTimers, switchLanguage, state } = await ui()
       const control = $("runtime-commands")
       control.fire("input")
-      i18n.setValidity(control, "Check this value and try again.")
+      i18n.setValidity(control, message("validation-value-invalid"))
       control.fire("blur")
       const label = control.labels[0]
       expect(label.textContent).toBe("Verification commands (required)")
@@ -899,6 +909,7 @@ describe("UI language selection", () => {
     }
     runInNewContext(script.replace(/^import[^\n]+\n/, ""), {
       createI18n: () => createI18n({ document, storage, navigator: { languages: ["zh-TW"] } }),
+      message,
       document,
       URLSearchParams,
       location: { search: "?error=access_denied" },

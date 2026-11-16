@@ -5,9 +5,9 @@ const $ = (id) => document.getElementById(id)
 
 if (document.body.dataset.page === "login") {
   const messages = {
-    login_failed: "Sign-in could not be completed. Please try again.",
-    access_denied: "This account does not have access to Reina. Contact your administrator.",
-    auth_not_configured: "Sign-in is not configured. Contact your administrator.",
+    login_failed: message("login-error-failed"),
+    access_denied: message("login-error-access-denied"),
+    auth_not_configured: message("login-error-not-configured"),
   }
   const code = new URLSearchParams(location.search).get("error")
   if (code) {
@@ -81,76 +81,60 @@ function initializeAdmin() {
     maxPatchBytes: "runtime-max-bytes",
   }
   const errorMessages = {
-    invalid_request: "The request could not be processed. Reload the page and try again.",
-    invalid_input: "Check the highlighted fields and try again.",
-    invalid_content_type: "The request could not be processed. Reload the page and try again.",
-    invalid_response: "Reina returned an unexpected response. Reload the page and try again.",
-    settings_unavailable: "Settings are unavailable. Try again or contact your administrator.",
-    invalid_provider_url:
-      "Use a public HTTPS endpoint without credentials, a query, or a fragment.",
-    provider_address_not_public:
-      "Use a public HTTPS provider endpoint. Private network addresses are not allowed.",
-    provider_origin_changed: "The provider redirected to a different origin. Check its base URL.",
-    api_key_required_for_new_endpoint: "Enter a new API key when changing the provider endpoint.",
-    provider_api_key_required: "Add a credential to this provider before selecting its model.",
-    provider_credential_required: "Add a credential to this provider before selecting its model.",
-    provider_reconnect_required: "Update this provider's credential, then try again.",
-    provider_auth_required: "Update this provider's credential, then try again.",
-    provider_credential_changed:
-      "This credential changed during setup. Close this dialog and try again.",
-    model_not_available:
-      "This model is not available for the saved credential. Choose another catalog model or reconnect.",
-    model_limits_exceeded:
-      "Use context and output settings within the selected catalog model's limits.",
-    provider_setup_invalid_response:
-      "Enter a response for the current provider prompt, then continue.",
-    setup_expired: "Sign-in expired. Go back and start again.",
-    setup_cancelled: "Sign-in was cancelled. The previous credential is unchanged.",
-    setup_failed: "Sign-in could not be completed. Go back and try again.",
-    setup_limit: "Too many sign-in attempts are active. Cancel an unused attempt or try later.",
-    unsupported_auth_method: "This sign-in method is not available for this provider.",
-    unsupported_method: "This sign-in method is not available for this provider.",
-    owner_inactive: "Your Reina session is no longer active. Reload the page to sign in again.",
-    consent_required: "Confirm the GitHub Copilot policy changes before starting.",
-    capacity: "Too many sign-in attempts are active. Cancel an unused attempt or try later.",
-    stale_prompt: "This prompt is no longer active. Go back and start again.",
-    unsafe_authorization_url:
-      "The provider returned an unsupported authorization link. Sign-in was stopped.",
-    unsupported_prompt: "This provider prompt is not supported in Reina.",
-    access_denied: "Provider authorization was denied. Go back to try again.",
-    login_expired: "Provider sign-in expired. Go back and start again.",
-    login_failed: "Provider sign-in failed. Go back to try again.",
-    invalid_prompt: "This prompt is no longer active. Go back and start again.",
-    policy_confirmation_required: "Confirm the GitHub Copilot policy changes before starting.",
-    model_already_exists: "This model is already saved for this provider.",
-    provider_limit: "The limit of 50 providers has been reached. Delete an unused provider first.",
-    model_limit: "The limit of 500 models has been reached. Delete an unused model first.",
-    file_read_failed: "The file could not be read. Select the PEM file again.",
-    invalid_private_key:
-      "Select an unencrypted RSA private key in PEM format (at least 2048 bits).",
-    github_connect_not_configured:
-      "GitHub connection is not configured for this service. Ask the service operator to complete App setup.",
-    github_connect_expired:
-      "This GitHub connection attempt expired. Choose Connect GitHub to start again.",
-    github_connect_failed:
-      "GitHub connection could not be completed. Choose Connect GitHub to try again. Your saved repository is unchanged.",
-    github_connect_access_denied:
-      "GitHub authorization was denied. Your saved repository is unchanged. You can connect again when ready.",
-    github_connect_stale:
-      "This GitHub connection attempt is no longer current. Choose Connect GitHub to start again.",
-    github_connect_limit:
-      "Too many GitHub connection attempts are active. Cancel an unused attempt or try again later.",
-    unsafe_github_url:
-      "GitHub returned an unsupported navigation URL. Navigation was stopped. Start a new connection.",
-    payload_too_large:
-      "The request is too large. Keep runtime settings within 512 KiB, PEM files within 32 KiB, and API keys within 8,192 characters.",
-    not_found: "This item no longer exists. Refresh settings and try again.",
-    provider_not_found: "This provider no longer exists. Refresh settings and try again.",
-    model_not_found: "This model no longer exists. Refresh settings and try again.",
+    invalid_request: message("error-request-invalid"),
+    invalid_input: message("error-input-invalid"),
+    invalid_content_type: message("error-request-invalid"),
+    invalid_response: message("error-response-invalid"),
+    settings_unavailable: message("error-settings-unavailable"),
+    invalid_provider_url: message("error-provider-url-invalid"),
+    provider_address_not_public: message("error-provider-address-private"),
+    provider_origin_changed: message("error-provider-origin-changed"),
+    api_key_required_for_new_endpoint: message("error-provider-endpoint-key-required"),
+    provider_api_key_required: message("error-provider-credential-required"),
+    provider_credential_required: message("error-provider-credential-required"),
+    provider_reconnect_required: message("error-provider-reconnect-required"),
+    provider_auth_required: message("error-provider-reconnect-required"),
+    provider_credential_changed: message("error-provider-credential-changed"),
+    model_not_available: message("error-model-unavailable"),
+    model_limits_exceeded: message("error-model-limits"),
+    provider_setup_invalid_response: message("error-provider-response-required"),
+    setup_expired: message("error-setup-expired"),
+    setup_cancelled: message("error-setup-cancelled"),
+    setup_failed: message("error-setup-failed"),
+    setup_limit: message("error-setup-capacity"),
+    unsupported_auth_method: message("error-auth-method-unsupported"),
+    unsupported_method: message("error-auth-method-unsupported"),
+    owner_inactive: message("error-session-inactive"),
+    consent_required: message("error-copilot-consent-required"),
+    capacity: message("error-setup-capacity"),
+    stale_prompt: message("error-prompt-stale"),
+    unsafe_authorization_url: message("error-authorization-url-unsafe"),
+    unsupported_prompt: message("error-prompt-unsupported"),
+    access_denied: message("error-provider-access-denied"),
+    login_expired: message("error-provider-login-expired"),
+    login_failed: message("error-provider-login-failed"),
+    invalid_prompt: message("error-prompt-stale"),
+    policy_confirmation_required: message("error-copilot-consent-required"),
+    model_already_exists: message("error-model-duplicate"),
+    provider_limit: message("error-provider-limit"),
+    model_limit: message("error-model-limit"),
+    file_read_failed: message("error-file-read"),
+    invalid_private_key: message("error-private-key-invalid"),
+    github_connect_not_configured: message("error-github-not-configured"),
+    github_connect_expired: message("error-github-expired"),
+    github_connect_failed: message("error-github-failed"),
+    github_connect_access_denied: message("error-github-access-denied"),
+    github_connect_stale: message("error-github-stale"),
+    github_connect_limit: message("error-github-capacity"),
+    unsafe_github_url: message("error-github-url-unsafe"),
+    payload_too_large: message("error-payload-too-large"),
+    not_found: message("error-item-not-found"),
+    provider_not_found: message("error-provider-not-found"),
+    model_not_found: message("error-model-not-found"),
 
-    csrf_failed: "Your security token has expired. Reload the page and try again.",
-    forbidden: "This action is not allowed. Reload the page and try again.",
-    network_error: "Could not reach Reina. Check your connection and try again.",
+    csrf_failed: message("error-csrf-expired"),
+    forbidden: message("error-action-forbidden"),
+    network_error: message("error-network"),
   }
 
   function node(tag, className, text) {
@@ -167,7 +151,7 @@ function initializeAdmin() {
       setAttribute(
         element,
         "aria-label",
-        message("{action} {context}", { action: message(text), context }),
+        message("contextual-action-label", { action: message(text), context }),
       )
     element.addEventListener("click", onClick)
     return element
@@ -183,7 +167,7 @@ function initializeAdmin() {
     return (
       errorMessages[error.code] ||
       errorMessages[String(error.code).replace(/^provider_(?:setup|auth)_/, "")] ||
-      "The action could not be completed. Check your settings and try again."
+      message("error-action-failed")
     )
   }
 
@@ -250,17 +234,13 @@ function initializeAdmin() {
       control.disabled = true
     })
     $("settings-content").setAttribute("aria-busy", "true")
-    status($("page-status"), "Loading your settings…", "pending")
+    status($("page-status"), message("settings-loading"), "pending")
     try {
       await refreshSettings()
       status($("page-status"))
     } catch (error) {
       if (error.code !== "unauthorized") {
-        status(
-          $("page-status"),
-          "Settings could not be loaded. Check your connection and try again.",
-          "error",
-        )
+        status($("page-status"), message("error-settings-load"), "error")
         $("retry-settings").hidden = false
       }
     } finally {
@@ -297,7 +277,7 @@ function initializeAdmin() {
     })
     const dialog = target.closest("dialog")
     ;(dialog || $("settings-content")).setAttribute("aria-busy", "true")
-    status(target, "Saving changes…", "pending")
+    status(target, message("changes-saving"), "pending")
     let saved = false
     const invalidControls = []
     try {
@@ -330,12 +310,12 @@ function initializeAdmin() {
           githubView = null
           renderGithubView()
         }
-        const message =
+        const failureMessage =
           saved && error.code !== "unsafe_github_url"
-            ? "Changes were saved, but settings could not be refreshed. Retry loading settings before making more changes."
+            ? message("error-settings-refresh-after-save")
             : errorMessage(error)
         if (saved && dialog?.open) dialog.close("saved")
-        status(saved && dialog ? $("page-status") : target, message, "error")
+        status(saved && dialog ? $("page-status") : target, failureMessage, "error")
         if (saved) {
           $("retry-settings").hidden = false
         } else if (form && error.fields?.length) {
@@ -360,7 +340,7 @@ function initializeAdmin() {
               )
                 continue
               if (control.closest("details")) control.closest("details").open = true
-              setValidity(control, "Check this value and try again.")
+              setValidity(control, message("validation-value-invalid"))
               invalidControls.push(control)
             }
           }
@@ -491,14 +471,14 @@ function initializeAdmin() {
     setText(
       $("runtime-secret-label"),
       configured
-        ? "Webhook secret (optional replacement)"
-        : "Webhook secret (required for first save)",
+        ? message("webhook-secret-replacement-label")
+        : message("webhook-secret-first-save-label"),
     )
     setText(
       $("runtime-secret-hint"),
       configured
-        ? "Secret configured. Leave blank to keep it, or enter at least 32 characters to replace it. Use the same secret in your GitHub App webhook configuration. The saved secret is never displayed."
-        : "Write-only. Enter at least 32 characters for the first save. Use the same secret in your GitHub App webhook configuration. Saved secrets are never displayed.",
+        ? message("webhook-secret-replacement-hint")
+        : message("webhook-secret-first-save-hint"),
     )
   }
 
@@ -524,45 +504,45 @@ function initializeAdmin() {
     const selected = models.find((model) => model.id === settings.selectedModelId)
     const runtime = settings.runtime
     const states = {
-      starting: "Applying configuration",
-      running: "Configuration applied",
-      not_configured: "Configuration incomplete",
-      failed: "Configuration could not be applied",
+      starting: message("runtime-state-starting"),
+      running: message("runtime-state-running"),
+      not_configured: message("runtime-state-incomplete"),
+      failed: message("runtime-state-failed"),
     }
     const reasons = {
-      configure_model: "Choose a saved model to continue.",
-      upload_private_key: "Ask the service operator to complete GitHub App setup.",
-      configure_runtime: "Complete Runtime settings to continue.",
-      configure_environment:
-        "Server environment settings are incomplete. Contact your administrator.",
-      cleanup_requires_operator_check:
-        "Server cleanup failed. Ask your administrator to check cleanup and restart Reina.",
-      settings_unavailable: "Settings could not be read. Contact your administrator.",
-      authentication_or_sandbox_unavailable:
-        "Check GitHub App credentials and server sandbox configuration.",
+      configure_model: message("runtime-reason-model-required"),
+      upload_private_key: message("runtime-reason-github-setup"),
+      configure_runtime: message("runtime-reason-settings-required"),
+      configure_environment: message("runtime-reason-environment"),
+      cleanup_requires_operator_check: message("runtime-reason-cleanup"),
+      settings_unavailable: message("runtime-reason-settings-unavailable"),
+      authentication_or_sandbox_unavailable: message("runtime-reason-authentication-sandbox"),
     }
-    const runtimeText = states[runtime.state] || "Runtime configuration"
+    const runtimeText = states[runtime.state] || message("runtime-configuration-title")
     setText(
       $("runtime-status"),
-      message("{state}. {reason}", {
+      message("runtime-status-summary", {
         state: message(runtimeText),
         reason: reasons[runtime.reason]
           ? message(reasons[runtime.reason])
           : selected
-            ? message("Selected model: {name}.", { name: selected.name })
-            : message("No model selected."),
+            ? message("runtime-selected-model", { name: selected.name })
+            : message("runtime-no-model"),
       }),
     )
     $("runtime-settings-link").hidden = runtime.reason !== "configure_runtime"
-    setText($("github-badge"), settings.github.configured ? "Key configured" : "Not configured")
+    setText(
+      $("github-badge"),
+      settings.github.configured ? message("key-configured") : message("credential-not-configured"),
+    )
     $("github-badge").classList.toggle("good", settings.github.configured)
     setText(
       $("github-fingerprint"),
       settings.github.configured
         ? settings.github.fingerprint
           ? raw(settings.github.fingerprint)
-          : "Fingerprint unavailable"
-        : "No key uploaded",
+          : message("key-fingerprint-unavailable")
+        : message("key-not-uploaded"),
     )
     const uploaded = settings.github.uploadedAt
     setText(
@@ -571,11 +551,15 @@ function initializeAdmin() {
     )
     setText(
       $("key-form-title"),
-      settings.github.configured ? "Replace private key" : "Upload private key",
+      settings.github.configured
+        ? message("private-key-replace-button")
+        : message("private-key-upload-button"),
     )
     setText(
       $("upload-key"),
-      settings.github.configured ? "Replace private key" : "Upload private key",
+      settings.github.configured
+        ? message("private-key-replace-button")
+        : message("private-key-upload-button"),
     )
     renderGithubSettings()
     updateControls()
@@ -622,10 +606,7 @@ function initializeAdmin() {
       $("runtime-image").value = ""
       $("runtime-forbidden-paths").value = ""
       $("runtime-repository-review").hidden = false
-      setText(
-        $("runtime-repository-review"),
-        "Repository or App identity changed. Stored Runtime settings were not changed. The worker image and forbidden paths were cleared in this form. Review the allowed paths, verification commands, and limits for this target before saving and applying.",
-      )
+      setText($("runtime-repository-review"), message("runtime-identity-changed-warning"))
     }
     if (appChanged) {
       githubAppFormInitialized = false
@@ -646,11 +627,10 @@ function initializeAdmin() {
     setText(
       $("runtime-connection-status"),
       connection
-        ? message(
-            "Connected repository: {repository}. Identity is supplied by Connect GitHub. An exact match to the complete saved Runtime configuration can restart scans and use model quota. New or changed worker settings and policy require Runtime Save and apply. Coding still requires explicit approval.",
-            { repository: `${connection.repository.owner}/${connection.repository.name}` },
-          )
-        : "No connected repository. Connect GitHub to select a verified repository, or use Advanced GitHub identity to enter a manual target.",
+        ? message("runtime-connected-repository-description", {
+            repository: `${connection.repository.owner}/${connection.repository.name}`,
+          })
+        : message("runtime-no-repository-description"),
     )
     runtimeConnectionBinding = nextBinding
     runtimeServiceAppId = serviceAppId
@@ -661,14 +641,14 @@ function initializeAdmin() {
     // A legacy webhook can exist before the first service App save.
     const sameApp = !positiveId(app?.appId) || Number($("github-app-id").value) === app.appId
     for (const [id, configured, label] of [
-      ["github-client-secret", app?.clientSecretConfigured, "Client secret"],
-      ["github-webhook-secret", app?.webhookSecretConfigured, "Webhook secret"],
+      ["github-client-secret", app?.clientSecretConfigured, message("client-secret-label")],
+      ["github-webhook-secret", app?.webhookSecretConfigured, message("webhook-secret-label")],
     ]) {
       const required = !sameApp || !configured
       $(id).required = required
       setText(
         $(`${id}-label`),
-        message(required ? "{label} (required)" : "{label} (optional replacement)", {
+        message(required ? message("field-required-label") : message("field-replacement-label"), {
           label: message(label),
         }),
       )
@@ -679,10 +659,10 @@ function initializeAdmin() {
     const app = settings?.githubApp
     if (!app) return []
     return [
-      ["GitHub App ID", "github-app-id", positiveId(app.appId)],
-      ["App private key", "private-key", app.privateKeyConfigured],
-      ["OAuth client secret", "github-client-secret", app.clientSecretConfigured],
-      ["Webhook secret", "github-webhook-secret", app.webhookSecretConfigured],
+      [message("github-app-id-label"), "github-app-id", positiveId(app.appId)],
+      [message("github-private-key-label"), "private-key", app.privateKeyConfigured],
+      [message("oauth-client-secret-label"), "github-client-secret", app.clientSecretConfigured],
+      [message("webhook-secret-label"), "github-webhook-secret", app.webhookSecretConfigured],
     ].filter(([, , configured]) => !configured)
   }
 
@@ -690,36 +670,36 @@ function initializeAdmin() {
     const app = settings.githubApp
     const connection = settings.githubConnection
     $("github-service-notice").hidden = app?.configured === true
-    setText($("github-connection-badge"), connection ? "Repository connected" : "Not connected")
+    setText(
+      $("github-connection-badge"),
+      connection ? message("github-repository-connected") : message("github-not-connected"),
+    )
     $("github-connection-badge").classList.toggle("good", Boolean(connection))
     $("github-connection-metadata").hidden = !connection
     if (connection) {
       const repository = connection.repository
       setText(
         $("github-current-repository"),
-        message(
-          "{repository} · Repository ID {repositoryId} · Installation ID {installationId} · App ID {appId}",
-          {
-            repository: `${repository.owner}/${repository.name}`,
-            repositoryId: repository.id,
-            installationId: repository.installationId,
-            appId: connection.appId,
-          },
-        ),
+        message("github-repository-metadata", {
+          repository: `${repository.owner}/${repository.name}`,
+          repositoryId: repository.id,
+          installationId: repository.installationId,
+          appId: connection.appId,
+        }),
       )
       setText(
         $("github-current-user"),
-        message("{login} · User ID {id}", { login: connection.user.login, id: connection.user.id }),
+        message("github-user-metadata", { login: connection.user.login, id: connection.user.id }),
       )
       const connectedAt = new Date(connection.connectedAt)
       setText(
         $("github-connected-at"),
-        Number.isFinite(connectedAt.getTime()) ? date(connectedAt) : "Date unavailable",
+        Number.isFinite(connectedAt.getTime()) ? date(connectedAt) : message("date-unavailable"),
       )
     }
     setText(
       $("github-connect"),
-      connection ? "Connect GitHub / change repository" : "Connect GitHub",
+      connection ? message("github-change-repository-button") : message("github-connect-button"),
     )
     if (app?.configured !== true) {
       $("github-connect").setAttribute("aria-controls", "github-service-setup")
@@ -730,21 +710,33 @@ function initializeAdmin() {
     }
     setText(
       $("github-callback-url"),
-      app?.callbackUrl ? raw(app.callbackUrl) : "Unavailable in this service version",
+      app?.callbackUrl ? raw(app.callbackUrl) : message("service-version-unavailable"),
     )
     setText(
       $("github-setup-url"),
-      app?.setupUrl ? raw(app.setupUrl) : "Unavailable in this service version",
+      app?.setupUrl ? raw(app.setupUrl) : message("service-version-unavailable"),
     )
     setText(
       $("github-service-status"),
       app
-        ? message("Client secret: {client}. Webhook secret: {webhook}. Private key: {key}.", {
-            client: message(app.clientSecretConfigured ? "configured" : "not configured"),
-            webhook: message(app.webhookSecretConfigured ? "configured" : "not configured"),
-            key: message(app.privateKeyConfigured ? "configured" : "not configured"),
+        ? message("github-service-credential-status", {
+            client: message(
+              app.clientSecretConfigured
+                ? message("credential-configured")
+                : message("credential-unconfigured"),
+            ),
+            webhook: message(
+              app.webhookSecretConfigured
+                ? message("credential-configured")
+                : message("credential-unconfigured"),
+            ),
+            key: message(
+              app.privateKeyConfigured
+                ? message("credential-configured")
+                : message("credential-unconfigured"),
+            ),
           })
-        : "Service App status is unavailable. Ask the service operator to update Reina before using Connect GitHub.",
+        : message("github-service-status-unavailable"),
     )
     if (!githubAppFormInitialized) {
       if (positiveId(app?.appId)) $("github-app-id").value = String(app.appId)
@@ -762,7 +754,7 @@ function initializeAdmin() {
     const select = $("github-repository-select")
     const previous = select.value
     select.replaceChildren(
-      option("Choose a repository", ""),
+      option(message("repository-choose-option"), ""),
       ...repositories.map((repository) => option(raw(repository.fullName), String(repository.id))),
     )
     select.value = previous
@@ -772,34 +764,23 @@ function initializeAdmin() {
     $("github-install-help").hidden = !authorized
     $("github-cancel").hidden = state === "idle"
     const user = githubView?.user?.login
-      ? message(" as {login}", { login: githubView.user.login })
+      ? message("github-authorized-user", { login: githubView.user.login })
       : ""
     const missing = missingGithubSetupFields().map(([label]) => label)
     const messages = {
       idle:
         settings.githubApp?.configured === true
-          ? "Choose Connect GitHub to authorize an account and select a repository. Your saved repository, if any, stays unchanged until you choose Use repository."
+          ? message("github-connect-idle-description")
           : missing.length
-            ? message(
-                "Missing service settings: {fields}. Choose Connect GitHub to open the required setup fields.",
-                { fields: list(missing.map((label) => message(label))) },
-              )
-            : "GitHub service status is unavailable. Refresh settings or contact the service operator.",
-      connecting:
-        "GitHub authorization has started. Complete authorization on GitHub, or cancel this attempt and connect again.",
+            ? message("github-setup-missing-description", {
+                fields: list(missing.map((label) => message(label))),
+              })
+            : message("github-status-unavailable"),
+      connecting: message("github-authorization-started"),
       select_repository: canSelect
-        ? message(
-            "GitHub authorized{user}. Choose a repository, then choose Use repository to save it. Use Install / manage App to add repositories.",
-            { user },
-          )
-        : message(
-            "GitHub authorized{user}, but no repositories are available. Install the App or request organization approval, then refresh repositories.",
-            { user },
-          ),
-      install_required: message(
-        "GitHub authorized{user}. No App installation with an available repository was found. Install the App or request organization approval, then refresh repositories.",
-        { user },
-      ),
+        ? message("github-authorized-repositories-description", { user })
+        : message("github-authorized-empty-description", { user }),
+      install_required: message("github-install-required-description", { user }),
     }
     const code = githubCallbackError || (expired ? "github_connect_expired" : null)
     status(
@@ -830,7 +811,7 @@ function initializeAdmin() {
       control.disabled = true
     })
     $("github-page").setAttribute("aria-busy", "true")
-    status($("github-connect-status"), "Checking GitHub connection…", "pending")
+    status($("github-connect-status"), message("github-connection-checking"), "pending")
     try {
       applyGithubView(await request("/api/github/connect"))
     } catch (error) {
@@ -895,11 +876,11 @@ function initializeAdmin() {
   }
 
   function credentialStatus(provider) {
-    if (!provider.hasCredential) return "Not configured"
-    if (provider.authType !== "oauth") return "API key configured"
+    if (!provider.hasCredential) return message("credential-not-configured")
+    if (provider.authType !== "oauth") return message("credential-api-key-configured")
     return provider.authDetails?.oauth?.isSubscription === true
-      ? "Subscription configured"
-      : "Account configured"
+      ? message("credential-subscription-configured")
+      : message("credential-account-configured")
   }
 
   function renderProvider(provider) {
@@ -928,40 +909,34 @@ function initializeAdmin() {
       node(
         "p",
         "",
-        message(
-          provider.models.length === 1
-            ? "{provider} · {count} saved model"
-            : "{provider} · {count} saved models",
-          {
-            provider: provider.sdkProviderId
-              ? message("Built-in provider")
-              : apiNames[provider.api] || provider.api,
-            count: number(provider.models.length),
-          },
-        ),
+        message("provider-saved-model-count", {
+          provider: provider.sdkProviderId
+            ? message("provider-builtin-label")
+            : apiNames[provider.api] || provider.api,
+          count: provider.models.length,
+        }),
       ),
     )
     const actions = node("div", "card-actions")
     actions.append(
-      button("Edit", "quiet", () => openProvider(provider), provider.name),
+      button(message("edit-button"), "quiet", () => openProvider(provider), provider.name),
       button(
-        "Delete",
+        message("delete-button"),
         "quiet danger",
         () =>
           confirmDelete({
             path: `/api/providers/${encodeURIComponent(provider.id)}`,
-            title: message("Delete saved connection to {name}?", { name: provider.name }),
-            description:
-              "This deletes the saved connection, its credential, and all its saved models. If one is selected, the selection is cleared. Built-in providers remain in the catalog. This cannot be undone.",
-            success: "Saved connection deleted.",
+            title: message("provider-delete-confirmation", { name: provider.name }),
+            description: message("provider-delete-warning"),
+            success: message("provider-deleted"),
           }),
         provider.name,
       ),
       button(
-        "＋ Save model",
+        message("model-save-add-button"),
         "secondary",
         () => openModel(provider),
-        message("for {name}", { name: provider.name }),
+        message("provider-for-name", { name: provider.name }),
       ),
     )
     bottom.append(info, actions)
@@ -975,55 +950,55 @@ function initializeAdmin() {
     const info = node("div", "model-info")
     const title = node("div", "model-title")
     title.append(node("h3", "", raw(model.name)))
-    if (selected) title.append(node("span", "badge selected", "Selected model"))
+    if (selected) title.append(node("span", "badge selected", message("model-selected-label")))
     info.append(
       title,
       node("code", "", raw(model.modelId)),
       node(
         "p",
         "model-meta",
-        message("{provider} · Context window: {context} tokens · {output}", {
+        message("model-metadata", {
           provider: model.provider.name,
           context: number(model.contextWindow),
           output:
             model.provider.sdkProviderId === "openai-codex"
-              ? message("Maximum output tokens setting: ignored by SDK 1.5.0")
-              : message("Maximum output tokens: {count}", { count: number(model.maxTokens) }),
+              ? message("model-output-ignored")
+              : message("model-output-count", { count: number(model.maxTokens) }),
         }),
       ),
     )
     const actions = node("div", "card-actions")
     actions.append(
       button(
-        "Edit",
+        message("edit-button"),
         "quiet",
         () => openModel(model.provider, model),
-        message("{model} from {provider}", { model: model.name, provider: model.provider.name }),
+        message("model-provider-context", { model: model.name, provider: model.provider.name }),
       ),
       button(
-        "Delete",
+        message("delete-button"),
         "quiet danger",
         () =>
           confirmDelete({
             path: `/api/models/${encodeURIComponent(model.id)}`,
-            title: message("Delete {name}?", { name: model.name }),
+            title: message("model-delete-confirmation", { name: model.name }),
             description: selected
-              ? "This deletes the saved model and clears the current selection. The provider and its credential will remain."
-              : "This deletes the saved model. The provider and its credential will remain.",
-            success: "Model deleted.",
+              ? message("model-selected-delete-warning")
+              : message("model-delete-warning"),
+            success: message("model-deleted"),
           }),
-        message("{model} from {provider}", { model: model.name, provider: model.provider.name }),
+        message("model-provider-context", { model: model.name, provider: model.provider.name }),
       ),
     )
     const use = button(
-      selected ? "Selected model" : "Select model",
+      selected ? message("model-selected-label") : message("model-select-button"),
       selected ? "secondary" : "primary",
       () => {
         if (selected) return
         if (!model.provider.hasCredential) {
           status(
             $("page-status"),
-            message("Add a credential to {name} before selecting this model.", {
+            message("model-provider-credential-required", {
               name: model.provider.name,
             }),
             "error",
@@ -1034,13 +1009,10 @@ function initializeAdmin() {
           path: "/api/selection",
           method: "PUT",
           data: { modelId: model.id },
-          success: message(
-            "{name} selected. Check runtime status to confirm that the configuration is applied.",
-            { name: model.name },
-          ),
+          success: message("model-selected-notice", { name: model.name }),
         })
       },
-      message("{model} from {provider}", { model: model.name, provider: model.provider.name }),
+      message("model-provider-context", { model: model.name, provider: model.provider.name }),
     )
     if (selected) use.setAttribute("aria-disabled", "true")
     actions.append(use)
@@ -1050,9 +1022,9 @@ function initializeAdmin() {
 
   function showPage({ focus = false } = {}) {
     const pages = {
-      models: ["Models", "Configure a provider. Select a model for Reina."],
-      github: ["GitHub App", "Connect your GitHub account and choose a repository."],
-      runtime: ["Runtime", "Configure the repository, worker image, and runtime policy."],
+      models: [message("models-title"), message("models-page-description")],
+      github: [message("github-title"), message("github-page-description")],
+      runtime: [message("runtime-title"), message("runtime-page-description")],
     }
     const page = Object.hasOwn(pages, location.hash.slice(1)) ? location.hash.slice(1) : "models"
     for (const name of Object.keys(pages)) {
@@ -1064,7 +1036,7 @@ function initializeAdmin() {
     setText($("page-description"), pages[page][1])
     setText(
       document.querySelector("title"),
-      message("{page} · Reina", { page: message(pages[page][0]) }),
+      message("page-document-title", { page: message(pages[page][0]) }),
     )
     $(`nav-${page}`).setAttribute("aria-current", "page")
     if (focus) $("page-title").focus()
@@ -1076,8 +1048,8 @@ function initializeAdmin() {
 
   function populateApiOptions(preferred = "") {
     $("provider-api").replaceChildren(
-      option("Select an API", ""),
-      ...Object.entries(apiNames).map(([id, name]) => option(name, id)),
+      option(message("api-choose-option"), ""),
+      ...Object.entries(apiNames).map(([id, name]) => option(raw(name), id)),
     )
     $("provider-api").value = preferred
   }
@@ -1085,8 +1057,8 @@ function initializeAdmin() {
   async function loadCatalog() {
     if (catalog) return
     if (catalogRequest) return catalogRequest
-    setText($("provider-catalog-status"), "Loading catalog…")
-    setText($("model-catalog-status"), "Loading catalog…")
+    setText($("provider-catalog-status"), message("catalog-loading"))
+    setText($("model-catalog-status"), message("catalog-loading"))
     catalogRequest = (async () => {
       try {
         const result = await request("/api/catalog")
@@ -1094,16 +1066,13 @@ function initializeAdmin() {
         catalog = result
       } catch (error) {
         if (error.code !== "unauthorized") {
-          setText(
-            $("provider-catalog-status"),
-            "Catalog unavailable. Retry, or go back to choose another method. Custom endpoints are available only with API keys.",
-          )
+          setText($("provider-catalog-status"), message("error-provider-catalog-unavailable"))
           $("retry-provider-catalog").hidden = false
           setText(
             $("model-catalog-status"),
             settings?.providers.find((provider) => provider.id === modelProviderId)?.sdkProviderId
-              ? "Catalog unavailable. Close and reopen to retry. Built-in providers require a catalog model."
-              : "Catalog unavailable. Enter a custom model below, or close and reopen to retry.",
+              ? message("error-builtin-model-catalog-unavailable")
+              : message("error-custom-model-catalog-unavailable"),
           )
         }
       } finally {
@@ -1142,12 +1111,12 @@ function initializeAdmin() {
     updateProviderSignInLabel()
     $("retry-provider-catalog").hidden = true
     const resultMessage = options.length
-      ? message("{count} providers. Select a provider to configure.", {
+      ? message("provider-search-results", {
           count: number(options.length),
         })
       : query
-        ? "No matching providers. Try another search."
-        : "No providers support this method in Reina. Go back to choose another method."
+        ? message("provider-search-empty")
+        : message("provider-method-empty")
     announceSearch($("provider-catalog-status"), resultMessage)
   }
 
@@ -1159,19 +1128,21 @@ function initializeAdmin() {
       $("continue-provider"),
       provider
         ? (details?.loginLabel ? raw(details.loginLabel) : null) ||
-            (setup.authType === "oauth" ? "Sign in with an account" : "Sign in with an API key")
-        : "Continue",
+            (setup.authType === "oauth"
+              ? message("auth-account-method")
+              : message("auth-api-key-method"))
+        : message("continue-button"),
     )
     setText(
       $("auth-provider-description"),
-      message("{description}{method}", {
+      message("provider-auth-description", {
         description: message(
           setup.authType === "oauth"
-            ? "Providers available for sign in with an account. OpenAI Codex is separate from OpenAI API keys."
-            : "Providers available for sign in with an API key. Built-in providers use their own setup prompts.",
+            ? message("provider-account-description")
+            : message("provider-api-key-description"),
         ),
         method: details?.name
-          ? message(" Authentication method: {name}.", { name: details.name })
+          ? message("provider-auth-method-description", { name: details.name })
           : "",
       }),
     )
@@ -1203,12 +1174,12 @@ function initializeAdmin() {
     announceSearch(
       $("model-catalog-status"),
       modelOptions.length
-        ? message("{count} models. Select a catalog model, then review it before saving.", {
+        ? message("model-search-results", {
             count: number(modelOptions.length),
           })
         : settings?.providers.find((provider) => provider.id === modelProviderId)?.sdkProviderId
-          ? "No matching catalog models. Try another search. Built-in providers require a catalog model."
-          : "No matching models. Try another search or enter a custom model below.",
+          ? message("model-builtin-search-empty")
+          : message("model-custom-search-empty"),
     )
   }
 
@@ -1232,19 +1203,22 @@ function initializeAdmin() {
       setText($("auth-credential-title"), raw(provider.name))
       setText(
         $("auth-credential-status"),
-        message(
-          "{status} — {method}. Updating keeps this saved connection and authentication method. Models and selection save separately.",
-          {
-            status: message(credentialStatus(provider)),
-            method:
-              provider.authDetails?.[provider.authType]?.name ||
-              message(provider.authType === "oauth" ? "Account" : "API key"),
-          },
-        ),
+        message("credential-management-description", {
+          status: message(credentialStatus(provider)),
+          method:
+            provider.authDetails?.[provider.authType]?.name ||
+            message(
+              provider.authType === "oauth"
+                ? message("account-method-label")
+                : message("api-key-method-label"),
+            ),
+        }),
       )
       setText(
         $("update-credential"),
-        provider.hasCredential ? "Update credential" : "Add credential",
+        provider.hasCredential
+          ? message("credential-update-button")
+          : message("credential-add-button"),
       )
       $("remove-credential").hidden = !provider.hasCredential
       setSetupStage("credential", false)
@@ -1266,18 +1240,22 @@ function initializeAdmin() {
     setText(
       $("provider-key-hint"),
       provider?.hasApiKey
-        ? "API key configured. Leave blank to keep it, or enter a new key to replace it. Changing the endpoint requires a new key. The saved key is never returned."
-        : "Write-only. A key is needed to use a model. You can save the provider without one.",
+        ? message("provider-api-key-replacement-hint")
+        : message("provider-api-key-new-hint"),
     )
   }
 
   const setupStages = {
-    method: ["auth-method-form", "Step 1: Select authentication method", "auth-account"],
-    provider: ["auth-provider-form", "Step 2: Select provider", "provider-search"],
-    policy: ["auth-policy-form", "Step 3: Confirm remote policy changes", "auth-policy-title"],
-    credential: ["auth-credential-actions", "Manage credential", "update-credential"],
-    setup: ["auth-setup", "Step 3: Complete provider sign-in", "auth-progress"],
-    custom: ["provider-form", "Step 3: Add custom provider", "provider-name"],
+    method: ["auth-method-form", message("provider-step-method"), "auth-account"],
+    provider: ["auth-provider-form", message("provider-step-provider"), "provider-search"],
+    policy: ["auth-policy-form", message("provider-step-policy"), "auth-policy-title"],
+    credential: [
+      "auth-credential-actions",
+      message("credential-manage-title"),
+      "update-credential",
+    ],
+    setup: ["auth-setup", message("provider-step-sign-in"), "auth-progress"],
+    custom: ["provider-form", message("provider-step-custom"), "provider-name"],
   }
 
   function focusSetupStage() {
@@ -1294,18 +1272,20 @@ function initializeAdmin() {
       $("provider-title"),
       stage === "custom"
         ? providerEditId
-          ? "Edit custom provider"
-          : "Add custom provider"
+          ? message("provider-custom-edit-title")
+          : message("provider-custom-add-button")
         : stage === "provider"
-          ? "Select provider"
+          ? message("provider-select-title")
           : providerEditId
-            ? "Edit provider"
-            : "Configure provider",
+            ? message("provider-edit-title")
+            : message("provider-configure-title"),
     )
     for (const [key, [id]] of Object.entries(setupStages)) $(id).hidden = stage !== key
     setText(
       $("provider-step"),
-      stage === "custom" && providerEditId ? "Edit custom provider" : setupStages[stage][1],
+      stage === "custom" && providerEditId
+        ? message("provider-custom-edit-title")
+        : setupStages[stage][1],
     )
     $("provider-back").hidden =
       stage === "method" ||
@@ -1373,7 +1353,7 @@ function initializeAdmin() {
     flow.promptId = null
     flow.eventKey = null
     const revision = ++flow.revision
-    setText($("auth-progress"), "Starting provider sign-in…")
+    setText($("auth-progress"), message("provider-sign-in-starting"))
     try {
       const view = await request("/api/provider-setups", {
         method: "POST",
@@ -1407,14 +1387,11 @@ function initializeAdmin() {
     $("auth-prompt-form").hidden = true
     $("auth-event").replaceChildren()
     $("auth-link-help").hidden = true
-    setText($("auth-progress"), "Sign-in stopped. Go back to try again.")
+    setText($("auth-progress"), message("provider-sign-in-stopped"))
     if (error.code !== "unauthorized")
       status(
         $("provider-status"),
-        message(
-          "{error} Existing credentials and model selection were not changed by this attempt.",
-          { error: message(errorMessage(error)) },
-        ),
+        message("provider-sign-in-error-notice", { error: message(errorMessage(error)) }),
         "error",
       )
   }
@@ -1423,7 +1400,7 @@ function initializeAdmin() {
     try {
       const parsed = new URL(url)
       if (parsed.protocol !== "https:" || parsed.username || parsed.password) return null
-      const link = node("a", "auth-link", label || "Open authorization page")
+      const link = node("a", "auth-link", label || message("auth-authorization-page-link"))
       link.href = parsed.href
       link.target = "_blank"
       link.rel = "noopener noreferrer"
@@ -1443,29 +1420,30 @@ function initializeAdmin() {
       if (link) {
         output.append(link)
         $("auth-link-help").hidden = false
-      } else
-        output.append(
-          node(
-            "p",
-            "hint",
-            "Authorization link unavailable: only secure HTTPS links are allowed. Go back and retry sign-in.",
-          ),
-        )
+      } else output.append(node("p", "hint", message("error-authorization-link-unavailable")))
     }
     if (event.type === "device_code") {
       output.append(
-        node("p", "hint", "Enter this code on the provider's verification page:"),
+        node("p", "hint", message("auth-device-code-instructions")),
         node("output", "device-code mono", raw(event.userCode)),
       )
-      addLink(event.verificationUri, "Open verification page")
+      addLink(event.verificationUri, message("auth-verification-page-link"))
       if (event.instructions) output.append(node("p", "hint", raw(event.instructions)))
     } else if (event.type === "auth_url") {
-      if (event.instructions) output.append(node("p", "hint", event.instructions))
-      addLink(event.url, "Open authorization page")
+      if (event.instructions)
+        output.append(node("p", "hint", message("auth-account-authorize-instructions")))
+      addLink(event.url, message("auth-authorization-page-link"))
     } else if (event.type === "info" || event.type === "progress") {
-      // These status messages and labels are fixed by Reina, not supplied by the provider.
-      output.append(node("p", "hint", event.message))
-      for (const link of event.links || []) addLink(link.url, link.label)
+      // Reina normalizes these events. Do not use server prose as translation keys.
+      output.append(
+        node(
+          "p",
+          "hint",
+          event.type === "info" ? message("auth-account-continue") : message("auth-in-progress"),
+        ),
+      )
+      for (const link of event.links || [])
+        addLink(link.url, message("auth-authorization-link-label"))
     }
   }
 
@@ -1485,24 +1463,17 @@ function initializeAdmin() {
       flow.pending = true
       $("auth-prompt-input").value = ""
       $("auth-prompt-form").hidden = true
-      setText($("auth-progress"), "Credential saved. Refreshing settings…")
+      setText($("auth-progress"), message("credential-saved-refreshing"))
       try {
         await refreshSettings(stillCompleting)
         if (!stillCompleting()) return
         $("provider-dialog").close("saved")
-        status(
-          $("page-status"),
-          "Credential saved. Model selection is unchanged. Save a model, then use Select model to save your preference.",
-        )
+        status($("page-status"), message("credential-saved-notice"))
         focusAfterRemoval()
       } catch {
         if (!stillCompleting()) return
         $("provider-dialog").close("saved")
-        status(
-          $("page-status"),
-          "Credential saved, but settings could not be refreshed. Retry loading settings before making more changes.",
-          "error",
-        )
+        status($("page-status"), message("error-credential-refresh-after-save"), "error")
         $("retry-settings").hidden = false
         focusAfterRemoval()
       }
@@ -1529,9 +1500,7 @@ function initializeAdmin() {
       throw { code: "invalid_response" }
     setText(
       $("auth-progress"),
-      prompt
-        ? "Complete the provider prompt to continue."
-        : "Waiting for the provider. You can go back or cancel sign-in.",
+      prompt ? message("provider-prompt-required") : message("provider-waiting"),
     )
     if (prompt?.id !== flow.promptId) {
       flow.promptId = prompt?.id || null
@@ -1557,7 +1526,7 @@ function initializeAdmin() {
         select.disabled = !isSelect
         select.required = isSelect
         select.replaceChildren(
-          option("Choose an option", ""),
+          option(message("option-choose"), ""),
           ...(prompt.options || []).map((choice) =>
             option(
               raw(choice.description ? `${choice.label} — ${choice.description}` : choice.label),
@@ -1600,20 +1569,18 @@ function initializeAdmin() {
     $("model-id").readOnly = Boolean(provider.sdkProviderId)
     setText(
       $("model-id-hint"),
-      provider.sdkProviderId
-        ? "Built-in providers use exact catalog model IDs. Select a catalog model before saving. Each model keeps its own API and endpoint."
-        : "The exact model identifier. Start with a letter or digit; use only letters, digits, dots, underscores, slashes, and hyphens.",
+      provider.sdkProviderId ? message("model-builtin-id-hint") : message("model-id-hint"),
     )
     setText(
       $("model-presets").querySelector(".form-divider"),
       provider.sdkProviderId
-        ? "Choose a catalog model, then review its name and limits below."
-        : "Or enter a custom model below",
+        ? message("model-catalog-review-divider")
+        : message("model-custom-entry-divider"),
     )
     $("model-context").value = String(model?.contextWindow || 128000)
     $("model-output").value = String(model?.maxTokens || 4096)
     $("model-advanced").open = Boolean(model)
-    setText($("model-title"), model ? "Edit model" : "Save model")
+    setText($("model-title"), model ? message("model-edit-title") : message("model-save-button"))
     setText($("model-provider-name"), raw(provider.name))
     $("model-presets").hidden = Boolean(model)
     $("model-search").value = ""
@@ -1653,7 +1620,7 @@ function initializeAdmin() {
     control.setAttribute("aria-invalid", String(invalid))
     const error = $(control.dataset.error)
     setText(error, () =>
-      invalid ? message("Error: {error}", { error: raw(control.validationMessage) }) : "",
+      invalid ? message("validation-inline-error", { error: raw(control.validationMessage) }) : "",
     )
     const descriptions = (control.getAttribute("aria-describedby") || "")
       .split(/\s+/)
@@ -1674,8 +1641,8 @@ function initializeAdmin() {
           status(
             target,
             () =>
-              message("{field}: {error}", {
-                field: control.labels?.[0]?.textContent || message("Field"),
+              message("validation-announcement", {
+                field: control.labels?.[0]?.textContent || message("field-label"),
                 error: control.validationMessage,
               }),
             "error",
@@ -1741,7 +1708,7 @@ function initializeAdmin() {
         item.id === $("provider-preset").value && item.authMethods.includes(setup?.authType),
     )
     if (!provider || !setup) {
-      status($("provider-status"), "Choose a supported provider before continuing.", "error")
+      status($("provider-status"), message("provider-supported-required"), "error")
       $("provider-preset").focus()
       return
     }
@@ -1759,10 +1726,9 @@ function initializeAdmin() {
     $("provider-dialog").close("remove")
     confirmDelete({
       path: `/api/providers/${encodeURIComponent(provider.id)}/credential`,
-      title: message("Remove {name} credential?", { name: provider.name }),
-      description:
-        "This removes the credential from Reina and stops affected work. The saved connection and models remain, but a model selected from this provider is deselected. It does not revoke access at the provider or log you out of Pocket ID. To use this provider again, add a new credential. This cannot be undone.",
-      success: "Credential removed. Saved models remain.",
+      title: message("credential-remove-confirmation", { name: provider.name }),
+      description: message("credential-remove-warning"),
+      success: message("credential-removed"),
     })
   })
   $("custom-provider").addEventListener("click", () => {
@@ -1798,7 +1764,7 @@ function initializeAdmin() {
     $("submit-auth-prompt").disabled = true
     $("auth-prompt-input").disabled = true
     $("auth-prompt-select").disabled = true
-    setText($("auth-progress"), "Sending response to the provider…")
+    setText($("auth-progress"), message("provider-response-sending"))
     try {
       const response = request(`/api/provider-setups/${encodeURIComponent(flow.id)}/responses`, {
         method: "POST",
@@ -1833,7 +1799,7 @@ function initializeAdmin() {
       data,
       form: $("provider-form"),
       target: $("provider-status"),
-      success: "Provider saved. Save a model, then choose Select model to select it.",
+      success: message("provider-saved-notice"),
     })
   })
 
@@ -1841,11 +1807,7 @@ function initializeAdmin() {
     event.preventDefault()
     if (busy) return
     if (!$("model-id").value) {
-      status(
-        $("model-status"),
-        "Choose a catalog model with Select catalog model before saving.",
-        "error",
-      )
+      status($("model-status"), message("model-catalog-selection-required"), "error")
       $("model-preset").focus()
       return
     }
@@ -1862,7 +1824,7 @@ function initializeAdmin() {
       },
       form: $("model-form"),
       target: $("model-status"),
-      success: "Model saved. Use Select model to save your model preference.",
+      success: message("model-saved-notice"),
     })
   })
 
@@ -1878,10 +1840,7 @@ function initializeAdmin() {
       paths.some((path) => path.length > 256) ||
       new Set(paths.map((path) => path.toLowerCase())).size !== paths.length
     )
-      setValidity(
-        control,
-        "Enter 1–64 unique repository-relative patterns, one per line, with up to 256 characters each.",
-      )
+      setValidity(control, message("validation-path-patterns"))
     return paths
   }
 
@@ -1910,10 +1869,7 @@ function initializeAdmin() {
     } catch {
       // Parser messages can include input. Use a fixed, actionable message instead.
     }
-    setValidity(
-      $("runtime-commands"),
-      'Enter a JSON array of 1–8 argv arrays, such as [["npm","run","ci"]]. Each command needs 1–32 non-empty string arguments, up to 4,096 characters each, without line breaks or null characters.',
-    )
+    setValidity($("runtime-commands"), message("validation-command-arrays"))
     return []
   }
 
@@ -1922,17 +1878,14 @@ function initializeAdmin() {
     if (busy) return
     for (const id of ["runtime-app-id", "runtime-repository-id", "runtime-installation-id"]) {
       if (!Number.isSafeInteger(Number($(id).value)) || Number($(id).value) < 1)
-        setValidity($(id), "Enter a whole number from 1 to 9,007,199,254,740,991.")
+        setValidity($(id), message("validation-positive-id"))
     }
     const allowedPaths = readRuntimePaths("runtime-allowed-paths")
     const forbiddenPaths = readRuntimePaths("runtime-forbidden-paths")
     const commands = readRuntimeCommands()
     const secret = $("runtime-webhook-secret")
     if (secret.value && (secret.value.trim() !== secret.value || /[\p{Cc}]/u.test(secret.value)))
-      setValidity(
-        secret,
-        "Use at least 32 characters without leading or trailing spaces or control characters.",
-      )
+      setValidity(secret, message("validation-webhook-secret"))
     if (!event.currentTarget.reportValidity()) return
     const data = {
       appId: Number($("runtime-app-id").value),
@@ -1961,8 +1914,7 @@ function initializeAdmin() {
       data,
       form: $("runtime-form"),
       target: $("runtime-form-status"),
-      success:
-        "Runtime settings saved and reload requested. Refresh status to check the applied state.",
+      success: message("runtime-settings-saved-notice"),
       onSaved: () => {
         // Without saved service App settings, status derives its App ID from
         // this Runtime save. That expected change must not clear the new policy.
@@ -1997,10 +1949,10 @@ function initializeAdmin() {
       status(
         $("github-app-status"),
         missing.length
-          ? message("Complete the one-time service setup. Missing: {fields}.", {
+          ? message("github-setup-incomplete-notice", {
               fields: list(missing.map(([label]) => message(label))),
             })
-          : "Service App status is unavailable. Refresh settings before continuing.",
+          : message("github-service-refresh-required"),
         "pending",
       )
       const control = missing[0]
@@ -2015,7 +1967,7 @@ function initializeAdmin() {
       method: "POST",
       target: $("github-connect-status"),
       refresh: false,
-      success: "Opening official GitHub authorization in this tab…",
+      success: message("github-authorization-opening"),
       onSaved: (result) => navigateGithub(result),
     })
   })
@@ -2025,7 +1977,7 @@ function initializeAdmin() {
       method: "POST",
       target: $("github-connect-status"),
       refresh: false,
-      success: "Opening the official GitHub App installation page in this tab…",
+      success: message("github-install-opening"),
       onSaved: (result) => navigateGithub(result, true),
     })
   })
@@ -2044,8 +1996,7 @@ function initializeAdmin() {
       method: "POST",
       target: $("github-connect-status"),
       refresh: false,
-      success:
-        "GitHub connection attempt cancelled. Your saved repository and Runtime settings are unchanged.",
+      success: message("github-connection-cancelled"),
       onSaved: () => {
         githubView = null
         renderGithubView()
@@ -2067,8 +2018,7 @@ function initializeAdmin() {
       form: event.currentTarget,
       target: $("github-connect-status"),
       refresh: false,
-      success:
-        "Repository connected. An exact match to the complete saved Runtime configuration can restart scans and use model quota. New or changed worker settings and policy require Runtime Save and apply. Coding still requires explicit approval.",
+      success: message("github-repository-connected-notice"),
       onSaved: async () => {
         await refreshSettings()
         if (!settings.githubConnection) throw { code: "invalid_response" }
@@ -2083,8 +2033,7 @@ function initializeAdmin() {
     event.preventDefault()
     if (busy) return
     const appId = Number($("github-app-id").value)
-    if (!positiveId(appId))
-      setValidity($("github-app-id"), "Enter a whole number from 1 to 9,007,199,254,740,991.")
+    if (!positiveId(appId)) setValidity($("github-app-id"), message("validation-positive-id"))
     updateGithubSecretRequirements()
     const data = { appId }
     for (const [id, name, minimum] of [
@@ -2103,11 +2052,8 @@ function initializeAdmin() {
         setValidity(
           control,
           name === "clientSecret"
-            ? "Paste only the client secret value from GitHub (1–4,096 characters, without embedded control characters)."
-            : message(
-                "Use {minimum}–4,096 characters without leading or trailing spaces or control characters.",
-                { minimum },
-              ),
+            ? message("validation-client-secret")
+            : message("validation-secret-length", { minimum }),
         )
       if (value) data[name] = value
     }
@@ -2120,8 +2066,7 @@ function initializeAdmin() {
       data,
       form: event.currentTarget,
       target: $("github-app-status"),
-      success:
-        "Service App settings saved. Complete any missing service credentials, then use Connect GitHub. Runtime configuration and coding approval remain separate.",
+      success: message("github-service-app-saved-notice"),
       onSaved: () => {
         githubAppFormInitialized = false
       },
@@ -2134,7 +2079,7 @@ function initializeAdmin() {
     const file = $("private-key").files?.[0]
     if (!file) return
     if (file.size > 32768 || file.size === 0) {
-      setValidity($("private-key"), "Select a non-empty PEM file no larger than 32 KiB.")
+      setValidity($("private-key"), message("validation-pem-file"))
       syncValidation($("private-key"), true)
       $("private-key").reportValidity()
       return
@@ -2145,7 +2090,7 @@ function initializeAdmin() {
       path: "/api/github/private-key",
       method: "POST",
       file,
-      success: "GitHub App private key saved. Configuration will be applied automatically.",
+      success: message("github-private-key-saved"),
     })
   })
 
@@ -2157,10 +2102,9 @@ function initializeAdmin() {
   $("delete-key").addEventListener("click", () =>
     confirmDelete({
       path: "/api/github/private-key",
-      title: "Delete GitHub App private key?",
-      description:
-        "Reina will no longer have a GitHub App private key. Upload a new key to restore the connection. This cannot be undone.",
-      success: "GitHub App private key deleted.",
+      title: message("github-private-key-delete-confirmation"),
+      description: message("github-private-key-delete-warning"),
+      success: message("github-private-key-deleted"),
       onSaved: () => {
         $("private-key").value = ""
       },
@@ -2171,14 +2115,14 @@ function initializeAdmin() {
       path: "/api/selection",
       method: "PUT",
       data: { modelId: null },
-      success: "Model selection cleared.",
+      success: message("model-selection-cleared"),
     })
   })
   $("reload-runtime").addEventListener("click", () => {
     void mutate({
       path: "/api/runtime/reload",
       method: "POST",
-      success: "Configuration reload requested. Refresh settings to check the applied state.",
+      success: message("runtime-reload-requested"),
     })
   })
   $("logout-form").addEventListener("submit", (event) => {
@@ -2186,8 +2130,7 @@ function initializeAdmin() {
     void mutate({
       path: "/auth/logout",
       method: "POST",
-      success:
-        "Signed out of the Reina session. Provider credentials and Pocket ID sign-in are unchanged.",
+      success: message("session-signed-out"),
       refresh: false,
       onSaved: () => location.replace("/login"),
     })
@@ -2207,7 +2150,7 @@ function initializeAdmin() {
   $("use-model-preset").addEventListener("click", () => {
     const preset = modelOptions[Number($("model-preset").value)]
     if (!preset || $("model-preset").selectedIndex < 0) {
-      setText($("model-catalog-status"), "Choose a model from the catalog first.")
+      setText($("model-catalog-status"), message("model-catalog-choice-required"))
       $("model-preset").focus()
       return
     }
@@ -2220,8 +2163,8 @@ function initializeAdmin() {
     status(
       $("model-status"),
       preset.api === "openai-codex-responses"
-        ? "Catalog model selected for this form. Codex SDK 1.5.0 ignores the maximum output tokens setting. Gateway time, request-count, and response-size limits still apply; they are not an upstream token or billing cap. Save the model, then select it separately for Reina."
-        : "Catalog model selected for this form. Review its settings, then save. The maximum output tokens setting is at most 4,096. Select the saved model separately for Reina.",
+        ? message("model-codex-catalog-selected-notice")
+        : message("model-catalog-selected-notice"),
     )
   })
 
