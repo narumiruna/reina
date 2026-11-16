@@ -42,12 +42,15 @@ For dynamic text, use `setText(element, message("model-delete-confirmation", { n
 Use `raw()` for literal output, including user names, IDs, and upstream prompts.
 Use a callback for text that reads a translated label or validation message. On a language change,
 source bindings update before text callbacks, so announcements do not keep text from the old language.
+Correcting or resetting a field clears its validation announcement, but not a newer request result.
 Do not translate form values or render translations as HTML. The credential-free tests check
 catalog coverage, matching placeholders, plural forms, locale persistence, and switching with drafts intact.
 
 `npm run build:web` uses esbuild to bundle i18next, the catalogs, and the DOM bindings into
 `dist/browser/i18n.js`. The server serves this bundle at `/assets/i18n.js`; no CDN, remote translation
-service, or inline import map is used. `npm run build` includes this step, and Vitest global setup
+service, or inline import map is used. i18next and esbuild are build-time dependencies; the production
+image needs only the generated bundle, not these packages or the TypeScript compiler.
+`npm run build` includes this step, and Vitest global setup
 runs it before tests. After changing the catalogs or `public/i18n.js`, rebuild before starting
 the local server. The Docker build includes the browser sources and build script.
 

@@ -720,6 +720,43 @@ describe("UI language selection", () => {
     }
   })
 
+  it.each([
+    [false, false],
+    [false, true],
+    [true, false],
+    [true, true],
+  ])("keeps secret labels named when saved flags are %s/%s", async (client, webhook) => {
+    const initial = initialSettings()
+    initial.githubApp.clientSecretConfigured = client
+    initial.githubApp.webhookSecretConfigured = webhook
+    const { $, switchLanguage, state } = await ui(initial)
+    const requests = state.requests.length
+    for (const locale of ["en", "tw", "en"]) {
+      switchLanguage(locale)
+      for (const changedApp of [false, true, false]) {
+        $("github-app-id").value = changedApp ? "999" : "123"
+        $("github-app-id").fire("input")
+        for (const [id, name, configured] of [
+          ["github-client-secret", "Client secret", client],
+          ["github-webhook-secret", "Webhook secret", webhook],
+        ] as const) {
+          const required = changedApp || !configured
+          const suffix =
+            locale === "en"
+              ? required
+                ? " (required)"
+                : " (optional replacement)"
+              : required
+                ? "（必填）"
+                : "（選填，可取代原值）"
+          expect($(`${id}-label`).textContent).toBe(`${name}${suffix}`)
+          expect($(id).required).toBe(required)
+        }
+      }
+    }
+    expect(state.requests).toHaveLength(requests)
+  })
+
   it("switches static and dynamic text, title, and labels without resetting drafts or fetching", async () => {
     const { $, document, state, stored, switchLanguage, openGithub } = await ui()
     await openGithub()
@@ -893,6 +930,89 @@ describe("UI language selection", () => {
         "Verification commands (required): Check this value and try again.",
       )
       expect(state.requests).toHaveLength(requests)
+    },
+  )
+
+  it.each([false, true])(
+    "clears corrected validation announcements (announced: %s)",
+    async (announced) => {
+      const { $, i18n, runTimers, switchLanguage, state } = await ui()
+      const control = $("runtime-commands")
+      control.fire("input")
+      i18n.setValidity(control, message("validation-value-invalid"))
+      control.fire("blur")
+      if (announced) {
+        runTimers(500)
+        expect($("page-status").textContent).toContain("Check this value")
+      }
+      const requests = state.requests.length
+      control.value = '[["npm","test"]]'
+      control.fire("input")
+      expect(control.getAttribute("aria-invalid")).toBe("false")
+      expect(control.getAttribute("aria-describedby")).not.toContain(control.dataset.error)
+      expect($("runtime-commands-error").textContent).toBe("")
+      for (const locale of ["tw", "en"]) {
+        switchLanguage(locale)
+        runTimers(500)
+        expect($("page-status").textContent).toBe("")
+        expect($("page-status").classes.has("error")).toBe(false)
+      }
+      expect(state.requests).toHaveLength(requests)
+    },
+  )
+
+  it("keeps a newer request error when an announced field is corrected", async () => {
+    const { $, i18n, runTimers, switchLanguage, state, refresh } = await ui()
+    const control = $("runtime-commands")
+    control.fire("input")
+    i18n.setValidity(control, message("validation-value-invalid"))
+    control.fire("blur")
+    runTimers(500)
+    state.failRefresh = true
+    await refresh()
+    expect($("page-status").textContent).toBe(en["error-settings-load"])
+    control.fire("input")
+    expect($("page-status").textContent).toBe(en["error-settings-load"])
+    switchLanguage("tw")
+    expect($("page-status").textContent).toBe(tw["error-settings-load"])
+    expect($("page-status").classes.has("error")).toBe(true)
+  })
+
+  it.each([false, true])(
+    "clears validation announcements on a dialog reset (announced: %s)",
+    async (announced) => {
+      const { $, i18n, runTimers, switchLanguage } = await ui({
+        ...initialSettings(),
+        providers: [
+          {
+            id: "provider-1",
+            name: "Example",
+            api: "openai-completions",
+            baseUrl: "https://api.example.com",
+            hasCredential: true,
+            hasApiKey: true,
+            authType: "api_key",
+            models: [],
+          },
+        ],
+      })
+      $("provider-list").querySelector("button")?.fire("click")
+      expect($("provider-dialog").open).toBe(true)
+      const control = $("provider-name")
+      control.fire("input")
+      i18n.setValidity(control, message("validation-value-invalid"))
+      control.fire("blur")
+      if (announced) {
+        runTimers(500)
+        expect($("provider-status").textContent).toContain("Check this value")
+      }
+      $("provider-dialog").close()
+      for (const locale of ["tw", "en"]) {
+        switchLanguage(locale)
+        runTimers(500)
+        expect($("provider-status").textContent).toBe("")
+        expect($("provider-status").classes.has("error")).toBe(false)
+      }
     },
   )
 

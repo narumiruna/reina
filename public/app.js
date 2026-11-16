@@ -157,7 +157,9 @@ function initializeAdmin() {
     return element
   }
 
+  const validationNotices = new Map()
   function status(target, message = "", kind = "") {
+    validationNotices.delete(target)
     setText(target, message)
     target.classList.remove("error", "pending")
     if (kind) target.classList.add(kind)
@@ -648,9 +650,7 @@ function initializeAdmin() {
       $(id).required = required
       setText(
         $(`${id}-label`),
-        message(required ? message("field-required-label") : message("field-replacement-label"), {
-          label: message(label),
-        }),
+        message(required ? "field-required-label" : "field-replacement-label", { label }),
       )
     }
   }
@@ -1608,6 +1608,17 @@ function initializeAdmin() {
   const edited = new WeakSet()
   let validationAnnouncement
   let validationField
+  function clearValidationAnnouncement(control) {
+    if (validationField === control) {
+      clearTimeout(validationAnnouncement)
+      validationField = null
+    }
+    // Do not clear a request result that replaced the field's announcement.
+    for (const [target, field] of validationNotices) {
+      if (field === control) status(target)
+    }
+  }
+
   function syncValidation(control, force = false, announce = false) {
     if (!control.matches?.("input, select, textarea") || !control.dataset.error) return
     const invalid =
@@ -1628,32 +1639,29 @@ function initializeAdmin() {
     if (invalid) descriptions.push(error.id)
     if (descriptions.length) control.setAttribute("aria-describedby", descriptions.join(" "))
     else control.removeAttribute("aria-describedby")
-    if (!invalid && validationField === control) {
-      clearTimeout(validationAnnouncement)
-      validationField = null
-    }
+    if (!invalid) clearValidationAnnouncement(control)
     if (announce && invalid && !previous) {
       clearTimeout(validationAnnouncement)
       validationField = control
       const target = control.closest("dialog")?.querySelector(".notice") || $("page-status")
-      validationAnnouncement = setTimeout(
-        () =>
-          status(
-            target,
-            () =>
-              message("validation-announcement", {
-                field: control.labels?.[0]?.textContent || message("field-label"),
-                error: control.validationMessage,
-              }),
-            "error",
-          ),
-        500,
-      )
+      validationAnnouncement = setTimeout(() => {
+        status(
+          target,
+          () =>
+            message("validation-announcement", {
+              field: control.labels?.[0]?.textContent || message("field-label"),
+              error: control.validationMessage,
+            }),
+          "error",
+        )
+        validationNotices.set(target, control)
+      }, 500)
     }
   }
 
   function resetValidation(form) {
     for (const control of form.querySelectorAll("input, select, textarea")) {
+      clearValidationAnnouncement(control)
       setValidity(control, "")
       control.setAttribute("aria-invalid", "false")
       const errorId = control.dataset.error
