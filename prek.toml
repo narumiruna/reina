@@ -1,0 +1,18 @@
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "biome-migrate"
+name = "Biome migrate"
+entry = "npm exec --no -- biome migrate --write"
+language = "system"
+pass_filenames = false
+always_run = true
+
+[[repos.hooks]]
+id = "biome-check"
+name = "Biome check"
+entry = "npm exec --no -- biome check --write src"
+language = "system"
+pass_filenames = false
+always_run = true

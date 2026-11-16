@@ -76,10 +76,15 @@ All live deployment restrictions in that document still apply.
 
 ## Development
 
-Use Node.js 26, npm, Docker with Linux containers, Docker Compose, and Git.
+Use Node.js 26, npm, Docker with Linux containers, Docker Compose, Git, and
+[prek](https://prek.j178.dev/installation/).
+
+For an existing checkout that used Husky, run `git config --unset core.hooksPath` before
+`prek install`.
 
 ```sh
 npm ci
+prek install
 npm run ci
 npm run test:runtime
 ```
@@ -101,8 +106,9 @@ npm run test:runtime
 
 Worker preparation downloads trusted build tools and integrity-checked public npm tarballs.
 It does not execute repository lifecycle scripts. Tests fail, rather than skip, when required
-runtime controls are unavailable. Husky runs Biome migration, formatting, and lint fixes before
-commits; it does not run the full CI suite.
+runtime controls are unavailable. The hooks in `prek.toml` run `biome migrate --write`, then
+`biome check --write src` for formatting and lint fixes before commits. They use the npm-installed
+Biome version and do not run the full CI suite. Run them manually with `prek run --all-files`.
 
 ## Prepare a target worker
 
