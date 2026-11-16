@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process"
+import { randomUUID } from "node:crypto"
 import {
   chmodSync,
   copyFileSync,
@@ -15,7 +16,7 @@ import { backup, DatabaseSync } from "node:sqlite"
 import { fileURLToPath } from "node:url"
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 import { loadConfig, loadRuntimeConfig } from "../src/config.js"
-import { Store } from "../src/jobs/store.js"
+import { type RequestBinding, Store } from "../src/jobs/store.js"
 import { dispatchInputSchema, dispatchSettingsSchema } from "../src/settings/dispatch.js"
 import {
   allowedPath,
@@ -25,6 +26,7 @@ import {
   policyHash,
   safePath,
 } from "../src/triage/policy.js"
+import type { Review } from "../src/triage/review.js"
 import { triageSchema } from "../src/triage/schema.js"
 import type {
   Approval,
@@ -150,6 +152,7 @@ function acceptRequest(store: Store, value: Proposal, authority: Approval, id = 
     material: request.kind === "comment",
     cancel: false,
     request: candidate,
+    requestIssueHash: value.fingerprint,
     requestBinding: {
       fingerprint: value.fingerprint,
       baseSha: value.baseSha,
@@ -158,6 +161,54 @@ function acceptRequest(store: Store, value: Proposal, authority: Approval, id = 
     },
   })
   return id
+}
+
+function directApproval(
+  value: Proposal,
+  kind: "comment" | "assignment",
+  sourceId = 300,
+  createdAt = value.createdAt - 1_000,
+): Approval {
+  return {
+    ...approval(value),
+    eventId: `${kind}:${sourceId}`,
+    createdAt,
+    request:
+      kind === "comment"
+        ? { kind, commentId: sourceId, bodyHash: "c".repeat(64), createdAt, updatedAt: createdAt }
+        : { kind, eventId: String(sourceId), assigneeId: 99, createdAt },
+  }
+}
+
+function binding(value: Proposal): RequestBinding {
+  return {
+    fingerprint: value.fingerprint,
+    baseSha: value.baseSha,
+    baseBranch: value.baseBranch,
+    policyHash: value.policyHash,
+  }
+}
+
+function pendingReview(value: Proposal): Review {
+  return {
+    ref: value.ref,
+    revision: randomUUID(),
+    binding: { ...binding(value), protocolRevision: "fixture-review-v1" },
+    state: "pending",
+    attempts: 0,
+    createdAt: value.createdAt,
+    updatedAt: value.createdAt,
+    nextAttemptAt: 0,
+  }
+}
+
+function inspect<T>(operation: (db: DatabaseSync) => T): T {
+  const db = new DatabaseSync(join(directory, "state", "reina.sqlite"), { readOnly: true })
+  try {
+    return operation(db)
+  } finally {
+    db.close()
+  }
 }
 
 function artifact(): Artifact {
@@ -209,7 +260,9 @@ describe("atomic revocation and persistent GitHub cooldown", () => {
     const store = openStore()
     const job = publishing(store, claim(store))
     expect(store.proposals()).toHaveLength(1)
-    expect(store.acceptDelivery("revoke-before-crash", { kind: "revoke" }, [job.ref])).toBe(true)
+    expect(store.acceptDelivery("revoke-before-crash", { kind: "revoke" }, [job.ref]).queued).toBe(
+      true,
+    )
     store.close()
     const restored = openStore()
     expect(restored.job(job.id)?.state).toBe("cancelled")
@@ -229,7 +282,7 @@ describe("atomic revocation and persistent GitHub cooldown", () => {
     store.acceptDelivery("material-revocation", { kind: "issue", ref, material: true }, [ref])
     store.close()
     store = openStore()
-    expect(store.acceptDelivery("older-direct", { kind: "issue", ref, request })).toBe(false)
+    expect(store.acceptDelivery("older-direct", { kind: "issue", ref, request }).queued).toBe(false)
     expect(
       store
         .deliveries()
@@ -259,7 +312,7 @@ describe("atomic revocation and persistent GitHub cooldown", () => {
           changedAt: createdAt - 1,
         },
         [ref],
-      ),
+      ).queued,
     ).toBe(false)
     expect(
       store.acceptDelivery(
@@ -271,7 +324,7 @@ describe("atomic revocation and persistent GitHub cooldown", () => {
           changedAt: createdAt,
         },
         [ref],
-      ),
+      ).queued,
     ).toBe(true)
     store.close()
     const restored = openStore()
@@ -327,6 +380,355 @@ describe("atomic revocation and persistent GitHub cooldown", () => {
     expect(openStore().blockedUntil()).toBe(deadline)
   })
 })
+describe("durable request sources and selective revocation", () => {
+  test.each([
+    ["comment", "complete"],
+    ["assignment", "complete"],
+    ["comment", "revoked"],
+    ["assignment", "revoked"],
+    ["comment", "exhausted"],
+    ["assignment", "exhausted"],
+  ] as const)("%s source stays consumed after %s and restart", (kind, outcome) => {
+    let store = openStore()
+    const value = proposal()
+    const authority = directApproval(value, kind)
+    const id = acceptRequest(store, value, authority)
+    const payload = required(store.deliveries().find((item) => item.id === id)).payload as Record<
+      string,
+      unknown
+    >
+    store.deferDelivery(id, 0, "issue")
+    if (outcome === "complete") {
+      expect(() => store.bindRequest(id, { ...binding(value), baseSha: "e".repeat(40) })).toThrow(
+        "proposal_stale",
+      )
+      store.completeDelivery(id)
+    } else if (outcome === "revoked") {
+      store.acceptDelivery("material", { kind: "issue", ref: value.ref, material: true }, [
+        value.ref,
+      ])
+    } else {
+      for (let attempt = 1; attempt < 8; attempt++) store.deferDelivery(id, 0, "issue")
+    }
+    store.close()
+    store = openStore()
+    const changed = {
+      ...payload,
+      actor: { ...authority.actor, login: "renamed-maintainer" },
+      requestIssueHash: "f".repeat(64),
+      requestBinding: { ...binding(value), baseSha: "e".repeat(40) },
+      ...(kind === "comment"
+        ? { request: { ...required(authority.request), bodyHash: "d".repeat(64) } }
+        : {}),
+    }
+    expect(store.acceptDelivery("different-guid", changed, [value.ref])).toEqual({
+      queued: false,
+      revocations: [],
+      reviews: [],
+    })
+    expect(() => store.bindRequest("different-guid", binding(value))).toThrow("job_cancelled")
+    expect(
+      inspect(
+        (db) => db.prepare("SELECT request_key FROM deliveries WHERE id = ?").get(id)?.request_key,
+      ),
+    ).toMatch(/^[a-f0-9]{64}$/)
+    expect(
+      inspect((db) => db.prepare("SELECT COUNT(*) AS count FROM approvals").get()?.count),
+    ).toBe(0)
+    const newAuthority = directApproval(value, kind, 301, authority.createdAt + 1)
+    const newId = acceptRequest(store, value, newAuthority, "genuinely-new-source")
+    expect(store.deliveries().some((item) => item.id === newId)).toBe(true)
+  })
+
+  test.each([false, true])(
+    "a newer pending binding=%s cannot shield older sources or jobs",
+    (bound) => {
+      const store = openStore()
+      const value = proposal(1, Date.now() - 20_000)
+      const oldAuthority = directApproval(value, "comment")
+      const oldId = acceptRequest(store, value, oldAuthority, "older-mention")
+      const oldPayload = required(store.deliveries().find((item) => item.id === oldId)).payload
+      store.saveProposal(value)
+      const job = required(store.claim(value, oldAuthority, oldId))
+      const review = pendingReview(value)
+      store.saveReview(review)
+      const cutoff = Date.now() - 10_000
+      const newerAuthority = directApproval(value, "assignment", 400, cutoff + 1_000)
+      const newerId = bound
+        ? acceptRequest(store, value, newerAuthority, "newer-assignment")
+        : "newer-assignment"
+      if (!bound)
+        store.acceptDelivery(newerId, {
+          kind: "issue",
+          ref: value.ref,
+          actor: newerAuthority.actor,
+          request: { kind: "assignment", assigneeId: 99, createdAt: newerAuthority.createdAt },
+        })
+      store.deferDelivery(oldId, 60_000, "issue")
+      store.deferDelivery(newerId, 60_000, "issue")
+      const result = store.acceptDelivery(
+        "middle-edit",
+        {
+          kind: "issue",
+          ref: value.ref,
+          material: true,
+          changedAt: cutoff,
+        },
+        [value.ref],
+        [{ ref: value.ref, reason: "changed" }],
+      )
+      expect(result.queued).toBe(false)
+      expect(result.revocations).toEqual([
+        { ref: value.ref, preservedJobIds: [], preservedBindings: bound ? [binding(value)] : [] },
+      ])
+      expect(store.job(job.id)?.state).toBe("cancelled")
+      expect(store.proposal(value.ref)).toEqual(bound ? value : undefined)
+      expect(store.review(value.ref)?.state).toBe(bound ? "pending" : "stale")
+      expect(result.reviews).toEqual(
+        bound
+          ? []
+          : [{ ref: value.ref, reason: "changed", revision: store.review(value.ref)?.revision }],
+      )
+      expect(store.acceptDelivery("old-source-replay", oldPayload).queued).toBe(false)
+      store.close()
+      const restored = openStore()
+      vi.setSystemTime(Date.now() + 60_001)
+      expect(restored.deliveries().map((item) => item.id)).toEqual([newerId])
+    },
+  )
+
+  test.each(["comment", "assignment"] as const)(
+    "a newer active %s protects only its job and matching context",
+    (kind) => {
+      const store = openStore()
+      const value = proposal(1, Date.now() - 20_000)
+      const olderId = acceptRequest(store, value, directApproval(value, "comment"), "older-mention")
+      const cutoff = Date.now() - 10_000
+      const newer = directApproval(value, kind, 401, cutoff + 1_000)
+      const newerId = acceptRequest(store, value, newer, "newer-source")
+      store.saveProposal(value)
+      const job = required(store.claim(value, newer, newerId))
+      const review = pendingReview(value)
+      store.saveReview(review)
+      const result = store.acceptDelivery(
+        "older-edit",
+        {
+          kind: "issue",
+          ref: value.ref,
+          material: true,
+          changedAt: cutoff,
+        },
+        [value.ref],
+        [{ ref: value.ref, reason: "changed" }],
+      )
+      expect(result).toEqual({
+        queued: false,
+        revocations: [
+          { ref: value.ref, preservedJobIds: [job.id], preservedBindings: [binding(value)] },
+        ],
+        reviews: [],
+      })
+      expect(store.job(job.id)?.state).toBe("approved")
+      expect(store.proposal(value.ref)).toEqual(value)
+      expect(store.review(value.ref)).toEqual(review)
+      expect(store.deliveries().map((item) => item.id)).toEqual([newerId])
+      expect(() => store.bindRequest(olderId, binding(value))).toThrow("job_cancelled")
+      const ambiguous = store.acceptDelivery(
+        "same-time-edit",
+        {
+          kind: "issue",
+          ref: value.ref,
+          material: true,
+          changedAt: newer.createdAt,
+        },
+        [value.ref],
+        [{ ref: value.ref, reason: "changed" }],
+      )
+      expect(ambiguous.queued).toBe(true)
+      expect(ambiguous.revocations[0]?.preservedJobIds).toEqual([])
+      expect(store.job(job.id)?.state).toBe("cancelled")
+      expect(store.proposal(value.ref)).toBeUndefined()
+    },
+  )
+
+  test("a newer unmatched binding and historical approval do not protect old authority", () => {
+    const store = openStore()
+    const value = proposal(1, Date.now() - 20_000)
+    store.saveProposal(value)
+    const historical = directApproval(value, "assignment", 400, Date.now() - 5_000)
+    const historicalId = acceptRequest(store, value, historical, "historical-source")
+    const historicalJob = required(store.claim(value, historical, historicalId))
+    advance(store, historicalJob, "failed", { error: "fixture_failure" })
+    store.completeDelivery(historicalId)
+    const oldJob = required(store.claim(value, approval(value, "older-label")))
+    store.saveReview(pendingReview(value))
+    const mismatched = { ...value, baseSha: "e".repeat(40) }
+    acceptRequest(
+      store,
+      mismatched,
+      directApproval(value, "assignment", 401, Date.now() - 4_000),
+      "unmatched-newer-source",
+    )
+    const result = store.acceptDelivery(
+      "middle-change",
+      {
+        kind: "issue",
+        ref: value.ref,
+        cancel: true,
+        changedAt: Date.now() - 10_000,
+      },
+      [value.ref],
+      [{ ref: value.ref, reason: "changed" }],
+    )
+    expect(result.revocations[0]?.preservedJobIds).toEqual([])
+    expect(result.revocations[0]?.preservedBindings).toEqual([])
+    expect(store.job(oldJob.id)?.state).toBe("cancelled")
+    expect(store.proposal(value.ref)).toBeUndefined()
+    expect(store.review(value.ref)?.state).toBe("stale")
+    store.completeDelivery("unmatched-newer-source")
+    expect(
+      store.acceptDelivery(
+        "another-old-change",
+        {
+          kind: "issue",
+          ref: value.ref,
+          cancel: true,
+          changedAt: Date.now() - 10_000,
+        },
+        [value.ref],
+      ).queued,
+    ).toBe(true)
+  })
+
+  test("schema 5 migration seals lost receipts and unbound sources without rebinding known work", () => {
+    vi.useFakeTimers()
+    const initial = Date.now()
+    vi.setSystemTime(initial)
+    let store = openStore()
+    const value = proposal()
+    store.saveProposal(value)
+    const bound = directApproval(value, "comment")
+    const boundId = acceptRequest(store, value, bound, "legacy-bound")
+    const boundPayload = required(store.deliveries().find((item) => item.id === boundId)).payload
+    const unbound = {
+      kind: "issue",
+      ref: issue(2).ref,
+      actor: bound.actor,
+      request: { kind: "assignment", assigneeId: 99, createdAt: bound.createdAt },
+    }
+    store.acceptDelivery("legacy-unbound", unbound)
+    const lost = { ...unbound, ref: issue(3).ref }
+    store.acceptDelivery("legacy-lost", lost)
+    store.completeDelivery("legacy-lost")
+    const failed = { ...unbound, ref: issue(4).ref }
+    store.acceptDelivery("legacy-failed", failed)
+    for (let attempt = 0; attempt < 8; attempt++) store.deferDelivery("legacy-failed", 5_000)
+    const deadline = store.blockedUntil()
+    store.saveReview(pendingReview(value))
+    store.saveScanPage(17)
+    store.close()
+    const db = new DatabaseSync(join(directory, "state", "reina.sqlite"))
+    db.exec(`DROP TABLE request_epoch; DROP INDEX deliveries_by_request;
+      ALTER TABLE deliveries DROP COLUMN request_key; PRAGMA user_version = 5;`)
+    db.close()
+    vi.setSystemTime(initial + 1_000)
+    store = openStore()
+    expect(inspect((db) => db.prepare("PRAGMA user_version").get()?.user_version)).toBe(6)
+    expect(
+      inspect((db) => db.prepare("SELECT reject_before FROM request_epoch").get()?.reject_before),
+    ).toBe(initial + 1_000)
+    expect(store.deliveries()).toEqual([{ id: boundId, payload: boundPayload }])
+    expect(store.blockedUntil()).toBe(deadline)
+    expect(store.scanPage()).toBe(17)
+    expect(store.review(value.ref)?.state).toBe("pending")
+    for (const [id, payload] of [
+      ["replay-lost", lost],
+      ["replay-unbound", unbound],
+      ["replay-failed", failed],
+    ] as const)
+      expect(store.acceptDelivery(id, payload)).toEqual({
+        queued: false,
+        revocations: [],
+        reviews: [],
+      })
+    expect(
+      inspect((db) => db.prepare("SELECT COUNT(*) AS count FROM approvals").get()?.count),
+    ).toBe(0)
+    expect(store.claim(value, bound, boundId)).toBeDefined()
+    const atCutoff = {
+      ...unbound,
+      ref: issue(5).ref,
+      request: { ...unbound.request, createdAt: initial + 1_000 },
+    }
+    expect(store.acceptDelivery("unknown-at-cutoff", atCutoff).queued).toBe(false)
+    vi.setSystemTime(initial + 1_001)
+    const fresh = { ...unbound, request: { ...unbound.request, createdAt: initial + 1_001 } }
+    expect(store.acceptDelivery("fresh-after-upgrade", fresh).queued).toBe(true)
+    store.close()
+    store = openStore()
+    expect(store.acceptDelivery("lost-after-restart", lost).queued).toBe(false)
+  })
+
+  test("schema 5 migration rolls back its column, epoch and source cleanup together", () => {
+    let store = openStore()
+    const payload = {
+      kind: "issue",
+      ref: issue().ref,
+      request: { kind: "assignment", assigneeId: 99, createdAt: Date.now() },
+    }
+    store.acceptDelivery("legacy-unbound", payload)
+    store.acceptDelivery("corrupt", {})
+    store.close()
+    const path = join(directory, "state", "reina.sqlite")
+    const db = new DatabaseSync(path)
+    db.exec(`DROP TABLE request_epoch; DROP INDEX deliveries_by_request;
+      ALTER TABLE deliveries DROP COLUMN request_key; PRAGMA user_version = 5;`)
+    db.prepare("UPDATE deliveries SET payload = ? WHERE id = 'corrupt'").run("{")
+    db.close()
+    expect(() => openStore()).toThrow()
+    expect(inspect((db) => db.prepare("PRAGMA user_version").get()?.user_version)).toBe(5)
+    expect(
+      inspect((db) =>
+        db.prepare("SELECT name FROM sqlite_master WHERE name = 'request_epoch'").get(),
+      ),
+    ).toBeUndefined()
+    expect(
+      inspect((db) =>
+        db
+          .prepare("PRAGMA table_info(deliveries)")
+          .all()
+          .some((column) => column.name === "request_key"),
+      ),
+    ).toBe(false)
+    expect(
+      inspect(
+        (db) =>
+          db.prepare("SELECT status FROM deliveries WHERE id = 'legacy-unbound'").get()?.status,
+      ),
+    ).toBe("pending")
+    const repaired = new DatabaseSync(path)
+    repaired.prepare("UPDATE deliveries SET payload = ? WHERE id = 'corrupt'").run("{}")
+    repaired.close()
+    store = openStore()
+    expect(store.deliveries()).toEqual([{ id: "corrupt", payload: {} }])
+  })
+
+  test("legacy direct approvals remain source evidence without a delivery key", () => {
+    const store = openStore()
+    const value = proposal()
+    store.saveProposal(value)
+    const authority = directApproval(value, "assignment")
+    const source = acceptRequest(store, value, authority)
+    const payload = required(store.deliveries().find((item) => item.id === source)).payload
+    required(store.claim(value, authority, source))
+    store.completeDelivery(source)
+    const db = new DatabaseSync(join(directory, "state", "reina.sqlite"))
+    db.prepare("UPDATE deliveries SET request_key = NULL WHERE id = ?").run(source)
+    db.close()
+    expect(store.acceptDelivery("legacy-approval-replay", payload).queued).toBe(false)
+  })
+})
+
 describe("strict configuration", () => {
   test("loads one numeric repository, safe defaults, and trusted argv without auth fields", () => {
     const value = loadConfig(environment())
@@ -903,9 +1305,9 @@ describe("durable store", () => {
   test("accepts the inbox durably before return, deduplicates completed events, and bounds retries", () => {
     let store = openStore()
     const payload = { kind: "issue", number: 1, nested: [true, null, "data"] }
-    expect(store.acceptDelivery("delivery-1", payload)).toBe(true)
+    expect(store.acceptDelivery("delivery-1", payload).queued).toBe(true)
     payload.number = 2
-    expect(store.acceptDelivery("delivery-1", { other: true })).toBe(false)
+    expect(store.acceptDelivery("delivery-1", { other: true }).queued).toBe(false)
     store.close()
     store = openStore()
     expect(store.deliveries()).toEqual([
@@ -913,7 +1315,7 @@ describe("durable store", () => {
     ])
     store.completeDelivery("delivery-1")
     expect(store.deliveries()).toEqual([])
-    expect(store.acceptDelivery("delivery-1", {})).toBe(false)
+    expect(store.acceptDelivery("delivery-1", {}).queued).toBe(false)
     vi.useFakeTimers()
     vi.setSystemTime(Date.now())
     store.acceptDelivery("retry", {})
@@ -923,7 +1325,7 @@ describe("durable store", () => {
     expect(store.deliveries().map((item) => item.id)).toEqual(["retry"])
     for (let attempt = 1; attempt < 8; attempt++) store.deferDelivery("retry", 0)
     expect(store.deliveries()).toEqual([])
-    expect(store.acceptDelivery("retry", {})).toBe(false)
+    expect(store.acceptDelivery("retry", {}).queued).toBe(false)
   })
 
   test("issue-local retries retain the payload across restart without blocking other deliveries", () => {
@@ -947,7 +1349,7 @@ describe("durable store", () => {
     vi.advanceTimersByTime(1)
     expect(store.deliveries()).toEqual([{ id: "local", payload }])
     store.completeDelivery("local")
-    expect(store.acceptDelivery("local", payload)).toBe(false)
+    expect(store.acceptDelivery("local", payload).queued).toBe(false)
   })
 
   test("a direct inbox binding is immutable and survives deferral and restart", () => {
@@ -1005,7 +1407,7 @@ describe("durable store", () => {
     store.close()
     store = openStore()
     expect(store.deliveries()).toEqual([])
-    expect(store.acceptDelivery("local-exhausted", {})).toBe(false)
+    expect(store.acceptDelivery("local-exhausted", {}).queued).toBe(false)
     expect(store.blockedUntil()).toBe(0)
   })
 
@@ -1046,7 +1448,7 @@ describe("durable store", () => {
       expect(() => store.acceptDelivery("invalid", payload)).toThrow()
       expect(store.deliveries()).toEqual([])
     }
-    expect(store.acceptDelivery("invalid", {})).toBe(true)
+    expect(store.acceptDelivery("invalid", {}).queued).toBe(true)
     expect(() => store.deferDelivery("invalid", -1)).toThrow()
   })
 
@@ -1086,6 +1488,8 @@ describe("durable store", () => {
       const path = join(directory, "state", "reina.sqlite")
       const db = new DatabaseSync(path)
       db.exec(`DROP TABLE reviews; DROP TABLE review_cursor;
+        DROP TABLE request_epoch; DROP INDEX deliveries_by_request;
+        ALTER TABLE deliveries DROP COLUMN request_key;
         ALTER TABLE deliveries DROP COLUMN global_until;
         ${version < 3 ? "DROP TABLE scan_cursor; DROP INDEX one_active_job_slot;" : ""}
         ${version === 1 ? "DROP TABLE assessments;" : ""}
@@ -1099,7 +1503,7 @@ describe("durable store", () => {
       expect(store.assessed("migrated")).toBe(true)
       const migrated = new DatabaseSync(path, { readOnly: true })
       try {
-        expect(migrated.prepare("PRAGMA user_version").get()?.user_version).toBe(5)
+        expect(migrated.prepare("PRAGMA user_version").get()?.user_version).toBe(6)
         expect(
           migrated
             .prepare("SELECT id,global_until FROM deliveries ORDER BY id")
@@ -1136,7 +1540,9 @@ describe("durable store", () => {
     store.close()
     const path = join(directory, "state", "reina.sqlite")
     const db = new DatabaseSync(path)
-    db.exec("DROP TABLE reviews; DROP TABLE review_cursor; PRAGMA user_version = 4;")
+    db.exec(`DROP TABLE reviews; DROP TABLE review_cursor;
+      DROP TABLE request_epoch; DROP INDEX deliveries_by_request;
+      ALTER TABLE deliveries DROP COLUMN request_key; PRAGMA user_version = 4;`)
     db.close()
 
     store = openStore()
@@ -1152,7 +1558,7 @@ describe("durable store", () => {
     ])
     const migrated = new DatabaseSync(path, { readOnly: true })
     try {
-      expect(migrated.prepare("PRAGMA user_version").get()?.user_version).toBe(5)
+      expect(migrated.prepare("PRAGMA user_version").get()?.user_version).toBe(6)
       expect(migrated.prepare("SELECT COUNT(*) AS count FROM reviews").get()?.count).toBe(0)
       expect(migrated.prepare("SELECT COUNT(*) AS count FROM review_cursor").get()?.count).toBe(1)
     } finally {
@@ -1204,26 +1610,18 @@ describe("durable store", () => {
       let store = openStore()
       const value = proposal()
       const createdAt = value.createdAt - 1_000
-      const request: NonNullable<Approval["request"]> =
-        kind === "comment"
-          ? { kind, commentId: 300, bodyHash: "c".repeat(64), createdAt, updatedAt: createdAt }
-          : { kind, eventId: "2000", assigneeId: 99, createdAt }
-      const authority: Approval = {
-        ...approval(value),
-        eventId: kind === "comment" ? "comment:300" : "assignment:2000",
-        createdAt,
-        request,
-      }
+      const authority = directApproval(value, kind)
       store.saveProposal(value)
       expect(store.claim(value, authority)).toBeUndefined()
       expect(store.claim(value, authority, "missing-source")).toBeUndefined()
-      const completed = acceptRequest(store, value, authority, "completed-source")
+      const completedAuthority = directApproval(value, kind, 301, createdAt - 1)
+      const completed = acceptRequest(store, value, completedAuthority, "completed-source")
       store.completeDelivery(completed)
-      expect(store.claim(value, authority, completed)).toBeUndefined()
+      expect(store.claim(value, completedAuthority, completed)).toBeUndefined()
       const wrongSource = acceptRequest(
         store,
         value,
-        { ...authority, request: { ...request, createdAt: createdAt - 1 } },
+        directApproval(value, kind, 302, createdAt - 2),
         "mismatched-source",
       )
       expect(store.claim(value, authority, wrongSource)).toBeUndefined()
@@ -1234,12 +1632,18 @@ describe("durable store", () => {
         { ...value, baseBranch: "other" },
         { ...value, policyHash: "f".repeat(64) },
       ].entries()) {
-        const wrongBinding = acceptRequest(store, changed, authority, `mismatched-binding-${index}`)
+        const bindingAuthority = directApproval(value, kind, 303 + index, createdAt - 3 - index)
+        const wrongBinding = acceptRequest(
+          store,
+          changed,
+          bindingAuthority,
+          `mismatched-binding-${index}`,
+        )
         expect(store.deliveries()).toContainEqual({
           id: wrongBinding,
           payload: expect.objectContaining({ requestBinding: expect.any(Object) }),
         })
-        expect(store.claim(value, authority, wrongBinding)).toBeUndefined()
+        expect(store.claim(value, bindingAuthority, wrongBinding)).toBeUndefined()
         store.completeDelivery(wrongBinding)
       }
       const source = acceptRequest(store, value, authority)
@@ -1296,18 +1700,8 @@ describe("durable store", () => {
     store.saveProposal(unpublished)
     expect(store.claim(unpublished, authority, source)).toBeUndefined()
     store.saveProposal(value)
-    for (const time of [Date.now() + 1_000, Date.now() - 86_400_000]) {
-      const invalid: Approval = {
-        ...authority,
-        createdAt: time,
-        request: {
-          kind: "comment",
-          commentId: 300,
-          bodyHash: "c".repeat(64),
-          createdAt: time,
-          updatedAt: time,
-        },
-      }
+    for (const [index, time] of [Date.now() + 1_000, Date.now() - 86_400_000].entries()) {
+      const invalid = directApproval(value, "comment", 301 + index, time)
       const invalidSource = acceptRequest(store, value, invalid, `invalid-source-${time}`)
       expect(store.claim(value, invalid, invalidSource)).toBeUndefined()
     }
@@ -1626,8 +2020,8 @@ describe("durable store", () => {
     holder.child.kill("SIGKILL")
     await exited
     const store = openStore()
-    expect(store.acceptDelivery("lock-probe", {})).toBe(false)
-    expect(store.acceptDelivery("after-crash", { kind: "scan" })).toBe(true)
+    expect(store.acceptDelivery("lock-probe", {}).queued).toBe(false)
+    expect(store.acceptDelivery("after-crash", { kind: "scan" }).queued).toBe(true)
     store.close()
     const reopened = openStore()
     expect(reopened.deliveries()).toHaveLength(1)

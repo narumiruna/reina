@@ -269,7 +269,9 @@ GraphQL explicitly reports `reinabot[bot] cannot be assigned to issues or pull r
 assignment is therefore unavailable for this installation. Use a mention until GitHub supports
 this App identity; installing an App alone does not make its bot an assignable user.
 
-Requests expire after 24 hours and are consumed once. Editing/deleting a request, material issue
+Requests expire after 24 hours and are consumed once. Durable receipt identities also prevent a
+new delivery ID from reviving a request rejected before coding. Such a rejection needs a new human
+request. Editing/deleting a request, material issue
 changes, later non-Reina comments, close/reopen, `bot:skip`, permission loss, and applicable
 unassignment revoke it. A changed base or policy cannot reuse a deferred request. A failed coding
 attempt needs a new human request. Duplicate delivery, scans, and restart do not repeat coding.

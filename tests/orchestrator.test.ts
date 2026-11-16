@@ -781,6 +781,101 @@ describe("direct human requests use the existing policy-bound workflow", () => {
     },
   )
 
+  test("a delayed material event cancels old coding but keeps a newer pending request", async () => {
+    const value = fixture()
+    await value.propose()
+    const blocked = blockCoding(value)
+    value.orchestrator.accept("old-label-approval", value.approval())
+    const signal = await blocked.entered
+    const oldJob = required(value.store.jobs()[0])
+    const older = directRequest(value, "comment")
+    value.store.acceptDelivery("older-pending-source", older)
+    const newer = directRequest(value, "assignment")
+    value.orchestrator.accept("newer-pending-source", newer)
+    value.orchestrator.accept(
+      "delayed-material-event",
+      value.work({
+        action: "edited",
+        material: true,
+        changedAt: required(older.request).createdAt + 500,
+      }),
+    )
+    expect(signal.aborted).toBe(true)
+    expect(value.store.job(oldJob.id)?.state).toBe("cancelled")
+    expect(value.store.proposal(oldJob.ref)).toBeUndefined()
+    expect(value.store.deliveries().map((item) => item.id)).toContain("newer-pending-source")
+    expect(value.store.deliveries().map((item) => item.id)).not.toContain("older-pending-source")
+    expect(value.store.deliveries().map((item) => item.id)).not.toContain("delayed-material-event")
+    blocked.release()
+    await value.orchestrator.drain()
+    expect(value.store.jobs().map((job) => job.state)).toEqual(["cancelled", "pr_ready"])
+    expect(value.runtime.code).toHaveBeenCalledTimes(2)
+    expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+    expect(value.github.currentIssue.labels).not.toContain("bot:approved")
+  })
+
+  describe.each(["comment", "assignment"] as const)("newer active %s request", (kind) => {
+    test.each(["coding", "triage"] as const)(
+      "a delayed material event consumes only the older source during %s",
+      async (phase) => {
+        const value = fixture()
+        const older = directRequest(value, kind === "comment" ? "assignment" : "comment")
+        const newer = directRequest(value, kind)
+        const entered = Promise.withResolvers<AbortSignal>()
+        const release = Promise.withResolvers<void>()
+        if (phase === "coding") {
+          value.runtime.code.mockImplementationOnce(async (snapshot, _prompt, signal) => {
+            entered.resolve(signal)
+            await waitForRelease(release.promise, signal)
+            return candidate(snapshot)
+          })
+        } else {
+          value.runtime.triage.mockImplementationOnce(async (_snapshot, _prompt, signal) => {
+            entered.resolve(signal)
+            await waitForRelease(release.promise, signal)
+            return output()
+          })
+        }
+        value.orchestrator.accept("newer-active-source", newer)
+        const signal = await entered.promise
+        const review = required(value.store.review(newer.ref))
+        const proposal = value.store.proposal(newer.ref)
+        value.store.acceptDelivery("older-pending-source", older)
+        value.orchestrator.accept(
+          "delayed-material-event",
+          value.work({
+            action: "edited",
+            material: true,
+            changedAt: required(older.request).createdAt + 500,
+          }),
+        )
+        expect(signal.aborted).toBe(false)
+        expect(value.store.review(newer.ref)).toEqual(review)
+        expect(value.store.proposal(newer.ref)).toEqual(proposal)
+        expect(value.store.deliveries().map((item) => item.id)).not.toContain(
+          "older-pending-source",
+        )
+        expect(value.store.deliveries().map((item) => item.id)).not.toContain(
+          "delayed-material-event",
+        )
+        expect(value.log.info).not.toHaveBeenCalledWith(
+          expect.objectContaining({
+            event: "triage_stale",
+            correlationId: "delayed-material-event",
+          }),
+        )
+        release.resolve()
+        await value.orchestrator.drain()
+        expect(value.store.jobs().map((job) => job.state)).toEqual(["pr_ready"])
+        expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+        expect(value.runtime.code).toHaveBeenCalledTimes(1)
+        expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+        expect(value.store.review(newer.ref)?.revision).toBe(review.revision)
+        expect(value.store.deliveries()).toEqual([])
+      },
+    )
+  })
+
   test("a signed request cannot authorize issue content changed before intake", async () => {
     const value = fixture()
     const work = directRequest(value)
@@ -919,6 +1014,120 @@ describe("direct human requests use the existing policy-bound workflow", () => {
       expectNoPublication(value)
     },
   )
+
+  test("unassignment during acknowledgement stops the revoked request before triage", async () => {
+    const value = fixture()
+    const work = directRequest(value, "assignment")
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    value.publisher.respond.mockImplementationOnce(async () => {
+      entered.resolve()
+      await release.promise
+    })
+    value.orchestrator.accept("revoked-during-ack", work)
+    await entered.promise
+    try {
+      now += 1_000
+      value.github.currentIssue.assignees = []
+      value.github.events.push({
+        id: "2001",
+        event: "unassigned",
+        actor: maintainer,
+        assignee: { id: botId, login: "reina[bot]", type: "Bot" },
+        createdAt: now,
+      })
+      value.orchestrator.accept(
+        "unassignment-after-request",
+        value.work({
+          action: "unassigned",
+          actor: maintainer,
+          changedAt: now,
+          cancel: true,
+        }),
+      )
+      expect(value.store.deliveries().some((item) => item.id === "revoked-during-ack")).toBe(false)
+    } finally {
+      release.resolve()
+    }
+    await value.orchestrator.drain()
+    expect(value.log.info).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event: "triage_started", correlationId: "revoked-during-ack" }),
+    )
+    expect(value.log.info).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event: "proposal_created", correlationId: "revoked-during-ack" }),
+    )
+    expect(value.log.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "cancelled",
+        correlationId: "revoked-during-ack",
+        reason: "job_cancelled",
+      }),
+    )
+    expect(value.store.jobs()).toEqual([])
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expectNoPublication(value)
+  })
+
+  describe.each(["comment", "assignment"] as const)("%s acknowledgement deferral", (kind) => {
+    test.each(["unchanged", "base", "branch", "policy", "evidence"])(
+      "retains the original binding across restart when %s",
+      async (change) => {
+        const value = fixture()
+        const work = directRequest(value, kind)
+        const binding = {
+          fingerprint: fingerprint(value.github.currentIssue, botId),
+          baseSha: value.github.baseline.sha,
+          baseBranch: value.github.baseline.branch,
+          policyHash: policyHash(value.config),
+        }
+        const retryAt = now + 30_000
+        let pendingAtResponse: unknown
+        value.publisher.respond.mockImplementationOnce(async () => {
+          pendingAtResponse = value.store.deliveries().find((item) => item.id === "deferred-ack")
+          throw new GitHubDeferred("github_rate_limit", retryAt)
+        })
+        await value.deliver(work, "deferred-ack")
+        expect(pendingAtResponse).toEqual({
+          id: "deferred-ack",
+          payload: { ...work, requestBinding: binding },
+        })
+        expect(value.store.blockedUntil()).toBe(retryAt)
+        expect(value.runtime.triage).not.toHaveBeenCalled()
+        expect(value.runtime.code).not.toHaveBeenCalled()
+        expectNoPublication(value)
+        await value.restart()
+        if (change === "base") value.github.baseline.sha = "c".repeat(40)
+        if (change === "branch") value.github.baseline.branch = "trunk"
+        if (change === "policy") value.config.maxChangedFiles = 1
+        if (change === "evidence") value.github.currentIssue.comments[0].body += " New evidence."
+        now = retryAt
+        expect(value.store.deliveries()).toContainEqual({
+          id: "deferred-ack",
+          payload: { ...work, requestBinding: binding },
+        })
+        await value.orchestrator.drain()
+        if (change === "unchanged") {
+          expect(value.store.jobs().map((job) => job.state)).toEqual(["pr_ready"])
+          expect(value.runtime.code).toHaveBeenCalledTimes(1)
+          expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+          expect(value.publisher.responses.size).toBe(1)
+        } else {
+          expect(value.store.jobs()).toEqual([])
+          expect(value.runtime.triage).not.toHaveBeenCalled()
+          expect(value.runtime.code).not.toHaveBeenCalled()
+          expect(value.publisher.respond).toHaveBeenCalledTimes(1)
+          expect(value.log.info).toHaveBeenCalledWith(
+            expect.objectContaining({
+              event: "cancelled",
+              correlationId: "deferred-ack",
+              reason: "proposal_stale",
+            }),
+          )
+          expectNoPublication(value)
+        }
+      },
+    )
+  })
 
   test.each(["base", "policy", "evidence"])(
     "a deferred direct request keeps its original %s binding across restart",

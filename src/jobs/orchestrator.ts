@@ -23,7 +23,7 @@ import type {
   Logger,
   Proposal,
 } from "../types.js"
-import type { Store } from "./store.js"
+import type { RequestBinding, Store } from "./store.js"
 import { IssueTriage } from "./triage.js"
 import { Worker } from "./worker.js"
 
@@ -90,6 +90,11 @@ export interface Boundaries {
 }
 
 const key = (ref: IssueRef) => `${ref.id}:${ref.issueId}`
+const sameRequestBinding = (a: RequestBinding, b: RequestBinding) =>
+  a.fingerprint === b.fingerprint &&
+  a.baseSha === b.baseSha &&
+  a.baseBranch === b.baseBranch &&
+  a.policyHash === b.policyHash
 const terminal = new Set(["pr_ready", "cancelled", "failed"])
 const reasons = new Set([
   "proposal_stale",
@@ -149,6 +154,7 @@ export class Orchestrator {
   private controllers = new Map<string, AbortController>()
   private controllerBranches = new Map<string, string>()
   private controllerRefs = new Map<string, IssueRef>()
+  private controllerContexts = new Map<string, { jobId?: string; binding?: RequestBinding }>()
   private worker: Worker
   private reviews: IssueTriage
 
@@ -221,22 +227,28 @@ export class Orchestrator {
       const stored = this.store.reviewForReconciliation(invalidation.ref)
       if (stored) invalidations.set(issueKey, { ...invalidation, ref: stored.ref })
     }
-    if (
-      !this.store.acceptDelivery(deliveryId, JSON.parse(JSON.stringify(validated)), revoked, [
-        ...invalidations.values(),
-      ])
+    const intake = this.store.acceptDelivery(
+      deliveryId,
+      JSON.parse(JSON.stringify(validated)),
+      revoked,
+      [...invalidations.values()],
     )
-      return
-    for (const { ref, reason } of invalidations.values()) {
-      const review = this.store.review(ref)
-      if (review)
-        this.event("triage_stale", ref, {
-          correlationId: deliveryId,
-          revision: review.revision,
-          reason,
-        })
+    for (const { ref, reason, revision } of intake.reviews) {
+      this.event("triage_stale", ref, {
+        correlationId: deliveryId,
+        revision,
+        reason,
+      })
     }
-    for (const ref of revoked) this.cancel(ref, true)
+    for (const { ref, preservedJobIds, preservedBindings } of intake.revocations) {
+      const context = this.controllerContexts.get(key(ref))
+      const binding = context?.binding
+      const preserved = context?.jobId
+        ? preservedJobIds.includes(context.jobId)
+        : binding && preservedBindings.some((preserved) => sameRequestBinding(preserved, binding))
+      if (!preserved) this.cancel(ref, true)
+    }
+    if (!intake.queued) return
     if (validated.kind === "invalidate") {
       if (validated.disable) this.disabled = true
       for (const [issueKey, controller] of this.controllers) {
@@ -525,7 +537,20 @@ export class Orchestrator {
       )
       return
     }
+    let proposal = this.store.proposal(issue.ref)
+    const head = await github.head()
+    if (this.stopped) return
+    let requestBinding: RequestBinding | undefined
     if (direct?.command === "fix") {
+      requestBinding = {
+        fingerprint: fingerprint(issue, this.botId),
+        baseSha: head.sha,
+        baseBranch: head.branch,
+        policyHash: policyHash(this.config),
+      }
+      if (work.requestBinding && !sameRequestBinding(work.requestBinding, requestBinding))
+        throw new Error("proposal_stale")
+      this.store.bindRequest(correlationId, requestBinding)
       const request = direct.request
       await publisher.respond(
         issue.ref,
@@ -538,25 +563,7 @@ export class Orchestrator {
           "Add bot:skip, edit/delete the request, or unassign Reina to revoke the applicable request. " +
           "Reina does not merge PRs.",
       )
-    }
-    let proposal = this.store.proposal(issue.ref)
-    const head = await github.head()
-    if (this.stopped) return
-    if (direct?.command === "fix") {
-      const binding = {
-        fingerprint: fingerprint(issue, this.botId),
-        baseSha: head.sha,
-        baseBranch: head.branch,
-        policyHash: policyHash(this.config),
-      }
-      if (
-        work.requestBinding &&
-        Object.entries(binding).some(
-          ([field, value]) => work.requestBinding?.[field as keyof typeof binding] !== value,
-        )
-      )
-        throw new Error("proposal_stale")
-      this.store.bindRequest(correlationId, binding)
+      if (this.stopped) return
     }
     if (
       proposal &&
@@ -571,11 +578,14 @@ export class Orchestrator {
       await publisher.labels(issue.ref.number, [], ["fix_available", "bot:approved", "bot:working"])
       proposal = undefined
     }
+    // Remote acknowledgement or label writes can outlive receipt revocation.
+    if (requestBinding) this.store.bindRequest(correlationId, requestBinding)
     const controller = new AbortController()
     const signal = AbortSignal.any([controller.signal, this.shutdown.signal])
     this.controllers.set(key(issue.ref), controller)
     this.controllerBranches.set(key(issue.ref), head.branch)
     this.controllerRefs.set(key(issue.ref), issue.ref)
+    this.controllerContexts.set(key(issue.ref), { binding: requestBinding })
     let review: Awaited<ReturnType<IssueTriage["run"]>>
     try {
       review = await this.reviews.run(issue, head, github, publisher, signal, correlationId)
@@ -584,6 +594,7 @@ export class Orchestrator {
         this.controllers.delete(key(issue.ref))
         this.controllerBranches.delete(key(issue.ref))
         this.controllerRefs.delete(key(issue.ref))
+        this.controllerContexts.delete(key(issue.ref))
       }
     }
     if (this.stopped || signal.aborted) return
@@ -728,6 +739,7 @@ export class Orchestrator {
     this.controllers.set(key(job.ref), controller)
     this.controllerBranches.set(key(job.ref), proposal.baseBranch)
     this.controllerRefs.set(key(job.ref), job.ref)
+    this.controllerContexts.set(key(job.ref), { jobId: job.id })
     this.event("dispatched", job.ref, { jobId: job.id, proposalId: proposal.revision })
     try {
       await this.worker.run(job, proposal, github, publisher, signal)
@@ -797,6 +809,7 @@ export class Orchestrator {
         this.controllers.delete(key(job.ref))
         this.controllerBranches.delete(key(job.ref))
         this.controllerRefs.delete(key(job.ref))
+        this.controllerContexts.delete(key(job.ref))
       }
     }
   }

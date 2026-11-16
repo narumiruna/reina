@@ -167,6 +167,8 @@ function legacyRecords(store: Store, activeJob = false): void {
 function downgrade(version: number): void {
   inspect((db) => {
     db.exec(`DROP TABLE reviews; DROP TABLE review_cursor;
+      DROP TABLE request_epoch; DROP INDEX deliveries_by_request;
+      ALTER TABLE deliveries DROP COLUMN request_key;
       ${version < 4 ? "ALTER TABLE deliveries DROP COLUMN global_until;" : ""}
       ${version < 3 ? "DROP TABLE scan_cursor; DROP INDEX one_active_job_slot;" : ""}
       ${version === 1 ? "DROP TABLE assessments;" : ""}
@@ -292,12 +294,12 @@ describe("strict review contract", () => {
 })
 
 describe("durable review storage", () => {
-  test("fresh schema5 does not infer success from old attempt hashes", () => {
+  test("fresh schema6 does not infer success from old attempt hashes", () => {
     const store = openStore()
     store.rememberAssessment("legacy-attempt-not-success")
     expect(store.review(review().ref)).toBeUndefined()
     expect(store.reviewBatch(100)).toEqual([])
-    expect(inspect((db) => db.prepare("PRAGMA user_version").get()?.user_version)).toBe(5)
+    expect(inspect((db) => db.prepare("PRAGMA user_version").get()?.user_version)).toBe(6)
     expect(store.saveReview(review(), randomUUID())).toBe(false)
     expect(inspect((db) => db.prepare("SELECT COUNT(*) AS count FROM reviews").get()?.count)).toBe(
       0,
@@ -417,7 +419,7 @@ describe("durable review storage", () => {
           { kind: "issue", ref: original.ref },
           [original.ref],
           [{ ref: original.ref, reason: "changed" }],
-        ),
+        ).queued,
       ).toBe(true)
       const invalidated = store.review(original.ref)
       expect(invalidated).toMatchObject({
@@ -439,7 +441,7 @@ describe("durable review storage", () => {
           {},
           [original.ref],
           [{ ref: original.ref, reason: "changed" }],
-        ),
+        ).queued,
       ).toBe(false)
       expect(store.review(original.ref)).toEqual(invalidated)
     },
@@ -456,7 +458,7 @@ describe("durable review storage", () => {
         {},
         [value.ref],
         [{ ref: value.ref, reason: "changed" }],
-      ),
+      ).queued,
     ).toBe(true)
     const revoked = store.review(value.ref)
     expect(revoked).toMatchObject({
@@ -974,7 +976,7 @@ describe("schema5 migrations and private files", () => {
       expect(store.review(review().ref)).toBeUndefined()
       expect(store.scanPage()).toBe(version < 3 ? 1 : 17)
       expect(store.assessed("legacy-attempt-not-success")).toBe(version !== 1)
-      expect(inspect((db) => db.prepare("PRAGMA user_version").get()?.user_version)).toBe(5)
+      expect(inspect((db) => db.prepare("PRAGMA user_version").get()?.user_version)).toBe(6)
       const delivery = inspect((db) => db.prepare("SELECT * FROM deliveries").get())
       expect(delivery).toMatchObject({
         id: "fixture-delivery",
@@ -1027,9 +1029,9 @@ describe("schema5 migrations and private files", () => {
     expect(
       inspect((db) => db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table'").all()),
     ).toEqual([{ name: "review_cursor" }])
-    inspect((db) => db.exec("DROP TABLE review_cursor; PRAGMA user_version = 6;"))
+    inspect((db) => db.exec("DROP TABLE review_cursor; PRAGMA user_version = 7;"))
     expect(() => openStore()).toThrow("Unsupported state database version")
-    expect(inspect((db) => db.prepare("PRAGMA user_version").get()?.user_version)).toBe(6)
+    expect(inspect((db) => db.prepare("PRAGMA user_version").get()?.user_version)).toBe(7)
   })
 
   test("preserves private permissions for the job database and lock", () => {

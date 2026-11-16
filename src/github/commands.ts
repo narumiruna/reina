@@ -181,7 +181,7 @@ async function currentComments(
       updatedAt < createdAt ||
       updatedAt > now ||
       later ||
-      (updatedAt > createdAt && updatedAt > candidate.createdAt)
+      (updatedAt > createdAt && updatedAt >= candidate.createdAt)
     ) {
       throw new GitHubError("approval_issue_changed")
     }

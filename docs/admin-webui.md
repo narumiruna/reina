@@ -153,9 +153,12 @@ and credentials: revoke affected sessions and review provider authorization befo
 
 ## Upgrade to durable issue triage
 
-Job database `reina.sqlite` migrates transactionally from schema 4 to 5, adding bounded current
-review records and an independent reconciliation cursor. Existing proposals, approvals, jobs,
-deliveries, and legacy attempt hashes remain intact; attempt hashes do not become completed
+Job database `reina.sqlite` schema 6 retains the schema-5 review records and reconciliation cursor.
+The transactional 5-to-6 migration adds indexed durable request receipt keys and a `request_epoch`
+cutoff. Valid retained sources are backfilled. Unknown pre-upgrade sources need a new human request;
+legacy unbound pending requests are completed without coding. Known bound pending requests retain
+their original baseline. Fresh databases have no legacy cutoff. Existing claimed approvals,
+publication records, and legacy attempt hashes are preserved; hashes do not become completed
 reviews. This is not encrypted `settings.sqlite`, which remains at schema 3. No new UI, settings,
 environment variable, or automatic label provisioning is added.
 
@@ -583,7 +586,7 @@ continuation data. No ambient environment, command, filesystem, or host Pi auth 
 3. Securely back up the original encryption key separately from the state backup. Restrict access
    to both. Losing that key makes the encrypted App key and provider credentials undecryptable.
 4. Restore compatible application state and the original key together. A downgrade after job
-   schema 5 or settings schema 3 requires matching pre-upgrade backups. Review restored credentials
+   schema 6 or settings schema 3 requires matching pre-upgrade backups. Review restored credentials
    and revoke affected sessions; a backup can restore old authorization. Reconcile GitHub resources,
    including triage comments and labels, before enabling dispatch. A database restore does not undo
    remote writes. Do not delete state to hide an encryption-key mismatch.
@@ -818,7 +821,7 @@ Current issue-triage test evidence must be recorded separately from the historic
 4. **Deployment operator**
    - Prerequisites: stopped-instance backups with WAL state and the original key, disposable
      migration/restore copies, and supported Linux with private same-path staging.
-   - Actions: check job schema 4-to-5 migration separately from settings schema 3; test restore,
+   - Actions: check job schema 4-to-5 and 5-to-6 migrations separately from settings schema 3; test restore,
      permissions, quotas, cleanup, and the complete runtime suite. Reconcile restored GitHub state.
    - Expected: compatible state and confirmed runtime controls before dispatch. Preflight alone
      is insufficient; retain full-suite results and any unverified paths.

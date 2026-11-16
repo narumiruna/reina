@@ -520,6 +520,38 @@ describe("request revocation and bounded live reads", () => {
     },
   )
 
+  test.each(["comment", "assignment"])(
+    "rejects a prior comment edited in the same second as the %s request",
+    async (kind) => {
+      const value = setup()
+      const candidate = kind === "assignment" ? value.assign() : value.candidate
+      const request: ExecutionRequest =
+        candidate.kind === "assignment" ? { ...candidate, eventId: "1001" } : candidate
+      const prior: RawComment = {
+        id: 9,
+        user: actor,
+        body: "Updated context",
+        created_at: iso(createdAt - 2000),
+        updated_at: iso(createdAt),
+      }
+      value.comments.unshift(prior)
+      await expect(
+        inspectRequest(value.github, value.issue, candidate, actor),
+      ).rejects.toMatchObject({ code: "approval_issue_changed" })
+      await expect(
+        validateRequest(value.github, value.issue, request, actor),
+      ).rejects.toMatchObject({ code: "approval_issue_changed" })
+
+      prior.updated_at = iso(createdAt - 1000)
+      await expect(
+        inspectRequest(value.github, value.issue, candidate, actor),
+      ).resolves.toMatchObject({ command: "fix" })
+      await expect(validateRequest(value.github, value.issue, request, actor)).resolves.toBe(
+        "write",
+      )
+    },
+  )
+
   test("fails closed on incomplete history without live writes", async () => {
     const value = setup()
     value.rest.issues.listEvents.mockResolvedValue(

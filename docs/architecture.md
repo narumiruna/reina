@@ -522,13 +522,21 @@ Requests expire after 24 hours. A direct request delegates one policy-bound prop
 claiming that the human approved an unseen exact proposal. It never synthesizes `bot:approved`.
 
 The first validated direct request is durably bound to the issue fingerprint, base name/SHA, and
-policy hash. Deferred work cannot rebind itself after those change. SQLite atomically claims the
-matching pending delivery, consumes a namespaced comment/assignment event once, and reserves the
-single active job slot. A newer material/cancellation event completes older pending requests in
-the same intake transaction. Signed issue/comment change timestamps prevent a demonstrably
-older delayed event from revoking a newer direct request. Same-time or undated changes remain
-conservative revocations; comment deletion never reuses the old comment-update timestamp as its
-deletion time. Live evidence rejects edited/deleted comments, later non-Reina comments,
+policy hash before its acknowledgement can defer. Deferred work cannot rebind after those change.
+The pending receipt is checked again after remote writes and before triage, so revocation during
+an acknowledgement cannot restart work from that request.
+A durable receipt key identifies the numeric repository, installation, issue, and immutable comment
+ID or assignment candidate. It excludes mutable bodies, actor logins, issue hashes, and bindings.
+The key remains after a delivery completes, fails, or is revoked, so a new delivery ID cannot
+revive a rejected request. SQLite atomically claims the matching pending delivery, consumes a
+namespaced comment/assignment event once, and reserves the single active job slot.
+
+Material/cancellation intake completes older pending requests individually in the same transaction.
+A newer pending source does not shield older authority. Only a newer active job and matching bound
+review/proposal context are preserved. Intake returns committed revocation effects separately from
+its dispatch decision, so an old event can cancel older work without later dispatching against the
+protected newer context. Same-time or undated changes remain conservative revocations; comment
+deletion never reuses the old comment-update timestamp as its deletion time. Live evidence rejects edited/deleted comments, later non-Reina comments,
 stale/replaced assignments, close/reopen, exclusion, and permission loss. Removal of
 the current proposal's `fix_available` label also revokes execution, even if restored.
 
@@ -551,14 +559,19 @@ SQLite stores reviews, proposals, consumed approval events, inbox deliveries, jo
 It uses foreign keys, WAL, full synchronous durability, and an independent process-lifetime
 SQLite lock. The OS releases that lock after a crash. The directory is service-owned and private.
 Ephemeral storage, network filesystems, and multiple service instances are unsupported.
-Job database `reina.sqlite` schema 5 adds current reviews and a separate review cursor through a
-transactional 4-to-5 migration. Supported older upgrades retain schema-4 cooldown separation.
-Existing proposals, approvals, jobs, deliveries, and legacy assessment hashes remain intact; no
-review completion is fabricated. Migration failure rolls back. This is separate from encrypted
-`settings.sqlite` schema 3; triage does not migrate settings. Stop the service and take a consistent
-backup before an upgrade. Direct requests add optional typed source evidence to approval JSON
-without changing job schema 5. Older binaries cannot parse these new records: a downgrade needs
-the matching pre-deployment backup, not manual removal of source fields or consumed event IDs.
+Job database `reina.sqlite` schema 6 retains schema-5 reviews and their separate cursor, as well
+as schema-4 cooldown separation. Its transactional 5-to-6 migration adds indexed receipt keys and
+an explicit `request_epoch` cutoff. Valid retained sources are backfilled. Legacy unbound pending
+requests are completed without coding because their original baseline cannot be proved. Unknown
+sources created at or before the upgrade cutoff require a new human request: old completed
+receipts no longer contain enough data to reconstruct their identity. Known bound pending sources
+retain their original bindings. Fresh databases have no legacy cutoff.
+
+Existing claimed approvals and publication records remain intact; no review completion or approval
+is fabricated. Migration failure rolls back. This is separate from encrypted `settings.sqlite`
+schema 3. Stop the service and take a consistent backup before an upgrade. Older binaries cannot
+open schema 6: a downgrade needs the matching pre-upgrade application and state backup, not manual
+removal of receipt keys, source fields, or consumed event IDs.
 
 Normal job states are approved, working, validating, publishing, and pr_ready. Failed and
 cancelled jobs cannot resume coding. The public labels are projections of state:
@@ -629,7 +642,7 @@ changed, do not resume remote writes. Existing remote effects require operator r
    - There is no built-in key rotation. Do not blindly regenerate the key; replacing the environment
      value does not re-encrypt existing state. See [credential recovery](admin-webui.md#secret-storage-and-recovery).
 3. Version and restore the application, compatible databases, and original encryption key together.
-   A downgrade after job schema 5 or settings schema 3 requires matching pre-upgrade backups;
+   A downgrade after job schema 6 or settings schema 3 requires matching pre-upgrade backups;
    never lower schema versions or delete review, approval, job, or OAuth records by hand.
    Restored backups can restore old provider credentials and sessions. Revoke affected sessions
    and review provider authorization before enabling dispatch.
@@ -643,7 +656,7 @@ changed, do not resume remote writes. Existing remote effects require operator r
 6. For unknown publication, inspect the stored intent and matching GitHub resources. Do not
    delete a branch/PR or reset an intent without explicit maintainer authorization.
 7. On rollback, stop scans/dispatch, cancel workers, preserve resource IDs, and restore a compatible
-   application. Older binaries cannot open job schema 5 or interpret its review recovery state.
+   application. Older binaries cannot open job schema 6 or interpret its request receipt state.
    Restore a matching state backup before using an older version. Do not automatically close
    existing PRs or delete branches.
 
