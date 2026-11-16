@@ -1,5 +1,16 @@
 # reina
 
+## 0.3.0
+
+### Minor Changes
+
+- c27568d: Add English (`en`) and 正體中文 (`tw`) to the login and admin UI, with a persistent language selector, translated messages and accessible labels, and locale-aware dates and counts. Switching languages preserves unsaved form input.
+
+### Patch Changes
+
+- fd697f6: Migrate UI translations to i18next with plain JSON catalogs, shared semantic kebab-case keys, named interpolation, and locale-aware plural rules. Bundle the browser module locally and preserve live switching and unsaved form input. Keep secret field labels named, clear corrected validation announcements, and omit build-only dependencies from the production image.
+- 834de1f: Update pi-ai to 1.5.2, openid-client to 6.9.0, i18next to 27.1.3, Biome to 2.6.8, and Vitest to 5.1.0. Refresh the dependency lockfile and align tests and documentation with the SDK's OpenAI Codex provider name. The isolated worker remains pinned to Pi 1.5.0.
+
 ## 0.2.0
 
 ### Minor Changes
