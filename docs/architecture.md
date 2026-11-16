@@ -512,11 +512,15 @@ authenticated App bot with instructions, or a verified assignment to that bot. A
 `help` replies with usage and does not grant coding authority. The bot login and slug alias come
 from authenticated GitHub identity, not user configuration or webhook text. Code fences, quotes,
 and HTML comments cannot mint requests. CommonMark source ranges exclude code blocks, raw HTML
-blocks, and Markdown blockquotes, including nested list continuations. Matching still uses the
-original lines, with inline-code and HTML-comment guards; stripping markup cannot create a command.
-Quote exclusion ends at the parsed quote boundary. HTML-block lines update comment state without
-becoming commands, so a comment that crosses a block boundary remains hidden. Code and quote
-contents do not change the outer lexical state. The parser does not render HTML. Issue-body and
+blocks, and Markdown blockquotes, including nested list continuations. The pinned
+`mdast-util-from-markdown` parser supplies block and inline source positions. Mentions must start
+in a text node and match the original raw line; masking HTML cannot create a namespace or its
+separator. HTML markup is masked only when reading the instructions after that raw mention.
+Quote exclusion ends at the parsed quote boundary. Only raw HTML nodes carry comment delimiters
+between parsed blocks, including HTML inside quotes. Inline source positions preserve commands
+after a real inline closure, including within the same paragraph. A closer in escaped prose or
+code cannot end that comment. HTML-block lines update lexical state without becoming commands. Matching
+never uses decoded or rendered text. The production parser does not render HTML. Issue-body and
 PR-thread mentions are not entrypoints.
 
 After raw-signature verification, intake stores only comment ID, original body SHA-256,

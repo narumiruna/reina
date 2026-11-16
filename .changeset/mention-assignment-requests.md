@@ -6,4 +6,4 @@ Add permission-checked issue mentions and assignment requests that authorize one
 
 Retain request identities after delivery completion, bind requests before acknowledgement retries, apply delayed revocations only to older authority, and reject ambiguous same-second comment edits. Upgrade job state transactionally to schema 6; unknown pre-upgrade sources require a fresh human request.
 
-Use CommonMark block source ranges to ignore code and quoted examples, including fences nested in Markdown list continuations, without changing plain-text mention requests.
+Use precise CommonMark block and inline source positions to ignore code, quoted examples, and HTML comments without changing plain-text mention requests. Preserve real commands after quote and comment closures; match namespaces and separators on the original text.

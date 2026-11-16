@@ -131,7 +131,7 @@ npm run prepare:worker -- /absolute/path/to/approved-snapshot reina-worker:local
 Enter the printed immutable image ID in **Runtime → Immutable worker image ID**. The worker
 contains Pi 1.5.0 and immutable target dependencies. At runtime, both package files must match its fingerprints.
 Prepare another image when dependencies change; changing the image invalidates old proposals.
-For Reina as its own target, the CommonMark parser dependency changes those fingerprints once
+For Reina as its own target, the Markdown parser dependencies change those fingerprints once
 this implementation is merged. Prepare a matching worker before dispatching against that new base.
 When Reina itself is the target, use these trusted verification argv in **Runtime**:
 

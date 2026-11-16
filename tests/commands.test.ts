@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto"
+import { HtmlRenderer, Parser } from "commonmark"
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 import { inspectRequest, type RequestCandidate, validateRequest } from "../src/github/commands.js"
 import { GitHub, type GitHubClient, GitHubDeferred } from "../src/github/scanner.js"
@@ -130,8 +131,17 @@ describe("trusted line-start mention commands", () => {
     ["@custom-reina help\nThanks!", "help"],
     ["@custom-reina help!\nPlease explain the usage.", "help"],
     ["<!-- hidden -->\n@custom-reina fix", "fix"],
-    ["<div><!--\n\nhidden\n-->\n@custom-reina fix", "fix"],
+    ["<div><!--\n\nhidden\n<div>-->\n\n@custom-reina fix", "fix"],
     ["<div><!-- hidden -->\n\n@custom-reina fix", "fix"],
+    ["<div><!--\n\nhidden <!-- nested -->\n\n@custom-reina fix", "fix"],
+    ["<div><!--\n\nhidden <!-- nested -->\n@custom-reina fix", "fix"],
+    ["@custom-reina <!-- metadata -->", "help"],
+    ["@custom-reina\n`fix`", "help"],
+    ["@custom-reina\r\n`fix`", "help"],
+    ["@custom-reina\n`multi\nfix\n`", "help"],
+    ["@custom-reina\nfix `test`", "fix"],
+    ["> <!-- closed -->\n\n@custom-reina fix", "fix"],
+    ["`<!--`\n\n@custom-reina fix", "fix"],
     ["~~~\n<!--\n~~~\n@custom-reina fix", "fix"],
     ["- ~~~text\n  @custom-reina hidden\n  ~~~\n\n@custom-reina fix", "fix"],
     ["@custom-reina\n\n- ~~~text\n  fix the example\n  ~~~", "help"],
@@ -165,6 +175,8 @@ describe("trusted line-start mention commands", () => {
     "\\@custom-reina fix",
     "&#x40;custom-reina fix",
     "&commat;custom-reina fix",
+    "@custom-reina<!-- -->fix",
+    "@custom-reina<!-- --> fix",
     "> @custom-reina fix",
     "> Example request:\n@custom-reina fix the typo",
     "`example\n@custom-reina fix the typo\n`",
@@ -184,6 +196,9 @@ describe("trusted line-start mention commands", () => {
     "<div><!--\r\n\r\n@custom-reina fix\r\n-->",
     "<div><!--\n\n-->@custom-reina fix",
     "<div><!-- @custom-reina fix -->",
+    "<div><!--\n\nhidden\n-->\n@custom-reina fix",
+    "> <!--\n>\n@custom-reina fix\n-->",
+    "<div><!--\n\n![<!-- nested -->](x)\n\n@custom-reina fix",
     "<!-- ``` -->\n> @custom-reina fix",
     "- ~~~text\n  @custom-reina fix the typo\n  ~~~",
     "+ ~~~text\n  @custom-reina fix the typo\n  ~~~",
@@ -203,6 +218,19 @@ describe("trusted line-start mention commands", () => {
     "- > Example:\n  @custom-reina fix",
     "- ~~~\n  example\n\nOutside the list.\n\n  ~~~\n@custom-reina fix\n  ~~~",
   ])("ignores non-command evidence: %j", async (body) => {
+    const { github, issue, candidate, rest } = setup(body)
+    await expect(inspectRequest(github, issue, candidate, actor)).resolves.toBeUndefined()
+    expect(rest.repos.getCollaboratorPermissionLevel).not.toHaveBeenCalled()
+  })
+
+  test.each([
+    "<div><!--\n\n@custom-reina fix\n-->",
+    "<div><!--\n\nhidden\n-->\n@custom-reina fix",
+    "> <!--\n>\n@custom-reina fix\n-->",
+    "<div><!--\n\n~~~\n-->\n~~~\n\n@custom-reina fix",
+  ])("never authorizes a command hidden by emitted HTML comments: %j", async (body) => {
+    const rendered = new HtmlRenderer().render(new Parser().parse(body))
+    expect(rendered.replace(/<!--[\s\S]*?(?:-->|$)/g, "")).not.toContain("@custom-reina fix")
     const { github, issue, candidate, rest } = setup(body)
     await expect(inspectRequest(github, issue, candidate, actor)).resolves.toBeUndefined()
     expect(rest.repos.getCollaboratorPermissionLevel).not.toHaveBeenCalled()

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto"
-import { Parser } from "commonmark"
+import type { Nodes } from "mdast"
+import { fromMarkdown } from "mdast-util-from-markdown"
 import type { Actor, ExecutionRequest, Issue, LabelEvent } from "../types.js"
 import { type GitHub, GitHubError, sameRepository } from "./scanner.js"
 
@@ -77,57 +78,93 @@ async function humanPermission(github: GitHub, actor: Actor): Promise<string> {
   return permission
 }
 
-function nonCommandLines(body: string): { excluded: Set<number>; html: Set<number> } {
-  const excluded = new Set<number>()
-  const html = new Set<number>()
-  const walker = new Parser().parse(body).walker()
-  for (let step = walker.next(); step; step = walker.next()) {
-    const { node, entering } = step
-    if (!entering || !["code_block", "html_block", "block_quote"].includes(node.type)) continue
-    for (let line = node.sourcepos[0][0]; line <= node.sourcepos[1][0]; line++) {
-      excluded.add(line)
-      if (node.type === "html_block") html.add(line)
-    }
-    // A protected container already covers all of its children.
-    walker.resumeAt(node, false)
+function htmlCommentState(text: string, comment: boolean): boolean {
+  let offset = 0
+  for (;;) {
+    const boundary = text.indexOf(comment ? "-->" : "<!--", offset)
+    if (boundary === -1) return comment
+    offset = boundary + (comment ? 3 : 4)
+    comment = !comment
   }
-  return { excluded, html }
 }
 
-/** Keep hidden text in place so removing markup cannot create a line-start command. */
-function commandLines(body: string): string[] {
-  const lines: string[] = []
+interface CommandLine {
+  raw: string
+  visible: string
+  canMention: boolean
+}
+
+/** Use source positions without decoding or stripping text into a command. */
+function commandLines(body: string): CommandLine[] {
+  const source = body.replace(/\r\n?/g, "\n")
+  const rawLines = source.split("\n")
+  const masked = source.split("")
+  const excluded = new Set<number>()
+  const textLines = new Set<number>()
+  const textRanges: { start: number; end: number }[] = []
+  const hidden = new Set<number>()
   let comment = false
-  let inlineTicks: number | undefined
-  const { excluded, html } = nonCommandLines(body)
-  for (const [index, raw] of body.split(/\r\n?|\n/).entries()) {
-    // HTML blocks can open comments that continue after the parsed block ends.
-    // Code and quote contents must not change the outer lexical state.
-    if (excluded.has(index + 1) && !html.has(index + 1)) continue
-    const hiddenPrefix = comment
-    let visible = ""
-    let offset = 0
-    while (offset < raw.length) {
-      const boundary = raw.indexOf(comment ? "-->" : "<!--", offset)
-      const end = boundary === -1 ? raw.length : boundary + (comment ? 3 : 4)
-      visible += comment
-        ? " ".repeat(end - offset)
-        : raw.slice(offset, boundary === -1 ? end : boundary)
-      if (!comment && boundary !== -1) visible += "    "
-      offset = end
-      if (boundary !== -1) comment = !comment
+  let nextLine = 1
+  const fillComments = (through: number) => {
+    while (nextLine <= through) {
+      if (comment) hidden.add(nextLine)
+      nextLine++
     }
-    if (excluded.has(index + 1) || hiddenPrefix || /^(?: {4}|\t)/.test(visible)) continue
-    const insideCode = inlineTicks !== undefined
-    for (const match of visible.matchAll(/`+/g)) {
-      let escapes = 0
-      for (let at = match.index - 1; at >= 0 && visible[at] === "\\"; at--) escapes++
-      if (escapes % 2) continue
-      if (inlineTicks === undefined) inlineTicks = match[0].length
-      else if (inlineTicks === match[0].length) inlineTicks = undefined
+  }
+  const stack: { node: Nodes; parent?: Nodes["type"] }[] = [{ node: fromMarkdown(source) }]
+  while (stack.length) {
+    const { node, parent } = stack.pop() as { node: Nodes; parent?: Nodes["type"] }
+    const position = node.position
+    if (!position || position.start.offset === undefined || position.end.offset === undefined)
+      throw new GitHubError("approval_comment_changed")
+    const lastLine = position.end.line - (position.end.column === 1 ? 1 : 0)
+    const blockHtml =
+      node.type === "html" &&
+      (parent === "root" || parent === "blockquote" || parent === "listItem")
+    if (
+      (["code", "blockquote", "definition"].includes(node.type) || blockHtml) &&
+      !excluded.has(position.start.line)
+    ) {
+      for (let line = position.start.line; line <= lastLine; line++) excluded.add(line)
     }
-    if (insideCode || /^ {0,3}`/.test(visible)) continue
-    lines.push(visible)
+    if (node.type === "text" && node.value.trim()) {
+      textRanges.push({ start: position.start.offset, end: position.end.offset })
+      for (let line = position.start.line; line <= lastLine; line++) textLines.add(line)
+    }
+    if (node.type === "html") {
+      let line = position.start.line
+      for (const fragment of node.value.split("\n")) {
+        fillComments(line++)
+        comment = htmlCommentState(fragment, comment)
+      }
+      for (let at = position.start.offset; at < position.end.offset; at++) {
+        if (masked[at] !== "\n") masked[at] = " "
+      }
+    }
+    if ("children" in node) {
+      for (let i = node.children.length - 1; i >= 0; i--)
+        stack.push({ node: node.children[i], parent: node.type })
+    }
+  }
+  fillComments(rawLines.length)
+  const visibleLines = masked.join("").split("\n")
+  const lines: CommandLine[] = []
+  let offset = 0
+  let text = 0
+  for (const [index, raw] of rawLines.entries()) {
+    const first = offset + (raw.match(/^\s*/)?.[0].length ?? 0)
+    while (text < textRanges.length && textRanges[text].end <= first) text++
+    if (!excluded.has(index + 1) && !hidden.has(index + 1) && textLines.has(index + 1)) {
+      lines.push({
+        raw,
+        visible: visibleLines[index],
+        canMention:
+          text < textRanges.length &&
+          textRanges[text].start <= first &&
+          first < textRanges[text].end,
+      })
+    }
+    offset += raw.length + 1
   }
   return lines
 }
@@ -138,22 +175,24 @@ function parseCommand(body: string, botLogin?: string): "help" | "fix" | undefin
   const alias = full.replace(/\[bot\]$/, "")
   let command: "help" | "fix" | undefined
   let addressed = false
-  for (const line of commandLines(body)) {
-    const mention = /^ {0,3}@([a-z\d-]+(?:\[bot\])?)(?=$|[\s,:!?。，：！？])/i.exec(line)
+  for (const { raw, visible, canMention } of commandLines(body)) {
+    const mention = canMention
+      ? /^ {0,3}@([a-z\d-]+(?:\[bot\])?)(?=$|[\s,:!?。，：！？])/i.exec(raw)
+      : null
     if (mention) {
       const login = mention[1].toLowerCase()
       if (login !== full && login !== alias) {
         addressed = false
         continue
       }
-      const instructions = line
+      const instructions = visible
         .slice(mention[0].length)
         .replace(/^[\s,:!?。，：！？]+/, "")
         .trim()
       addressed = instructions.length === 0
       if (instructions && !/^help[.!?。！？]*$/i.test(instructions)) return "fix"
       command = "help"
-    } else if (addressed && line.trim()) {
+    } else if (addressed && visible.trim()) {
       // Instructions can start on the next visible line after a bare mention.
       return "fix"
     }
