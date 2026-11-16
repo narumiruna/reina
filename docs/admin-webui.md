@@ -11,6 +11,7 @@ Dispatch stays disabled and webhooks return HTTP 503 until the controller is rea
 
 The login and admin pages support **English** (`en`) and **正體中文** (`tw`). Use the
 **Language / 語言** selector to switch without reloading the page or discarding unsaved form input.
+Choose a language before you open a dialog. Native modal dialogs block the page language selector.
 The preference is stored in this browser under the local storage key `reina.locale`; it is not
 an account or server setting. If storage is blocked, switching still works for the current page.
 
@@ -27,6 +28,8 @@ For UI changes, keep the English source text and `public/locales/tw.js` entries 
 Mark static text with `data-i18n` (only direct text nodes are translated), and mark translated
 attributes with `data-i18n-aria-label` or `data-i18n-placeholder`. Dynamic text uses the bindings
 in `public/i18n.js`; use named `message()` placeholders for data and `raw()` for literal output.
+Use a callback for text that reads a translated label or validation message. On a language change,
+source bindings update before text callbacks, so announcements do not keep text from the old language.
 Do not translate form values or render translations as HTML. The credential-free tests check
 catalog coverage, matching placeholders, locale persistence, and switching with drafts intact.
 

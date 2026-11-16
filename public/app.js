@@ -1673,10 +1673,11 @@ function initializeAdmin() {
         () =>
           status(
             target,
-            message("{field}: {error}", {
-              field: control.labels?.[0]?.textContent || message("Field"),
-              error: control.validationMessage,
-            }),
+            () =>
+              message("{field}: {error}", {
+                field: control.labels?.[0]?.textContent || message("Field"),
+                error: control.validationMessage,
+              }),
             "error",
           ),
         500,

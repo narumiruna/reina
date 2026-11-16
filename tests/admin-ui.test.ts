@@ -35,6 +35,7 @@ class Element {
   open = false
   type = ""
   validationMessage = ""
+  userInteracted = false
   listeners = new Map<string, Array<(event: EventFixture) => void>>()
   classes = new Set<string>()
   classList = {
@@ -64,6 +65,11 @@ class Element {
   get validity() {
     return { valid: !this.validationMessage }
   }
+  get labels(): Element[] {
+    let root: Element = this
+    while (root.parent) root = root.parent
+    return root.querySelectorAll("label").filter((label) => label.getAttribute("for") === this.id)
+  }
   setAttribute(name: string, value: string) {
     this.attributes.set(name, value)
   }
@@ -77,6 +83,7 @@ class Element {
     this.listeners.set(name, [...(this.listeners.get(name) || []), listener])
   }
   fire(name: string) {
+    if (["input", "change", "blur"].includes(name)) this.userInteracted = true
     for (const listener of this.listeners.get(name) || [])
       listener({ currentTarget: this, preventDefault() {} })
   }
@@ -103,6 +110,7 @@ class Element {
       const match =
         last === "*" ||
         last === this.tag ||
+        (last === ":user-invalid" && this.userInteracted && !this.validity.valid) ||
         (last.startsWith("[data-i18n") && this.attributes.has(last.slice(1, -1))) ||
         (last === "dialog[open]" && this.tag === "dialog" && this.open) ||
         (last.startsWith(".") && this.classes.has(last.slice(1))) ||
@@ -273,10 +281,13 @@ async function ui(initial = initialSettings(), locale = "en") {
     getItem: (key: string) => stored.get(key) ?? null,
     setItem: (key: string, value: string) => stored.set(key, value),
   }
+  const i18n = createI18n({ document, storage })
+  const timers = new Map<number, { callback: () => void; delay: number }>()
+  let timerId = 0
   runInNewContext(
     script.replace(/^import[^\n]+\n/, ""),
     {
-      createI18n: () => createI18n({ document, storage }),
+      createI18n: () => i18n,
       date,
       list,
       message,
@@ -298,8 +309,11 @@ async function ui(initial = initialSettings(), locale = "en") {
           this.value = value
         }
       },
-      setTimeout: () => 1,
-      clearTimeout() {},
+      setTimeout: (callback: () => void, delay: number) => {
+        timers.set(++timerId, { callback, delay })
+        return timerId
+      },
+      clearTimeout: (id: number) => timers.delete(id),
       fetch: async (path: string, options: { method: string; body?: string }) => {
         const data = options.body ? JSON.parse(options.body) : undefined
         state.requests.push({ path, data })
@@ -340,6 +354,14 @@ async function ui(initial = initialSettings(), locale = "en") {
     state,
     stored,
     document,
+    i18n,
+    runTimers(delay: number) {
+      for (const [id, timer] of [...timers]) {
+        if (timer.delay !== delay) continue
+        timers.delete(id)
+        timer.callback()
+      }
+    },
     switchLanguage(locale: string) {
       $("language-select").value = locale
       $("language-select").fire("change")
@@ -832,6 +854,37 @@ describe("UI language selection", () => {
     $("runtime-commands").fire("input")
     expect($("runtime-commands-error").textContent).toBe("")
   })
+
+  it.each([false, true])(
+    "updates validation announcements after a language switch (announced: %s)",
+    async (announced) => {
+      const { $, i18n, runTimers, switchLanguage, state } = await ui()
+      const control = $("runtime-commands")
+      control.fire("input")
+      i18n.setValidity(control, "Check this value and try again.")
+      control.fire("blur")
+      const label = control.labels[0]
+      expect(label.textContent).toBe("Verification commands (required)")
+      expect($("page-status").textContent).toBe("")
+      const requests = state.requests.length
+      if (announced) {
+        runTimers(500)
+        expect($("page-status").textContent).toBe(
+          "Verification commands (required): Check this value and try again.",
+        )
+      }
+      switchLanguage("tw")
+      if (!announced) runTimers(500)
+      expect(label.textContent).toBe("驗證指令（必填）")
+      expect(control.validationMessage).toBe("請檢查此值後再試一次。")
+      expect($("page-status").textContent).toBe("驗證指令（必填）：請檢查此值後再試一次。")
+      switchLanguage("en")
+      expect($("page-status").textContent).toBe(
+        "Verification commands (required): Check this value and try again.",
+      )
+      expect(state.requests).toHaveLength(requests)
+    },
+  )
 
   it("localizes login errors and still switches when storage is blocked", () => {
     const markup = readFileSync(new URL("../public/login.html", import.meta.url), "utf8")

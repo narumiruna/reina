@@ -72,20 +72,25 @@ export function createI18n({
   let locale = detectLocale(saved, navigator?.languages || [navigator?.language || "en"])
   const bindings = new WeakMap()
 
-  function bind(element, field, update) {
+  function bind(element, field, update, deferred = false) {
     let fields = bindings.get(element)
     if (!fields) {
       fields = new Map()
       bindings.set(element, fields)
     }
-    fields.set(field, update)
+    fields.set(field, { update, deferred })
     update()
   }
 
   function setText(element, value) {
-    bind(element, "text", () => {
-      element.textContent = translate(value, locale)
-    })
+    bind(
+      element,
+      "text",
+      () => {
+        element.textContent = translate(value, locale)
+      },
+      typeof value === "function",
+    )
   }
 
   function setAttribute(element, name, value) {
@@ -111,9 +116,15 @@ export function createI18n({
     if (!Object.hasOwn(locales, next)) return false
     locale = next
     document.documentElement.lang = locales[locale]
+    const deferred = []
     for (const element of document.querySelectorAll("*")) {
-      for (const update of bindings.get(element)?.values() || []) update()
+      for (const binding of bindings.get(element)?.values() || []) {
+        if (binding.deferred) deferred.push(binding.update)
+        else binding.update()
+      }
     }
+    // Callbacks can read labels and validity from controls later in the DOM.
+    for (const update of deferred) update()
     const select = document.getElementById("language-select")
     if (select) select.value = locale
     try {
