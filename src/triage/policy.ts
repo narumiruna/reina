@@ -3,7 +3,7 @@ import picomatch from "picomatch"
 import type { Config, Issue, Proposal, Snapshot, TriageDecision } from "../types.js"
 import { triageSchema } from "./schema.js"
 
-const POLICY_REVISION = "reina-mvp-1"
+const POLICY_REVISION = "reina-direct-requests-1"
 const DAY_MS = 86_400_000
 const PROTECTED_DIRECTORIES = new Set([
   ".git",

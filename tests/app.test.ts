@@ -1,4 +1,4 @@
-import { createHmac, generateKeyPairSync } from "node:crypto"
+import { createHash, createHmac, generateKeyPairSync } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
 import type { Server } from "node:http"
 import { tmpdir } from "node:os"
@@ -193,6 +193,7 @@ class MockGitHub extends GitHub {
     id: number
     body: string
     created_at: string
+    updated_at?: string
     user: { id: number; type: string; login: string }
   }[] = []
   permissions = new Map([
@@ -202,7 +203,7 @@ class MockGitHub extends GitHub {
   refs = new Map<string, string>()
 
   constructor(value: Config) {
-    super({} as GitHubClient, value.repository, botId)
+    super({} as GitHubClient, value.repository, botId, undefined, "reina[bot]")
     this.currentIssue = {
       ref: { ...value.repository, number: 12, issueId: 1_012 },
       title: "Correct the usage example",
@@ -362,6 +363,7 @@ class MockGitHub extends GitHub {
 }
 
 class MockPublisher extends Publisher {
+  responses = new Map<string, string>()
   comments = new Map<string, { commentId: number; publishedAt: number }>()
   drafts = new Map<string, { number: number; url: string }>()
 
@@ -371,6 +373,19 @@ class MockPublisher extends Publisher {
   ) {
     super({} as GitHubClient, reader.repository, reader.botId)
   }
+
+  override respond = vi.fn(async (ref: Issue["ref"], requestId: string, message: string) => {
+    if (this.responses.has(requestId)) return
+    this.responses.set(requestId, message)
+    const comment = {
+      id: 600 + this.responses.size,
+      body: `<!-- reina:request:${ref.id}:${ref.issueId}:${requestId} -->\n\n${message}`,
+      user: { id: botId, type: "Bot", login: "reina[bot]" },
+      created_at: new Date(Date.now()).toISOString(),
+    }
+    this.reader.remoteComments.push(comment)
+    this.reader.currentIssue.comments.push({ id: comment.id, authorId: botId, body: comment.body })
+  })
 
   createComment = vi.fn(async (proposal: Proposal) => {
     const comment = { commentId: 500 + this.comments.size, publishedAt: Date.now() }
@@ -571,6 +586,29 @@ async function fixture(): Promise<AppFixture> {
   return result
 }
 
+function requestComment(value: AppFixture, body: string, actor = maintainer) {
+  const comment = {
+    id: 300,
+    body,
+    user: { ...actor },
+    created_at: new Date(now).toISOString(),
+    updated_at: new Date(now).toISOString(),
+  }
+  value.github.remoteComments.push(comment)
+  value.github.currentIssue.comments.push({ id: comment.id, authorId: actor.id, body })
+  return payload({
+    action: "created",
+    sender: actor,
+    issue: {
+      id: value.github.currentIssue.ref.issueId,
+      number: value.github.currentIssue.ref.number,
+      title: value.github.currentIssue.title,
+      body: value.github.currentIssue.body,
+    },
+    comment,
+  })
+}
+
 function sign(raw: string) {
   return `sha256=${createHmac("sha256", webhookSecret).update(raw).digest("hex")}`
 }
@@ -634,10 +672,75 @@ describe("webhook routing and bounded event data", () => {
       installation: { id: 789 },
       repository: { id: 456, name: "project", owner: { login: "example" }, default_branch: "main" },
       sender: maintainer,
-      issue: { id: 1_012, number: 12 },
-      comment: { user: { id: 50 } },
+      issue: {
+        id: 1_012,
+        number: 12,
+        contentHash: createHash("sha256")
+          .update(JSON.stringify(["RAW_TITLE_MUST_NOT_REACH_PROBOT", rawIssueBody]))
+          .digest("hex"),
+      },
+      comment: {
+        user: { id: 50 },
+        bodyHash: createHash("sha256").update(rawCommentBody).digest("hex"),
+      },
     })
   })
+
+  test("preserves only signed request identity, timestamps, and original content hashes", () => {
+    const body = "  @reina fix the example\r\n"
+    const event = payload({
+      action: "created",
+      comment: {
+        id: 300,
+        body,
+        user: maintainer,
+        created_at: new Date(now).toISOString(),
+        updated_at: new Date(now).toISOString(),
+      },
+    })
+    const safe = sanitizeWebhook(event)
+    expect(sanitizeWebhook(safe)).toEqual(safe)
+    expect(webhookWork("issue_comment", safe, configuration(), botId)).toMatchObject({
+      request: {
+        kind: "comment",
+        commentId: 300,
+        bodyHash: createHash("sha256").update(body).digest("hex"),
+        createdAt: now,
+        updatedAt: now,
+      },
+      requestIssueHash: createHash("sha256")
+        .update(JSON.stringify([event.issue.title, event.issue.body]))
+        .digest("hex"),
+    })
+    expect(JSON.stringify(safe)).not.toContain(body)
+    expect(JSON.stringify(safe)).not.toContain(rawIssueBody)
+  })
+
+  test.each(["assigned", "unassigned"] as const)(
+    "routes %s only for the exact configured bot ID",
+    (action) => {
+      const event = payload({
+        action,
+        assignee: { id: botId, login: "reina[bot]", type: "Bot" },
+        issue: { ...payload().issue, updated_at: new Date(now).toISOString() },
+      })
+      expect(webhookWork("issues", event, configuration(), botId)).toMatchObject({
+        action,
+        cancel: action === "unassigned",
+        ...(action === "assigned"
+          ? { request: { kind: "assignment", assigneeId: botId, createdAt: now } }
+          : {}),
+      })
+      expect(
+        webhookWork(
+          "issues",
+          { ...event, assignee: { id: 98, login: "reina[bot]", type: "Bot" } },
+          configuration(),
+          botId,
+        ),
+      ).toBeUndefined()
+    },
+  )
 
   test.each([
     ["opened", undefined, false, false],
@@ -662,6 +765,22 @@ describe("webhook routing and bounded event data", () => {
     })
     expect(JSON.stringify(work)).not.toContain(rawIssueBody)
     if (label) expect(work).toHaveProperty("label", label)
+  })
+
+  test("retains signed change times but does not mistake an old comment update time for deletion", () => {
+    const updated_at = "2026-11-03T10:03:00Z"
+    const data = payload({ action: "edited", issue: { ...payload().issue, updated_at } })
+    expect(webhookWork("issues", data, configuration(), botId)).toMatchObject({
+      changedAt: Date.parse(updated_at),
+      material: true,
+    })
+    const comment = { id: 300, user: { id: maintainer.id }, updated_at }
+    expect(
+      webhookWork("issue_comment", payload({ action: "edited", comment }), configuration(), botId),
+    ).toMatchObject({ changedAt: Date.parse(updated_at), material: true })
+    expect(
+      webhookWork("issue_comment", payload({ action: "deleted", comment }), configuration(), botId),
+    ).not.toHaveProperty("changedAt")
   })
 
   test.each(["created", "edited", "deleted"])(
@@ -773,6 +892,137 @@ describe("webhook routing and bounded event data", () => {
 })
 
 describe("signed HTTP ingress and the complete credential-free workflow", () => {
+  test("a signed bare mention returns help without triage or code", async () => {
+    const value = await fixture()
+    const event = requestComment(value, "@reina")
+    expect((await value.post(event, "mention-help", "issue_comment")).status).toBe(202)
+    await value.orchestrator.drain()
+    expect(value.publisher.responses.get("comment-300")).toContain("@reina <instructions>")
+    expect(value.publisher.responses.get("comment-300")).toContain("draft PR")
+    expect(value.runtime.triage).not.toHaveBeenCalled()
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(value.store.jobs()).toEqual([])
+    expect(value.store.proposals()).toEqual([])
+    expect(value.publisher.createDraft).not.toHaveBeenCalled()
+    expectNoPrivateLogs(value)
+  })
+
+  test("a signed instruction mention creates one verified draft without an approval label", async () => {
+    const value = await fixture()
+    const instructions = "@reina correct npn to npm in the usage example"
+    const event = requestComment(value, instructions)
+    const received = vi.spyOn(value.app, "receive")
+    const requestedAt = now
+    now += 1_000
+    expect((await value.post(event, "mention-fix", "issue_comment")).status).toBe(202)
+    await value.orchestrator.drain()
+    const proposal = required(value.store.proposal(value.github.currentIssue.ref))
+    const job = required(value.store.jobs()[0])
+    expect(job).toMatchObject({
+      state: "pr_ready",
+      approval: {
+        eventId: "comment:300",
+        actor: maintainer,
+        createdAt: requestedAt,
+        request: { kind: "comment", commentId: 300 },
+      },
+      publication: { prNumber: 40 },
+    })
+    expect(job.approval.createdAt).toBeLessThan(required(proposal.publishedAt))
+    expect(value.publisher.responses.get("comment-300")).toContain(
+      "No additional bot:approved label is required",
+    )
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    expect(value.runtime.code).toHaveBeenCalledTimes(1)
+    expect(value.runtime.verify).toHaveBeenCalledTimes(1)
+    expect(job.artifact?.hash).toBe(artifactHash(required(job.artifact)))
+    expect(value.publisher.createDraft).toHaveBeenCalledExactlyOnceWith({
+      jobId: job.id,
+      head: branchFor(12),
+      base: "main",
+      draft: true,
+    })
+    expect(value.github.events).toEqual([])
+    expect(value.github.currentIssue.labels).not.toContain("bot:approved")
+    const dispatched = JSON.stringify(received.mock.calls)
+    expect(dispatched).not.toContain(instructions)
+    expect(dispatched).not.toContain(value.github.currentIssue.body)
+    expect((await value.post(event, "mention-fix", "issue_comment")).status).toBe(202)
+    expect((await value.post(event, "mention-fix-replay", "issue_comment")).status).toBe(202)
+    await value.orchestrator.drain()
+    expect(value.store.jobs()).toHaveLength(1)
+    expect(value.runtime.code).toHaveBeenCalledTimes(1)
+    expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+    expect(value.publisher.responses.size).toBe(1)
+    expectNoPrivateLogs(value)
+  })
+
+  test("signed bot assignment creates a draft without a mention or approval label", async () => {
+    const value = await fixture()
+    const assignee: Actor = { id: botId, login: "reina[bot]", type: "Bot" }
+    value.github.currentIssue.assignees = [assignee]
+    value.github.events.push({
+      id: "2000",
+      event: "assigned",
+      actor: maintainer,
+      assignee,
+      createdAt: now,
+    })
+    const event = payload({
+      action: "assigned",
+      assignee,
+      issue: {
+        id: 1_012,
+        number: 12,
+        title: value.github.currentIssue.title,
+        body: value.github.currentIssue.body,
+        updated_at: new Date(now).toISOString(),
+      },
+    })
+    now += 1_000
+    expect((await value.post(event, "assignment-fix")).status).toBe(202)
+    await value.orchestrator.drain()
+    expect(value.store.jobs()).toEqual([
+      expect.objectContaining({
+        state: "pr_ready",
+        approval: expect.objectContaining({
+          eventId: "assignment:2000",
+          request: expect.objectContaining({
+            kind: "assignment",
+            eventId: "2000",
+            assigneeId: botId,
+          }),
+        }),
+      }),
+    ])
+    expect(value.github.currentIssue.labels).not.toContain("bot:approved")
+    expect(value.runtime.verify).toHaveBeenCalledTimes(1)
+    expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+    expect((await value.post(event, "assignment-replay")).status).toBe(202)
+    await value.orchestrator.drain()
+    expect(value.store.jobs()).toHaveLength(1)
+    expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+    expectNoPrivateLogs(value)
+  })
+
+  test.each([outsider, { id: 98, login: "other-bot", type: "Bot" }])(
+    "signed requests from $login cannot authorize coding",
+    async (actor) => {
+      const value = await fixture()
+      value.github.permissions.set("other-bot", "write")
+      const event = requestComment(value, "@reina correct the usage example", actor)
+      expect((await value.post(event, "denied-mention", "issue_comment")).status).toBe(202)
+      await value.orchestrator.drain()
+      expect(value.store.jobs()).toEqual([])
+      if (actor.type === "Bot") expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+      else expect(value.runtime.triage).not.toHaveBeenCalled()
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expect(value.publisher.respond).not.toHaveBeenCalled()
+      expect(value.publisher.createDraft).not.toHaveBeenCalled()
+      expectNoPrivateLogs(value)
+    },
+  )
+
   test("acknowledges durable intake before triage and produces one independently verified draft", async () => {
     const value = await fixture()
     const entered = Promise.withResolvers<void>()

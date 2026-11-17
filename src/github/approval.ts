@@ -1,8 +1,15 @@
-import type { Actor, Approval, Issue, LabelEvent, Proposal } from "../types.js"
+import type { Actor, Approval, ExecutionRequest, Issue, LabelEvent, Proposal } from "../types.js"
+import { validateRequest } from "./commands.js"
 import { proposalBody } from "./publisher.js"
 import { type GitHub, GitHubError, numericId, sameRepository } from "./scanner.js"
 
-function requireCurrent(github: GitHub, issue: Issue, proposal: Proposal, now: number): void {
+function requireCurrent(
+  github: GitHub,
+  issue: Issue,
+  proposal: Proposal,
+  now: number,
+  direct = false,
+): void {
   if (
     !sameRepository(github.repository, issue.ref) ||
     !sameRepository(issue.ref, proposal.ref) ||
@@ -16,7 +23,7 @@ function requireCurrent(github: GitHub, issue: Issue, proposal: Proposal, now: n
     issue.state !== "open" ||
     issue.labels.includes("bot:skip") ||
     !issue.labels.includes("fix_available") ||
-    !issue.labels.includes("bot:approved")
+    (!direct && !issue.labels.includes("bot:approved"))
   ) {
     throw new GitHubError("approval_issue_not_eligible")
   }
@@ -35,13 +42,11 @@ function requireCurrent(github: GitHub, issue: Issue, proposal: Proposal, now: n
   }
 }
 
-async function currentEvent(
+async function requireProposalComment(
   github: GitHub,
   issue: Issue,
   proposal: Proposal,
-  now: number,
-): Promise<{ event: LabelEvent; permission: string }> {
-  requireCurrent(github, issue, proposal, now)
+): Promise<void> {
   const comments = await github.comments(issue.ref.number)
   const comment = comments.find((item) => numericId(item.id) === proposal.commentId)
   if (
@@ -50,9 +55,41 @@ async function currentEvent(
     comment.user.type !== "Bot" ||
     comment.body !== proposalBody(proposal) ||
     Date.parse(comment.created_at) !== proposal.publishedAt
-  ) {
+  )
     throw new GitHubError("approval_proposal_comment_changed")
-  }
+}
+
+async function requestPermission(
+  github: GitHub,
+  issue: Issue,
+  proposal: Proposal,
+  request: ExecutionRequest,
+  actor: Actor,
+  now: number,
+): Promise<string> {
+  requireCurrent(github, issue, proposal, now, true)
+  await requireProposalComment(github, issue, proposal)
+  const history = await github.history(issue.ref.number)
+  if (
+    history.some(
+      (event) =>
+        event.createdAt >= Math.max(request.createdAt, proposal.publishedAt ?? 0) &&
+        event.event === "unlabeled" &&
+        event.label === "fix_available",
+    )
+  )
+    throw new GitHubError("approval_revoked")
+  return validateRequest(github, issue, request, actor, now)
+}
+
+async function currentEvent(
+  github: GitHub,
+  issue: Issue,
+  proposal: Proposal,
+  now: number,
+): Promise<{ event: LabelEvent; permission: string }> {
+  requireCurrent(github, issue, proposal, now)
+  await requireProposalComment(github, issue, proposal)
   const history = await github.history(issue.ref.number)
   if (
     history.some(
@@ -125,6 +162,28 @@ export async function authorize(
   }
 }
 
+/** A direct human request delegates one policy-bound proposal without a label transition. */
+export async function authorizeRequest(
+  github: GitHub,
+  issue: Issue,
+  proposal: Proposal,
+  request: ExecutionRequest,
+  actor: Actor,
+  now = Date.now(),
+): Promise<Approval> {
+  const permission = await requestPermission(github, issue, proposal, request, actor, now)
+  if (await github.conflicts(issue.ref.number)) throw new GitHubError("approval_conflicting_work")
+  return {
+    eventId:
+      request.kind === "comment" ? `comment:${request.commentId}` : `assignment:${request.eventId}`,
+    actor,
+    proposalRevision: proposal.revision,
+    createdAt: request.createdAt,
+    permission,
+    request,
+  }
+}
+
 /** Recheck authority, but do not reject the job's own publication branch. */
 export async function revalidate(
   github: GitHub,
@@ -132,6 +191,20 @@ export async function revalidate(
   proposal: Proposal,
   approval: Approval,
 ): Promise<void> {
+  if (approval.request) {
+    const expected =
+      approval.request.kind === "comment"
+        ? `comment:${approval.request.commentId}`
+        : `assignment:${approval.request.eventId}`
+    if (
+      approval.proposalRevision !== proposal.revision ||
+      approval.eventId !== expected ||
+      approval.createdAt !== approval.request.createdAt
+    )
+      throw new GitHubError("approval_event_replaced")
+    await requestPermission(github, issue, proposal, approval.request, approval.actor, Date.now())
+    return
+  }
   const { event } = await currentEvent(github, issue, proposal, Date.now())
   if (
     approval.proposalRevision !== proposal.revision ||

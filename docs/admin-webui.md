@@ -153,9 +153,12 @@ and credentials: revoke affected sessions and review provider authorization befo
 
 ## Upgrade to durable issue triage
 
-Job database `reina.sqlite` migrates transactionally from schema 4 to 5, adding bounded current
-review records and an independent reconciliation cursor. Existing proposals, approvals, jobs,
-deliveries, and legacy attempt hashes remain intact; attempt hashes do not become completed
+Job database `reina.sqlite` schema 6 retains the schema-5 review records and reconciliation cursor.
+The transactional 5-to-6 migration adds indexed durable request receipt keys and a `request_epoch`
+cutoff. Valid retained sources are backfilled. Unknown pre-upgrade sources need a new human request;
+legacy unbound pending requests are completed without coding. Known bound pending requests retain
+their original baseline. Fresh databases have no legacy cutoff. Existing claimed approvals,
+publication records, and legacy attempt hashes are preserved; hashes do not become completed
 reviews. This is not encrypted `settings.sqlite`, which remains at schema 3. No new UI, settings,
 environment variable, or automatic label provisioning is added.
 
@@ -583,7 +586,7 @@ continuation data. No ambient environment, command, filesystem, or host Pi auth 
 3. Securely back up the original encryption key separately from the state backup. Restrict access
    to both. Losing that key makes the encrypted App key and provider credentials undecryptable.
 4. Restore compatible application state and the original key together. A downgrade after job
-   schema 5 or settings schema 3 requires matching pre-upgrade backups. Review restored credentials
+   schema 6 or settings schema 3 requires matching pre-upgrade backups. Review restored credentials
    and revoke affected sessions; a backup can restore old authorization. Reconcile GitHub resources,
    including triage comments and labels, before enabling dispatch. A database restore does not undo
    remote writes. Do not delete state to hide an encryption-key mismatch.
@@ -731,6 +734,75 @@ These checks used dummy identities and local provider responses. They do not est
 GitHub permissions/delivery ordering, real provider compatibility or cost, semantic triage quality,
 production backup restoration, or production-host runtime acceptance. Complete the handoff below.
 
+### Live mention-request acceptance (2026-11-16 UTC)
+
+The following evidence is from the local Compose deployment targeting `narumiruna/reina`,
+not from dummy GitHub fixtures. These checks ran against the local implementation worktree
+before its changes were committed. The deployed controller image at this checkpoint was
+`sha256:b06c62356a1a32b72b068017bbc328d860ffeac0a67054f8d5601020a807332d`.
+
+- **Mention help:** [source comment](https://github.com/narumiruna/reina/issues/25#issuecomment-6923246046)
+  received [the App's usage reply](https://github.com/narumiruna/reina/issues/25#issuecomment-6923551218).
+  GitHub recorded an initial delivery timeout before intake. One official GitHub redelivery of
+  the same GUID produced the reply; no synthetic event or database reset was used.
+- **Mention to draft PR:** [the human request](https://github.com/narumiruna/reina/issues/25#issuecomment-6922680761)
+  produced [draft PR #26](https://github.com/narumiruna/reina/pull/26), authored by `reinabot[bot]`
+  (user ID `355975874`), without a separate `bot:approved` label.
+  Job `bf733a5c-9411-4fbb-8474-9e392b60b92c` reached `pr_ready` with artifact hash
+  `56cba3cb85db2178c0595d6cb06f2123a8451d69d519bb7c025862135b4a39f2`.
+  Head `89234d93fe618c9d814c095978809db729170e1c` targets main
+  `a17718c2b7b203b088263f70d435098e21c7cee1`. The two added files are
+  `tests/branch-names.test.ts` and `.changeset/branch-name-tests.md`, both mode `100644`.
+  The latter contains exactly `---\n---\n`, the required empty Changeset for this test-only change.
+- **Independent verification:** `npm run check`,
+  `npm test -- --configLoader runner --cache=false`, and `npm run build` all exited `0` in
+  worker image `sha256:94911eea56d364acbb1571f550050235e122872d694cbf8bb53a5be03892765e`.
+  [GitHub Actions run 43911419491](https://github.com/narumiruna/reina/actions/runs/43911419491)
+  also passed both `ci` (including Changesets) and `runtime` on that exact head.
+  At this checkpoint, the local worktree passed 1,947 unit tests, the build, Changesets validation,
+  and all 19 Linux runtime tests with zero skips. No verification gate was removed or narrowed.
+  PR #26 was later merged; these results describe its original draft head.
+- **Publication recovery:** earlier test PR #24 established recovery from saved validated
+  artifacts without repeating coding. Git data JSON omitted the final LF from the commit
+  message while retaining it in the hashed Git object. The publisher now accepts only that
+  exact normalization. PR #24 and its issue #23 were closed as superseded. Reina did not merge
+  any PR or delete any branch during these checks.
+- **Blocked native assignment:** the repository owner's assignee check succeeds, but the
+  App bot's check returns `404`; a real assignment attempt returned `403`, and GraphQL
+  returned `FORBIDDEN`. Existing App write permissions do not make this identity assignable.
+  The assignment handler is covered by regression tests, but no live native-assignment success
+  is claimed. It currently uses the verified App bot ID; no alternate account setting was added.
+  To continue, the App owner must obtain GitHub assignment eligibility for this identity or
+  provide an assignable dedicated bot account and authorize separate-identity support.
+  A login is sufficient for that handoff; do not send account tokens or passwords.
+
+### Schema-6 deployment acceptance (2026-11-16 UTC)
+
+Commit `af853188641df94e1ce63937848e4836e3fded9a` was deployed after the review follow-up,
+using a consistent stopped-instance backup and a retained rollback image. Controller image
+`sha256:29edd479eb1a2d733d1896167b2769d1eafd7aba2751d415ed5161581f02a45a`
+matched all 15 changed compiled modules. Migration advanced job schema 5 to 6 with cutoff
+`1794854848596`; all five historical jobs retained their state, proposal, artifact, and commit
+identities. Settings schema 3 and the encrypted trusted-dispatch settings were unchanged.
+
+The fresh [request on issue #29](https://github.com/narumiruna/reina/issues/29#issuecomment-6925805076)
+produced [draft PR #30](https://github.com/narumiruna/reina/pull/30) from
+`reinabot[bot]` without an approval label. Job `243ad984-8a6f-47e9-bff8-1628f62e1f59`
+reached `pr_ready`; receipt key
+`0f81f3c975d0caa1ce1640f6ed47e66443dd2b3039d727e3fb55ab91086d3f52` remained after
+completion with zero retries. Artifact
+`bf9612389a19177affed2fb5bd5b4ffa24b56611b41614a3ddeeb38efd97dd9f` matched the exact
+remote files and modes at head `8abf2deb3ce68ce14d213853d1dabf329a7c3f31` on base
+`f449ce0b90a2813fc6408cccd4d90f8edf1bb8c6`. The existing tests were preserved, two positive
+boundary cases were added, and the empty Changeset contained exactly `---\n---\n`.
+All three independent verification commands exited `0` in the expected immutable worker.
+[GitHub Actions run 43934040450](https://github.com/narumiruna/reina/actions/runs/43934040450)
+passed both `ci` and `runtime` on the exact head.
+
+This checkpoint predates the later CommonMark parser follow-up. It verifies the schema-6
+migration and fresh request pipeline, not a live native-assignment success or deployment of
+later commits. Native assignment still requires an eligible GitHub identity.
+
 ### Issue-triage acceptance handoff
 
 This is an owner-operated acceptance procedure, not permission for live writes or paid inference.
@@ -743,8 +815,12 @@ Current issue-triage test evidence must be recorded separately from the historic
    - Expected: one mutable summary per issue with kind and host outcome. Needs-info gets
      `bot:needs-info`; a human decision gets `bot:needs-human`. `bot:triaged` follows confirmed
      summary/outcome publication. `fix_available` follows a separate immutable proposal.
-     No coding starts without fresh approval of that exact proposal. Then approve and inspect
-     one draft PR. Evidence/base/policy changes and 24-hour candidate renewal need new approval.
+     The label-based path needs fresh approval of that exact proposal. A permitted human's
+     explicit mention request, or supported bot assignment, can instead delegate one policy-bound
+     attempt without an additional label. Both paths publish the immutable proposal before coding.
+     Inspect one draft PR. Evidence/base/policy changes and 24-hour renewal need a new human
+     request or approval. Native assignment must first pass GitHub's assignee-eligibility check;
+     the current `reinabot[bot]` App is rejected by GitHub.
 2. **Repository maintainer and operator**
    - Prerequisites: authorize disposable edit, failure, and restart scenarios; retain saved state.
    - Actions: edit the issue; add/edit/delete a human comment; close or add `bot:skip`; check
@@ -760,7 +836,8 @@ Current issue-triage test evidence must be recorded separately from the historic
      remain suppressed after restart or label removal, separate from successful 24-hour renewal.
    - For a same-owner rename, update the configured repository name. Confirm that live numeric
      identity checks permit recovery, the summary is reused, and any replacement proposal needs
-     fresh approval. Do not use this path for owner transfers or cross-repository moves.
+     a fresh human request or approval. Do not use this path for owner transfers or
+     cross-repository moves.
 3. **Provider account owner**
    - Prerequisites: supported entitled account, explicit usage/cost authorization, and acceptance
      of the Codex cap limitation where applicable.
@@ -771,7 +848,7 @@ Current issue-triage test evidence must be recorded separately from the historic
 4. **Deployment operator**
    - Prerequisites: stopped-instance backups with WAL state and the original key, disposable
      migration/restore copies, and supported Linux with private same-path staging.
-   - Actions: check job schema 4-to-5 migration separately from settings schema 3; test restore,
+   - Actions: check job schema 4-to-5 and 5-to-6 migrations separately from settings schema 3; test restore,
      permissions, quotas, cleanup, and the complete runtime suite. Reconcile restored GitHub state.
    - Expected: compatible state and confirmed runtime controls before dispatch. Preflight alone
      is insufficient; retain full-suite results and any unverified paths.

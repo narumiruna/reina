@@ -46,12 +46,63 @@ const actorSchema = z.strictObject({
   type: boundedText(40),
 })
 const argvSchema = z.array(boundedText(4_096)).min(1).max(32)
+const requestCandidateSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("comment"),
+    commentId: positiveId,
+    bodyHash: digest,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  }),
+  z.object({
+    kind: z.literal("assignment"),
+    assigneeId: positiveId,
+    createdAt: timestamp,
+  }),
+])
+const requestBindingSchema = z.strictObject({
+  fingerprint: digest,
+  baseSha: gitSha,
+  baseBranch: boundedText(255),
+  policyHash: digest,
+})
+export type RequestBinding = z.infer<typeof requestBindingSchema>
+export interface DeliveryIntakeResult {
+  queued: boolean
+  revocations: {
+    ref: IssueRef
+    preservedJobIds: string[]
+    preservedBindings: RequestBinding[]
+  }[]
+  reviews: {
+    ref: IssueRef
+    reason: ReviewInvalidation["reason"]
+    revision: string
+  }[]
+}
 const approvalSchema: z.ZodType<Approval> = z.strictObject({
   eventId: boundedText(200),
   actor: actorSchema,
   proposalRevision: digest,
   createdAt: timestamp,
   permission: boundedText(30),
+  request: z
+    .discriminatedUnion("kind", [
+      z.strictObject({
+        kind: z.literal("comment"),
+        commentId: positiveId,
+        bodyHash: digest,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+      z.strictObject({
+        kind: z.literal("assignment"),
+        eventId: boundedText(200),
+        assigneeId: positiveId,
+        createdAt: timestamp,
+      }),
+    ])
+    .optional(),
 })
 const proposalSchema: z.ZodType<Proposal> = z
   .strictObject({
@@ -244,6 +295,57 @@ function sameReviewPins(a: IssueRef, b: IssueRef): boolean {
   )
 }
 
+function requestSource(
+  payload: unknown,
+): { ref: IssueRef; createdAt: number; requestKey: string } | undefined {
+  if (typeof payload !== "object" || payload === null) return undefined
+  const candidate = payload as Record<string, unknown>
+  const ref = refSchema.safeParse(candidate.ref)
+  const request = requestCandidateSchema.safeParse(candidate.request)
+  if (candidate.kind !== "issue" || !ref.success || !request.success) return undefined
+  const identity = {
+    repositoryId: ref.data.id,
+    installationId: ref.data.installationId,
+    issueId: ref.data.issueId,
+    ...(request.data.kind === "comment"
+      ? { kind: "comment", commentId: request.data.commentId }
+      : {
+          kind: "assignment",
+          assigneeId: request.data.assigneeId,
+          createdAt: request.data.createdAt,
+        }),
+  }
+  return {
+    ref: ref.data,
+    createdAt: request.data.createdAt,
+    requestKey: createHash("sha256").update(stable(identity)).digest("hex"),
+  }
+}
+
+function requestBinding(value: Proposal | Review): RequestBinding {
+  const pins = "binding" in value ? value.binding : value
+  return {
+    fingerprint: pins.fingerprint,
+    baseSha: pins.baseSha,
+    baseBranch: pins.baseBranch,
+    policyHash: pins.policyHash,
+  }
+}
+
+function changeCutoff(payload: unknown, ref: IssueRef): number | undefined {
+  if (typeof payload !== "object" || payload === null) return undefined
+  const candidate = payload as Record<string, unknown>
+  const candidateRef = refSchema.safeParse(candidate.ref)
+  const changedAt = timestamp.safeParse(candidate.changedAt)
+  return candidate.kind === "issue" &&
+    (candidate.material === true || candidate.cancel === true) &&
+    candidateRef.success &&
+    sameRef(candidateRef.data, ref) &&
+    changedAt.success
+    ? changedAt.data
+    : undefined
+}
+
 function parseRecord<T>(schema: z.ZodType<T>, value: unknown, kind: string): T {
   try {
     if (typeof value !== "string" || Buffer.byteLength(value) > 16_777_216) throw new Error()
@@ -396,8 +498,8 @@ export class Store {
   private migrate(): void {
     const db = this.database()
     const version = db.prepare("PRAGMA user_version").get()?.user_version
-    if (version === 5) return
-    if (![0, 1, 2, 3, 4].includes(Number(version)))
+    if (version === 6) return
+    if (![0, 1, 2, 3, 4, 5].includes(Number(version)))
       throw new Error("Unsupported state database version")
     this.transaction(() => {
       if (version === 1 || version === 2 || version === 3) {
@@ -448,7 +550,8 @@ export class Store {
         CREATE TABLE scan_cursor (id INTEGER PRIMARY KEY CHECK(id = 1), page INTEGER NOT NULL CHECK(page BETWEEN 1 AND 9007199254740991)) STRICT;
         INSERT INTO scan_cursor(id,page) VALUES(1,1);
       `)
-      db.exec(`
+      if (Number(version) < 5)
+        db.exec(`
         CREATE TABLE reviews (
           issue_key TEXT PRIMARY KEY,
           revision TEXT NOT NULL,
@@ -462,6 +565,42 @@ export class Store {
         INSERT INTO review_cursor(id,issue_key) VALUES(1,'');
         PRAGMA user_version = 5;
       `)
+      db.exec(`
+        ALTER TABLE deliveries ADD COLUMN request_key TEXT
+          CHECK(request_key IS NULL OR (length(request_key) = 64 AND request_key NOT GLOB '*[^a-f0-9]*'));
+        CREATE INDEX deliveries_by_request ON deliveries(request_key) WHERE request_key IS NOT NULL;
+        CREATE TABLE request_epoch (
+          id INTEGER PRIMARY KEY CHECK(id = 1),
+          reject_before INTEGER CHECK(reject_before IS NULL OR reject_before >= 0)
+        ) STRICT;
+      `)
+      // Completed legacy receipts have lost their source. A cutoff prevents their
+      // replay without inventing approvals or retaining webhook content.
+      db.prepare("INSERT INTO request_epoch(id,reject_before) VALUES(1,?)").run(
+        version === 0 ? null : Date.now(),
+      )
+      for (const row of db.prepare("SELECT id,payload,status FROM deliveries").all()) {
+        if (typeof row.payload !== "string") continue
+        const payload = JSON.parse(row.payload)
+        encodePayload(payload)
+        const source = requestSource(payload)
+        if (!source) continue
+        db.prepare("UPDATE deliveries SET request_key = ? WHERE id = ?").run(
+          source.requestKey,
+          row.id as string,
+        )
+        if (
+          row.status === "pending" &&
+          (!requestBindingSchema.safeParse(payload.requestBinding).success ||
+            !actorSchema.safeParse(payload.actor).success ||
+            payload.actor.type !== "User" ||
+            !digest.safeParse(payload.requestIssueHash).success)
+        )
+          db.prepare("UPDATE deliveries SET status = 'complete', payload = NULL WHERE id = ?").run(
+            row.id as string,
+          )
+      }
+      db.exec("PRAGMA user_version = 6;")
     })
   }
 
@@ -660,23 +799,172 @@ export class Store {
     ).run(digest, Date.now())
   }
 
+  private duplicateRequest(source: NonNullable<ReturnType<typeof requestSource>>): boolean {
+    const db = this.database()
+    if (
+      db.prepare("SELECT id FROM deliveries WHERE request_key = ? LIMIT 1").get(source.requestKey)
+    )
+      return true
+    // Legacy claims remain durable evidence even when their delivery payload is gone.
+    for (const row of db
+      .prepare("SELECT json FROM approvals WHERE issue_key = ?")
+      .all(key(source.ref))) {
+      const approval = parseRecord(approvalSchema, row.json, "approval")
+      if (
+        approval.request &&
+        requestSource({ kind: "issue", ref: source.ref, request: approval.request })?.requestKey ===
+          source.requestKey
+      )
+        return true
+    }
+    const cutoff = db.prepare("SELECT reject_before FROM request_epoch WHERE id = 1").get()
+    if (!cutoff) throw new Error("Missing request epoch record")
+    return (
+      cutoff.reject_before !== null &&
+      source.createdAt <= validate(timestamp, cutoff.reject_before, "request epoch")
+    )
+  }
+
+  private newerRequests(ref: IssueRef, cutoff: number): { binding?: RequestBinding }[] {
+    const requests: { binding?: RequestBinding }[] = []
+    for (const row of this.database()
+      .prepare("SELECT payload FROM deliveries WHERE status = 'pending'")
+      .all()) {
+      if (typeof row.payload !== "string") continue
+      const payload = JSON.parse(row.payload)
+      const source = requestSource(payload)
+      const actor = actorSchema.safeParse(payload?.actor)
+      if (
+        !source ||
+        !sameRef(source.ref, ref) ||
+        source.createdAt <= cutoff ||
+        !actor.success ||
+        actor.data.type !== "User"
+      )
+        continue
+      const binding = requestBindingSchema.safeParse(payload.requestBinding)
+      requests.push(binding.success ? { binding: binding.data } : {})
+    }
+    return requests
+  }
+
+  private revocationScope(
+    ref: IssueRef,
+    cutoff?: number,
+  ): DeliveryIntakeResult["revocations"][number] {
+    const scope: DeliveryIntakeResult["revocations"][number] = {
+      ref,
+      preservedJobIds: [],
+      preservedBindings: [],
+    }
+    if (cutoff === undefined) return scope
+    const db = this.database()
+    const bindings = this.newerRequests(ref, cutoff).flatMap((source) =>
+      source.binding ? [source.binding] : [],
+    )
+    for (const row of db.prepare("SELECT * FROM jobs WHERE issue_key = ?").all(key(ref))) {
+      const job = this.readJob(row)
+      if (
+        !sameRef(job.ref, ref) ||
+        !ACTIVE_STATES.includes(job.state) ||
+        !job.approval.request ||
+        job.approval.request.createdAt <= cutoff
+      )
+        continue
+      const proposal = db
+        .prepare("SELECT json FROM proposals WHERE revision = ? AND valid = 1")
+        .get(job.proposalRevision)
+      if (!proposal) continue
+      const value = parseRecord(proposalSchema, proposal.json, "proposal")
+      if (!sameRef(value.ref, ref)) continue
+      scope.preservedJobIds.push(job.id)
+      bindings.push(requestBinding(value))
+    }
+    const proposal = this.proposal(ref)
+    const review = this.review(ref)
+    const contexts = [
+      ...(proposal ? [requestBinding(proposal)] : []),
+      ...(review ? [requestBinding(review)] : []),
+    ]
+    for (const binding of bindings) {
+      if (
+        contexts.some((context) => stable(context) === stable(binding)) &&
+        !scope.preservedBindings.some((previous) => stable(previous) === stable(binding))
+      )
+        scope.preservedBindings.push(binding)
+    }
+    return scope
+  }
+
+  private obsoleteChange(payload: unknown): boolean {
+    if (typeof payload !== "object" || payload === null) return false
+    const ref = refSchema.safeParse((payload as Record<string, unknown>).ref)
+    if (!ref.success) return false
+    const cutoff = changeCutoff(payload, ref.data)
+    return (
+      cutoff !== undefined &&
+      (this.newerRequests(ref.data, cutoff).length > 0 ||
+        this.revocationScope(ref.data, cutoff).preservedJobIds.length > 0)
+    )
+  }
+
   acceptDelivery(
     id: string,
     payload: unknown,
     revoked: IssueRef[] = [],
     reviews: ReviewInvalidation[] = [],
-  ): boolean {
+  ): DeliveryIntakeResult {
     const db = this.database()
     deliveryId(id)
     return this.transaction(() => {
-      if (db.prepare("SELECT id FROM deliveries WHERE id = ?").get(id)) return false
+      const result: DeliveryIntakeResult = { queued: false, revocations: [], reviews: [] }
+      if (db.prepare("SELECT id FROM deliveries WHERE id = ?").get(id)) return result
       const json = encodePayload(payload)
       const now = Date.now()
+      const source = requestSource(payload)
+      const duplicate = source !== undefined && this.duplicateRequest(source)
+      const obsolete = !duplicate && this.obsoleteChange(payload)
       db.prepare(
-        "INSERT INTO deliveries(id,payload,status,accepted_at,available_at) VALUES(?,?,'pending',?,?)",
-      ).run(id, json, now, now)
-      // A received revocation must survive a crash before dispatch or publication recovery.
-      for (const ref of revoked) this.invalidateRecords(ref)
+        "INSERT INTO deliveries(id,payload,status,accepted_at,available_at,request_key) VALUES(?,?,?,?,?,?)",
+      ).run(
+        id,
+        duplicate || obsolete ? null : json,
+        duplicate || obsolete ? "complete" : "pending",
+        now,
+        now,
+        source?.requestKey ?? null,
+      )
+      if (duplicate) return result
+      result.queued = !obsolete
+      // Dispatch can be obsolete while its revocation of older authority is not.
+      for (const ref of revoked) {
+        const cutoff = changeCutoff(payload, ref)
+        const scope = this.revocationScope(ref, cutoff)
+        for (const row of db
+          .prepare("SELECT id,payload FROM deliveries WHERE status = 'pending' AND id != ?")
+          .all(id)) {
+          if (typeof row.payload !== "string") continue
+          const pending = JSON.parse(row.payload)
+          if (typeof pending !== "object" || pending === null || !pending.request) continue
+          const pendingRef = refSchema.safeParse(pending.ref)
+          if (!pendingRef.success || !sameRef(ref, pendingRef.data)) continue
+          const pendingSource = requestSource(pending)
+          const actor = actorSchema.safeParse(pending.actor)
+          if (
+            cutoff !== undefined &&
+            pendingSource &&
+            pendingSource.createdAt > cutoff &&
+            actor.success &&
+            actor.data.type === "User"
+          )
+            continue
+          db.prepare("UPDATE deliveries SET status = 'complete', payload = NULL WHERE id = ?").run(
+            row.id as string,
+          )
+        }
+        this.invalidateRecords(ref, scope)
+        result.revocations.push(scope)
+      }
       for (const invalidation of reviews) {
         const { ref, reason } = validate(
           z.strictObject({
@@ -690,6 +978,13 @@ export class Store {
         if (!row) continue
         const current = this.readReview(row)
         if (!sameRef(current.ref, ref)) throw new Error("Inconsistent review identity")
+        const scope = this.revocationScope(ref, changeCutoff(payload, ref))
+        if (
+          scope.preservedBindings.some(
+            (binding) => stable(binding) === stable(requestBinding(current)),
+          )
+        )
+          continue
         const review = validate(reviewSchema, staleReview(current, reason, now), "review")
         db.prepare("UPDATE reviews SET revision = ?, state = ?, json = ? WHERE issue_key = ?").run(
           review.revision,
@@ -697,8 +992,9 @@ export class Store {
           JSON.stringify(review),
           key(ref),
         )
+        result.reviews.push({ ref, reason, revision: review.revision })
       }
-      return true
+      return result
     })
   }
 
@@ -722,6 +1018,27 @@ export class Store {
         encodePayload(payload)
         return { id: row.id, payload }
       })
+  }
+
+  bindRequest(id: string, binding: RequestBinding): void {
+    deliveryId(id)
+    this.transaction(() => {
+      const db = this.database()
+      const row = db
+        .prepare("SELECT payload FROM deliveries WHERE id = ? AND status = 'pending'")
+        .get(id)
+      if (typeof row?.payload !== "string") throw new Error("job_cancelled")
+      const payload = JSON.parse(row.payload)
+      if (
+        !payload.request ||
+        (payload.requestBinding && stable(payload.requestBinding) !== stable(binding))
+      )
+        throw new Error("proposal_stale")
+      db.prepare("UPDATE deliveries SET payload = ? WHERE id = ? AND status = 'pending'").run(
+        encodePayload({ ...payload, requestBinding: binding }),
+        id,
+      )
+    })
   }
 
   completeDelivery(id: string): void {
@@ -826,13 +1143,27 @@ export class Store {
     this.transaction(() => this.invalidateRecords(ref))
   }
 
-  private invalidateRecords(ref: IssueRef): void {
+  private invalidateRecords(
+    ref: IssueRef,
+    scope?: DeliveryIntakeResult["revocations"][number],
+  ): void {
     const db = this.database()
     const issueKey = key(ref)
-    db.prepare("UPDATE proposals SET valid = 0 WHERE issue_key = ?").run(issueKey)
+    for (const row of db
+      .prepare("SELECT revision,json FROM proposals WHERE issue_key = ? AND valid = 1")
+      .all(issueKey)) {
+      const proposal = parseRecord(proposalSchema, row.json, "proposal")
+      if (
+        scope?.preservedBindings.some(
+          (binding) => stable(binding) === stable(requestBinding(proposal)),
+        )
+      )
+        continue
+      db.prepare("UPDATE proposals SET valid = 0 WHERE revision = ?").run(row.revision as string)
+    }
     for (const row of db.prepare("SELECT * FROM jobs WHERE issue_key = ?").all(issueKey)) {
       const job = this.readJob(row)
-      if (ACTIVE_STATES.includes(job.state)) {
+      if (ACTIVE_STATES.includes(job.state) && !scope?.preservedJobIds.includes(job.id)) {
         this.updateJob({
           ...job,
           state: "cancelled",
@@ -843,7 +1174,7 @@ export class Store {
     }
   }
 
-  claim(proposal: Proposal, approval: Approval): Job | undefined {
+  claim(proposal: Proposal, approval: Approval, requestDeliveryId?: string): Job | undefined {
     const db = this.database()
     const proposalResult = proposalSchema.safeParse(proposal)
     const approvalResult = approvalSchema.safeParse(approval)
@@ -853,6 +1184,37 @@ export class Store {
     return this.transaction(() => {
       const stored = this.proposal(value.ref)
       const now = Date.now()
+      if (authority.request) {
+        if (!requestDeliveryId) return undefined
+        deliveryId(requestDeliveryId)
+        const row = db
+          .prepare("SELECT payload FROM deliveries WHERE id = ? AND status = 'pending'")
+          .get(requestDeliveryId)
+        if (typeof row?.payload !== "string") return undefined
+        const pending = JSON.parse(row.payload)
+        const pendingRef = refSchema.safeParse(pending.ref)
+        const binding = {
+          fingerprint: value.fingerprint,
+          baseSha: value.baseSha,
+          baseBranch: value.baseBranch,
+          policyHash: value.policyHash,
+        }
+        if (
+          !pendingRef.success ||
+          !sameRef(pendingRef.data, value.ref) ||
+          pending.actor === undefined ||
+          pending.request === undefined ||
+          pending.requestBinding === undefined ||
+          stable(pending.actor) !== stable(authority.actor) ||
+          stable(pending.requestBinding) !== stable(binding) ||
+          (authority.request.kind === "comment"
+            ? stable(pending.request) !== stable(authority.request)
+            : pending.request?.kind !== "assignment" ||
+              pending.request.assigneeId !== authority.request.assigneeId ||
+              pending.request.createdAt !== authority.request.createdAt)
+        )
+          return undefined
+      }
       if (
         !stored ||
         stable(stored) !== stable(value) ||
@@ -864,7 +1226,14 @@ export class Store {
         authority.proposalRevision !== value.revision ||
         authority.actor.type !== "User" ||
         !["write", "maintain", "admin"].includes(authority.permission) ||
-        authority.createdAt <= value.publishedAt ||
+        (authority.request
+          ? authority.createdAt !== authority.request.createdAt ||
+            authority.createdAt + 86_400_000 <= now ||
+            authority.eventId !==
+              (authority.request.kind === "comment"
+                ? `comment:${authority.request.commentId}`
+                : `assignment:${authority.request.eventId}`)
+          : authority.createdAt <= value.publishedAt) ||
         authority.createdAt >= value.expiresAt ||
         authority.createdAt > now ||
         db.prepare("SELECT event_id FROM approvals WHERE event_id = ?").get(authority.eventId) ||

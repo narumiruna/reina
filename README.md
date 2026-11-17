@@ -1,8 +1,9 @@
 # Reina
 
-Reina is a Probot GitHub App that assesses issues and proposes small fixes. A maintainer must
-approve the exact proposal before the Pi coding agent changes code. Validated changes become a
-**draft pull request**. Reina never merges a PR or enables auto-merge.
+Reina is a Probot GitHub App that assesses issues and proposes small fixes. A maintainer can
+approve an exact proposal or explicitly request one policy-bound coding attempt with a mention
+or supported issue assignment. Validated changes become a **draft pull request**.
+Reina never merges a PR or enables auto-merge.
 
 The MVP supports one Node/npm repository, one service instance, and one coding job at a time.
 Dispatch requires persistent local storage and a prepared Docker worker. Missing isolation prevents
@@ -130,6 +131,27 @@ npm run prepare:worker -- /absolute/path/to/approved-snapshot reina-worker:local
 Enter the printed immutable image ID in **Runtime → Immutable worker image ID**. The worker
 contains Pi 1.5.0 and immutable target dependencies. At runtime, both package files must match its fingerprints.
 Prepare another image when dependencies change; changing the image invalidates old proposals.
+For Reina as its own target, the Markdown parser dependencies change those fingerprints once
+this implementation is merged. Prepare a matching worker before dispatching against that new base.
+When Reina itself is the target, use these trusted verification argv in **Runtime**:
+
+```json
+[
+  ["npm", "run", "check"],
+  ["npm", "test", "--", "--configLoader", "runner", "--cache=false"],
+  ["npm", "run", "build"]
+]
+```
+
+These run the same lint, full test suite, and builds as `npm run ci`. The Vite runner loader and
+disabled result cache avoid writes to immutable `node_modules`. Verification uses a separate,
+bounded temporary directory outside the checkout so test fixtures can execute temporary scripts.
+Do not make prepared dependencies writable to work around test startup failures.
+
+Reina's PR CI also requires a Changeset. Include `.changeset/*.md` in the allowed paths and list
+the required Changeset in the issue's requested files. Test-only changes can use an empty
+Changeset. Keep `.changeset/config.json` and workflow files outside the bot's editable scope.
+
 Preparation has a separate 2 GiB workspace, 64 MiB tarball limit, 1 GiB download budget, and
 512 MiB dependency export budget (128 MiB per file). These are fixed preparation limits, not
 new environment settings. Ordinary job workspace, memory, process, and network controls are
@@ -219,6 +241,44 @@ and persistent storage bootstrap settings need environment variables. Saved runt
 encrypted in SQLite and take priority over legacy dispatch environment settings. Legacy dispatch
 settings remain a fallback only until the first runtime save; remove them after migration.
 
+## Request a pull request
+
+Use the installed App's authenticated bot login or slug, not the repository name.
+For this installation, add a new **issue comment** such as:
+
+```text
+@reinabot fix the problem described in this issue and open a PR
+```
+
+Free-form instructions, including Chinese, are supported after the mention.
+`@reinabot[bot]` is also accepted. A bare `@reinabot` or `@reinabot help` replies with usage
+without starting a coding job. Mentions inside code fences (including fenced Markdown list
+examples), quotes, or HTML comments do not start requests. PR comments and mentions in the issue body are not command entrypoints.
+
+The requesting human must have current `write`, `maintain`, or `admin` repository permission.
+A valid request delegates one bounded attempt: Reina acknowledges it, assesses the issue,
+publishes the exact proposal, and continues to isolated coding and verification when the
+assessment is `fix_candidate`. No additional `bot:approved` label is required. Other outcomes
+remain visible in the triage summary; a request does not override configured paths or safety limits.
+The PR always targets the configured repository's checked default branch, not a destination in
+comment text. It remains a draft for human review.
+
+Assigning the bot also requests one attempt **when GitHub permits that bot as an assignee**.
+The authorization belongs to the human assigner, not the bot. Removing that assignment revokes
+its request. The current `reinabot[bot]` App account returns 404 from GitHub's repository-assignee
+check with both user and installation authentication. A real add-assignee request returns 403;
+GraphQL explicitly reports `reinabot[bot] cannot be assigned to issues or pull requests.` Native
+assignment is therefore unavailable for this installation. Use a mention until GitHub supports
+this App identity; installing an App alone does not make its bot an assignable user.
+
+Requests expire after 24 hours and are consumed once. Durable receipt identities also prevent a
+new delivery ID from reviving a request rejected before coding. Such a rejection needs a new human
+request. Editing/deleting a request, material issue
+changes, later non-Reina comments, close/reopen, `bot:skip`, permission loss, and applicable
+unassignment revoke it. A changed base or policy cannot reuse a deferred request. A failed coding
+attempt needs a new human request. Duplicate delivery, scans, and restart do not repeat coding.
+An existing PR for an issue prevents another PR for that issue.
+
 ## Issue workflow
 
 - Open an issue or wait for the bounded periodic scan. Closed issues, PRs, and `bot:skip` are excluded.
@@ -229,14 +289,16 @@ settings remain a fallback only until the first runtime save; remove them after 
 - A failed assessment gets `bot:triage-failed`, not a reviewed claim for that version.
 - A fix candidate can get a separate immutable proposal with exact files, checks, risks, and expiry.
   `fix_available` is added only after that proposal is confirmed; triage alone never starts coding.
-- A human with write, maintain, or admin permission adds `bot:approved`.
-- Approval must follow publication of that revision. If necessary, remove and re-add the label.
-  Same-second approval/comment ordering is rejected because GitHub timestamps lack sufficient precision.
-- Reina checks the current issue, proposal, permissions, approval history, and exact base SHA.
+- For the label-based path, a human with write, maintain, or admin permission adds `bot:approved`.
+  This label transition must follow publication of that revision. If necessary, remove and re-add
+  the label. Same-second approval/comment ordering is rejected because GitHub timestamps lack
+  sufficient precision. An explicit [direct request](#request-a-pull-request) uses its own live
+  evidence instead and does not require this extra transition.
+- Reina checks the current issue, proposal, human permission, authorization evidence, and exact base SHA.
 - Coding and independent offline validation run in separate disposable containers.
 - A successful result produces one draft PR and `bot:pr_ready`. Failures get `bot:failed`.
 - Remove approval, close the issue, or add `bot:skip` to stop pending work and cancel running work.
-  A failed/interrupted attempt needs a new human approval transition.
+  A failed/interrupted attempt needs a new human request or approval transition.
 
 For example, a bug report without reproduction details can receive `bot:triaged` and
 `bot:needs-info`, with questions about the public version and minimal reproduction steps.

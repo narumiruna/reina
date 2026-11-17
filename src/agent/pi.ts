@@ -9,6 +9,9 @@ export function piArguments(model: string, phase: "triage" | "code"): string[] {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,199}$/.test(model)) throw new Error("invalid_model_id")
   return [
     "/usr/local/bin/node",
+    // Docker exec can start with umask 000. Pin new tool-created files to 0644.
+    "--import",
+    "data:text/javascript,process.umask(0o022)",
     "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
     "--print",
     "--mode",

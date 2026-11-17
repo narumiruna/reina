@@ -93,7 +93,9 @@ flowchart TD
   Summary --> Candidate{Host outcome is fix_candidate?}
   Candidate -->|Yes, no existing conflict| Proposal[Immutable proposal comment]
   Candidate -->|No| Wait[Wait for information or maintainer decision]
-  Proposal --> Approval[Human actor and history checks]
+  Proposal --> Approval[Live human label or direct-request evidence]
+  Intake --> Request[Signed mention or assignment metadata]
+  Request --> Approval
   Approval --> Claim[Transactional single job claim]
   Claim --> Coding[Coding worker container]
   Coding --> Frozen[Frozen validated artifact]
@@ -140,6 +142,26 @@ Host Docker proxy variables are explicitly cleared so client configuration canno
 credentials into a job. Startup probes verify this rule as well as the filesystem and process limits.
 
 Triage uses a read-only snapshot mount. Coding uses a bounded disposable workspace volume.
+Verification additionally has a private 64 MiB `nosuid,nodev` tmpfs at `/run/reina-verify-tmp`.
+It permits executable test fixtures outside the checkout; the normal `/tmp` remains `noexec`.
+Only verification sets `TMPDIR` to this scratch directory. The trusted launch removes the
+internal `REINA_PHASE` marker from target verification commands so it cannot be mistaken for
+application configuration. Prepared dependencies remain read-only, and verification still has
+no model socket, credentials, network access, or extra capabilities.
+
+For Reina's Vite-based tests, use the runner config loader and disable the result cache, rather
+than making `node_modules/.vite-temp` writable. The deployed three verification argv run Biome,
+the complete Vitest suite, and both builds; see [worker preparation](../README.md#prepare-a-target-worker).
+This changes only execution environment and cache handling, not test selection or assertions.
+The coding instructions require available local formatting and lint checks on only the approved
+changed files before export. Full test suites and builds run in the separate verifier, not the
+coding workspace, so generated build files do not expand the proposed patch.
+The trusted Pi launch sets umask `022` through a constant Node preload; child commands inherit
+that mask. Some Docker daemons start `docker exec` with umask `000`, which otherwise makes the
+Pi write tool create new files as `0666`. The preload produces normal `0644` source files without
+changing the Pi package or relaxing artifact validation. Export still rejects `0666`, privileged
+modes, unsupported executable modes, and executable-bit changes.
+
 Before export, the worker pauses the complete container, including detached children. The daemon
 exports the frozen tree; the trusted parser rejects unsafe paths and unsupported file types.
 A fresh offline container runs approved verification argv against the candidate. The published
@@ -480,24 +502,86 @@ approval; normal OAuth refresh within the unchanged generation does not. A job c
 switch accounts or destinations. Reina's own comments, labels, reactions, and `updated_at` do not
 invalidate the proposal. Other comment changes are material.
 
-Approval requires a signed label event from a human, live repository permission, an identifiable
-current label-history transition after the exact proposal comment, and no conflicting job or PR.
-Reina checks that the App-owned proposal comment still has its immutable content. Presence of
-`bot:approved` alone is never authority. Delayed events cannot approve a later proposal.
-Observed close/reopen history also revokes proposals created before that lifecycle change, even
-when those webhooks are missing. Accepted revocation and inbox state commit in one transaction,
-so a crash cannot restore authority before publication recovery.
+The label-based authorization path requires a signed label event from a human, live repository
+permission, an identifiable current label-history transition after the exact proposal comment,
+and no conflicting job or PR. Presence of `bot:approved` alone is never authority. These label
+rules are unchanged by direct requests.
+
+A second authorization path accepts a newly created issue comment that directly mentions the
+authenticated App bot with instructions, or a verified assignment to that bot. A bare mention or
+`help` replies with usage and does not grant coding authority. The bot login and slug alias come
+from authenticated GitHub identity, not user configuration or webhook text. Code fences, quotes,
+and HTML comments cannot mint requests. CommonMark source ranges exclude code blocks, raw HTML
+blocks, and Markdown blockquotes, including nested list continuations. The pinned
+`mdast-util-from-markdown` parser supplies block and inline source positions. Mentions must start
+in a text node and match the original raw line; masking HTML cannot create a namespace or its
+separator. HTML markup is masked only when reading the instructions after that raw mention.
+Quote exclusion ends at the parsed quote boundary. Only raw HTML nodes carry comment delimiters
+between parsed blocks, including HTML inside quotes. Inline source positions preserve commands
+after a real inline closure, including within the same paragraph. A closer in escaped prose or
+code cannot end that comment. HTML-block lines update lexical state without becoming commands. Matching
+never uses decoded or rendered text. The production parser does not render HTML. Issue-body and
+PR-thread mentions are not entrypoints.
+
+After raw-signature verification, intake stores only comment ID, original body SHA-256,
+creation/update timestamps, actor, and a digest of issue title/body. Raw bodies do not enter
+Probot dispatch, inbox control data, or logs. Assignment candidates contain bot ID and the signed
+issue update timestamp; live bounded history supplies the immutable assignment event ID.
+The human actor must match the source exactly and retain `write`, `maintain`, or `admin` permission.
+Requests expire after 24 hours. A direct request delegates one policy-bound proposal, rather than
+claiming that the human approved an unseen exact proposal. It never synthesizes `bot:approved`.
+
+The first validated direct request is durably bound to the issue fingerprint, base name/SHA, and
+policy hash before its acknowledgement can defer. Deferred work cannot rebind after those change.
+The pending receipt is checked again after remote writes and before triage, so revocation during
+an acknowledgement cannot restart work from that request.
+A durable receipt key identifies the numeric repository, installation, issue, and immutable comment
+ID or assignment candidate. It excludes mutable bodies, actor logins, issue hashes, and bindings.
+The key remains after a delivery completes, fails, or is revoked, so a new delivery ID cannot
+revive a rejected request. SQLite atomically claims the matching pending delivery, consumes a
+namespaced comment/assignment event once, and reserves the single active job slot.
+
+Material/cancellation intake completes older pending requests individually in the same transaction.
+A newer pending source does not shield older authority. Only a newer active job and matching bound
+review/proposal context are preserved. Intake returns committed revocation effects separately from
+its dispatch decision, so an old event can cancel older work without later dispatching against the
+protected newer context. Same-time or undated changes remain conservative revocations; comment
+deletion never reuses the old comment-update timestamp as its deletion time. Live evidence rejects edited/deleted comments, later non-Reina comments,
+stale/replaced assignments, close/reopen, exclusion, and permission loss. Removal of
+the current proposal's `fix_available` label also revokes execution, even if restored.
+
+Both paths require the unchanged App-owned immutable proposal comment and revalidation before
+coding and publication. A consumed request cannot repeat coding after failure, redelivery, scan,
+or restart. Observed close/reopen history revokes stale authority even when webhooks are missing.
+Accepted revocation and inbox state commit in one transaction, so a crash cannot restore authority
+before publication recovery. Static request acknowledgements reconcile App-owned markers before
+another write; unknown remote outcomes are not evidence of a successful response.
+
+GitHub must separately permit the App bot as an issue assignee. A real 2026-11-16 check for
+`reinabot[bot]` returned 404 with both repository-scoped installation and human authentication,
+while repository and bot-user reads succeeded. A real REST add-assignee request returned 403,
+and GraphQL returned `FORBIDDEN` with `reinabot[bot] cannot be assigned to issues or pull requests.`
+The assignment handler does not bypass this platform restriction. Native assignment for this
+installation remains unavailable; mentions are the working entrypoint until the App identity
+becomes assignable.
 
 SQLite stores reviews, proposals, consumed approval events, inbox deliveries, jobs, and publication phases.
 It uses foreign keys, WAL, full synchronous durability, and an independent process-lifetime
 SQLite lock. The OS releases that lock after a crash. The directory is service-owned and private.
 Ephemeral storage, network filesystems, and multiple service instances are unsupported.
-Job database `reina.sqlite` schema 5 adds current reviews and a separate review cursor through a
-transactional 4-to-5 migration. Supported older upgrades retain schema-4 cooldown separation.
-Existing proposals, approvals, jobs, deliveries, and legacy assessment hashes remain intact; no
-review completion is fabricated. Migration failure rolls back. This is separate from encrypted
-`settings.sqlite` schema 3; triage does not migrate settings. Stop the service and take a consistent
-backup before an upgrade.
+Job database `reina.sqlite` schema 6 retains schema-5 reviews and their separate cursor, as well
+as schema-4 cooldown separation. Its transactional 5-to-6 migration adds indexed receipt keys and
+an explicit `request_epoch` cutoff. Valid retained sources are backfilled. Legacy unbound pending
+requests are completed without coding because their original baseline cannot be proved. Unknown
+sources created at or before the upgrade cutoff require a new human request: old completed
+receipts no longer contain enough data to reconstruct their identity. Known bound pending sources
+retain their original bindings. Fresh databases have no legacy cutoff.
+
+Existing claimed approvals and publication records remain intact; no review completion or approval
+is fabricated. Migration failure rolls back. This is separate from encrypted `settings.sqlite`
+schema 3. Stop the service and take a consistent backup before an upgrade. Older binaries cannot
+open schema 6: a downgrade needs the matching pre-upgrade application and state backup, not manual
+removal of receipt keys, source fields, or consumed event IDs.
 
 Normal job states are approved, working, validating, publishing, and pr_ready. Failed and
 cancelled jobs cannot resume coding. The public labels are projections of state:
@@ -509,7 +593,7 @@ cancelled jobs cannot resume coding. The public labels are projections of state:
 | `bot:needs-human`   | Successful triage requires a maintainer decision; not a coding failure                     |
 | `bot:triage-failed` | Assessment failed without a valid current result; not `bot:triaged`                        |
 | `fix_available`     | A concrete fix proposal has been confirmed                                                 |
-| `bot:approved`      | A human added an approval transition; the record still needs validation                    |
+| `bot:approved`      | A human added a label approval transition; direct requests use separate validated evidence |
 | `bot:working`       | Coding, validation, or publication is in progress                                          |
 | `bot:pr_ready`      | A confirmed draft PR exists                                                                |
 | `bot:failed`        | An attempt failed or publication needs recovery                                            |
@@ -537,6 +621,10 @@ reads. A deleted terminal issue cannot prevent other publication jobs from recov
 The publisher uploads validated blobs, trees, commits, and a new ref through GitHub APIs.
 It never runs Git or hooks with credentials. The branch is `narumi/fix/reina-issue-<number>`.
 Commit inputs are stable, and publication intent/resource IDs are persisted before later effects.
+Git data JSON can omit the single final LF from a commit message even though the raw Git object
+retains it. Metadata checks accept only the exact message or that exact one-LF omission; body
+changes, extra newlines, trailing spaces, and CRLF substitutions remain rejected. Commit inputs
+and the content-addressed commit identity do not change during publication recovery.
 
 Unknown write responses require reconciliation. The publisher compares the exact ref/commit and
 App-owned PR marker, head, base, and author across all PR states. Existing closed or merged PRs
@@ -564,7 +652,7 @@ changed, do not resume remote writes. Existing remote effects require operator r
    - There is no built-in key rotation. Do not blindly regenerate the key; replacing the environment
      value does not re-encrypt existing state. See [credential recovery](admin-webui.md#secret-storage-and-recovery).
 3. Version and restore the application, compatible databases, and original encryption key together.
-   A downgrade after job schema 5 or settings schema 3 requires matching pre-upgrade backups;
+   A downgrade after job schema 6 or settings schema 3 requires matching pre-upgrade backups;
    never lower schema versions or delete review, approval, job, or OAuth records by hand.
    Restored backups can restore old provider credentials and sessions. Revoke affected sessions
    and review provider authorization before enabling dispatch.
@@ -578,7 +666,7 @@ changed, do not resume remote writes. Existing remote effects require operator r
 6. For unknown publication, inspect the stored intent and matching GitHub resources. Do not
    delete a branch/PR or reset an intent without explicit maintainer authorization.
 7. On rollback, stop scans/dispatch, cancel workers, preserve resource IDs, and restore a compatible
-   application. Older binaries cannot open job schema 5 or interpret its review recovery state.
+   application. Older binaries cannot open job schema 6 or interpret its request receipt state.
    Restore a matching state backup before using an older version. Do not automatically close
    existing PRs or delete branches.
 

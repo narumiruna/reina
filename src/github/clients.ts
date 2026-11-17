@@ -66,6 +66,7 @@ export function boundaryFactory(
   app: Probot,
   config: Config,
   botId: number,
+  botLogin?: string,
 ): () => Promise<Boundaries> {
   let cached: { boundaries: Boundaries; until: number } | undefined
   return async () => {
@@ -73,7 +74,7 @@ export function boundaryFactory(
     const read = await installationClient(app, config, false)
     const write = await installationClient(app, config, true)
     const boundaries = {
-      github: new GitHub(read.client, config.repository, botId, read.auth),
+      github: new GitHub(read.client, config.repository, botId, read.auth, botLogin),
       publisher: new Publisher(write.client, config.repository, botId, write.auth),
     }
     cached = {

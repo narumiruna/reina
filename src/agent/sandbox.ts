@@ -164,6 +164,12 @@ export function containerArguments(
       "no_proxy",
     ].map((name) => `--env=${name}=`),
   ]
+  if (phase === "verify")
+    argv.push(
+      // Test fixtures may execute temporary scripts; keep this bounded and outside the checkout.
+      "--tmpfs=/run/reina-verify-tmp:rw,exec,nosuid,nodev,size=67108864,uid=1000,gid=1000,mode=0700",
+      "--env=TMPDIR=/run/reina-verify-tmp",
+    )
   if (snapshot)
     argv.push(
       "--mount",
@@ -618,11 +624,16 @@ export class DockerRuntime implements AgentRuntime {
         for (const argv of commands) {
           const timeoutMs = deadline - performance.now()
           if (timeoutMs <= 0) throw new Error("verification_timeout")
-          const result = await this.exec(container.id, argv, {
-            signal,
-            timeoutMs,
-            limit: 64 * 1024,
-          })
+          // The worker's internal phase marker is not target-repository configuration.
+          const result = await this.exec(
+            container.id,
+            ["/usr/bin/env", "--unset=REINA_PHASE", "--", ...argv],
+            {
+              signal,
+              timeoutMs,
+              limit: 64 * 1024,
+            },
+          )
           results.push({
             argv: [...argv],
             exitCode: result.exitCode,

@@ -75,6 +75,14 @@ describe("Pi 1.5.0 CLI boundary", () => {
   it("selects only documented flags, exact custom model and phase tools", () => {
     expect(PI_VERSION).toBe("1.5.0")
     const argv = piArguments("fixture", "triage")
+    const prefix = [
+      "/usr/local/bin/node",
+      "--import",
+      "data:text/javascript,process.umask(0o022)",
+      "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+    ]
+    expect(argv.slice(0, prefix.length)).toEqual(prefix)
+    expect(piArguments("fixture", "code").slice(0, prefix.length)).toEqual(prefix)
     for (const flag of [
       "--print",
       "--no-session",
@@ -166,6 +174,34 @@ describe("Pi 1.5.0 CLI boundary", () => {
     expect(imageMatchesReference("node:26", image)).toBe(false)
   })
 
+  it("adds only bounded executable scratch and TMPDIR for verification", () => {
+    const scratch = [
+      "--tmpfs=/run/reina-verify-tmp:rw,exec,nosuid,nodev,size=67108864,uid=1000,gid=1000,mode=0700",
+      "--env=TMPDIR=/run/reina-verify-tmp",
+    ]
+    const argv = containerArguments(config.image, "job", "owner", "verify")
+    expect(argv.filter((arg) => arg.startsWith("--tmpfs="))).toEqual([
+      "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=67108864,uid=1000,gid=1000,mode=0700",
+      scratch[0],
+    ])
+    expect(argv.filter((arg) => arg.startsWith("--env=TMPDIR="))).toEqual([scratch[1]])
+    expect(argv.filter((arg) => arg.startsWith("type="))).toEqual([
+      "type=volume,source=job-workspace,target=/workspace,volume-nocopy",
+    ])
+    expect(argv.join(" ")).not.toMatch(
+      /privileged|cap-add|docker\.sock|reina-model\.sock|\/opt\/deps/,
+    )
+    for (const phase of ["prepare", "triage", "code"]) {
+      const original = containerArguments(config.image, "job", "owner", phase)
+      expect(original.some((arg) => arg.includes("reina-verify-tmp"))).toBe(false)
+      expect(
+        argv
+          .filter((arg) => !scratch.includes(arg))
+          .map((arg) => (arg === "--env=REINA_PHASE=verify" ? `--env=REINA_PHASE=${phase}` : arg)),
+      ).toEqual(original)
+    }
+  })
+
   it("never requests host networking or credential mounts", () => {
     const argv = containerArguments(config.image, "job", "owner", "code", "/tmp/job/model.sock")
     for (const flag of [
@@ -200,10 +236,21 @@ describe("frozen archive boundary", () => {
     { name: "src/link", type: "symlink" as const, linkname: "/etc/passwd" },
     { name: "src/hard", type: "link" as const, linkname: "src/a" },
     { name: "src/fifo", type: "fifo" as const },
-    { name: "src/suid", type: "file" as const, mode: 0o4644 },
   ])("rejects unsafe entry $name", async (header) => {
     await expect(parseWorkspaceArchive(await tarBytes(header), false)).rejects.toThrow()
   })
+
+  it.each([0o666, 0o777, 0o4644, 0o2644, 0o1644, 0o700, 0o744, 0o764])(
+    "rejects unsafe regular file mode %i",
+    async (mode) => {
+      await expect(
+        parseWorkspaceArchive(
+          await tarBytes({ name: "src/created.txt", type: "file", mode }, Buffer.from("new\n")),
+          false,
+        ),
+      ).rejects.toThrow("artifact_file_mode")
+    },
+  )
 
   it("accepts only the fixed immutable dependency link", async () => {
     expect(

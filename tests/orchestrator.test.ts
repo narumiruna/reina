@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -206,6 +207,7 @@ class MockGitHub extends GitHub {
     user: { id: number; type: string; login: string }
     body: string
     created_at: string
+    updated_at?: string
   }[] = []
   permissions = new Map([
     [maintainer.login, "write"],
@@ -217,7 +219,7 @@ class MockGitHub extends GitHub {
 
   constructor(value: Config) {
     const octokit = fakeOctokit(() => this)
-    super(octokit as unknown as GitHubClient, value.repository, botId)
+    super(octokit as unknown as GitHubClient, value.repository, botId, undefined, "reina[bot]")
     this.octokit = octokit
     this.currentIssue = {
       ref: { ...value.repository, number: 12, issueId: 1_012 },
@@ -370,6 +372,7 @@ type DraftInput = {
 type Draft = DraftInput & { number: number; url: string }
 
 class MockPublisher extends Publisher {
+  responses = new Map<string, string>()
   comments = new Map<string, { commentId: number; publishedAt: number }>()
   drafts = new Map<string, Draft>()
   crashAfterCreate = false
@@ -385,6 +388,20 @@ class MockPublisher extends Publisher {
     async (review: Review, save: (value: Review) => void, signal?: AbortSignal) =>
       publishReview(this.reader, review, save, signal),
   )
+
+  override respond = vi.fn(async (ref: Issue["ref"], requestId: string, message: string) => {
+    if (this.responses.has(requestId)) return
+    this.responses.set(requestId, message)
+    const comment = {
+      issueNumber: ref.number,
+      id: 800 + this.responses.size,
+      user: { id: botId, type: "Bot", login: "reina[bot]" },
+      body: `<!-- reina:request:${ref.id}:${ref.issueId}:${requestId} -->\n\n${message}`,
+      created_at: new Date(Date.now()).toISOString(),
+    }
+    this.reader.remoteComments.push(comment)
+    this.reader.currentIssue.comments.push({ id: comment.id, authorId: botId, body: comment.body })
+  })
 
   createComment = vi.fn(async (proposal: Proposal) => {
     const comment = { commentId: 500 + this.comments.size, publishedAt: Date.now() }
@@ -584,6 +601,58 @@ function fixture(): TestFixture {
   return result
 }
 
+function directRequest(
+  value: TestFixture,
+  kind: "comment" | "assignment" = "comment",
+  actor = maintainer,
+): IssueWork {
+  now += 1_000
+  const common = {
+    actor,
+    requestIssueHash: createHash("sha256")
+      .update(JSON.stringify([value.github.currentIssue.title, value.github.currentIssue.body]))
+      .digest("hex"),
+  }
+  if (kind === "assignment") {
+    const assignee: Actor = { id: botId, login: "reina[bot]", type: "Bot" }
+    value.github.currentIssue.assignees = [assignee]
+    value.github.events.push({
+      id: "2000",
+      event: "assigned",
+      actor,
+      assignee,
+      createdAt: now,
+    })
+    return value.work({
+      ...common,
+      action: "assigned",
+      request: { kind, assigneeId: botId, createdAt: now },
+    })
+  }
+  const body = "@reina correct the usage example as described in this issue"
+  value.github.remoteComments.push({
+    issueNumber: 12,
+    id: 300,
+    user: { ...actor },
+    body,
+    created_at: new Date(now).toISOString(),
+    updated_at: new Date(now).toISOString(),
+  })
+  value.github.currentIssue.comments.push({ id: 300, authorId: actor.id, body })
+  return value.work({
+    ...common,
+    action: "created",
+    material: true,
+    request: {
+      kind,
+      commentId: 300,
+      bodyHash: createHash("sha256").update(body).digest("hex"),
+      createdAt: now,
+      updatedAt: now,
+    },
+  })
+}
+
 async function waitForRelease<T>(gate: Promise<T>, signal: AbortSignal): Promise<T> {
   signal.throwIfAborted()
   const aborted = Promise.withResolvers<never>()
@@ -628,6 +697,496 @@ function deferIssueRead(value: TestFixture, at: number, error: GitHubIssueDeferr
     return read(number)
   })
 }
+
+describe("direct human requests use the existing policy-bound workflow", () => {
+  test("assignment can authorize an existing proposal without another assessment", async () => {
+    const value = fixture()
+    const proposal = await value.propose()
+    const work = directRequest(value, "assignment")
+    await value.deliver(work, "existing-proposal-request")
+    expect(value.store.jobs()).toEqual([
+      expect.objectContaining({
+        state: "pr_ready",
+        proposalRevision: proposal.revision,
+        approval: expect.objectContaining({ eventId: "assignment:2000" }),
+      }),
+    ])
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    expect(value.publisher.createComment).toHaveBeenCalledTimes(1)
+    expect(value.runtime.code).toHaveBeenCalledTimes(1)
+    expect(value.runtime.verify).toHaveBeenCalledTimes(1)
+    expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+    expect(value.github.currentIssue.labels).not.toContain("bot:approved")
+  })
+
+  test.each(["comment", "assignment"] as const)(
+    "%s authority is consumed even when the first coding attempt fails",
+    async (kind) => {
+      const value = fixture()
+      const work = directRequest(value, kind)
+      value.runtime.code.mockRejectedValueOnce(new Error("pi_agent_error"))
+      await value.deliver(work, "direct-first-attempt")
+      expect(value.store.jobs()).toHaveLength(1)
+      expect(value.store.jobs()[0].state).toBe("failed")
+      await value.deliver(work, "direct-replay")
+      await value.deliver(work, "direct-replay")
+      expect(value.store.jobs()).toHaveLength(1)
+      expect(value.runtime.code).toHaveBeenCalledTimes(1)
+      expectNoPublication(value)
+    },
+  )
+
+  test.each(["comment", "assignment"] as const)(
+    "concurrent %s replays preserve the original attempt and create one draft",
+    async (kind) => {
+      const value = fixture()
+      const work = directRequest(value, kind)
+      const blocked = blockCoding(value)
+      value.orchestrator.accept("direct-concurrent-first", work)
+      const signal = await blocked.entered
+      value.orchestrator.accept("direct-concurrent-first", work)
+      value.orchestrator.accept("direct-concurrent-second", work)
+      expect(signal.aborted).toBe(false)
+      expect(value.runtime.code).toHaveBeenCalledTimes(1)
+      blocked.release()
+      await value.orchestrator.drain()
+      expect(value.store.jobs().map((job) => job.state)).toEqual(["pr_ready"])
+      expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  test.each(["comment", "assignment"] as const)(
+    "an older delayed issue edit does not revoke a newer %s request",
+    async (kind) => {
+      const value = fixture()
+      const work = directRequest(value, kind)
+      const blocked = blockCoding(value)
+      value.orchestrator.accept("newer-direct-request", work)
+      const signal = await blocked.entered
+      value.orchestrator.accept(
+        "delayed-older-edit",
+        value.work({
+          action: "edited",
+          material: true,
+          changedAt: required(work.request).createdAt - 1_000,
+        }),
+      )
+      expect(signal.aborted).toBe(false)
+      expect(value.store.deliveries().some((item) => item.id === "delayed-older-edit")).toBe(false)
+      blocked.release()
+      await value.orchestrator.drain()
+      expect(value.store.jobs().map((job) => job.state)).toEqual(["pr_ready"])
+      expect(value.runtime.code).toHaveBeenCalledTimes(1)
+      expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  test("a delayed material event cancels old coding but keeps a newer pending request", async () => {
+    const value = fixture()
+    await value.propose()
+    const blocked = blockCoding(value)
+    value.orchestrator.accept("old-label-approval", value.approval())
+    const signal = await blocked.entered
+    const oldJob = required(value.store.jobs()[0])
+    const older = directRequest(value, "comment")
+    value.store.acceptDelivery("older-pending-source", older)
+    const newer = directRequest(value, "assignment")
+    value.orchestrator.accept("newer-pending-source", newer)
+    value.orchestrator.accept(
+      "delayed-material-event",
+      value.work({
+        action: "edited",
+        material: true,
+        changedAt: required(older.request).createdAt + 500,
+      }),
+    )
+    expect(signal.aborted).toBe(true)
+    expect(value.store.job(oldJob.id)?.state).toBe("cancelled")
+    expect(value.store.proposal(oldJob.ref)).toBeUndefined()
+    expect(value.store.deliveries().map((item) => item.id)).toContain("newer-pending-source")
+    expect(value.store.deliveries().map((item) => item.id)).not.toContain("older-pending-source")
+    expect(value.store.deliveries().map((item) => item.id)).not.toContain("delayed-material-event")
+    blocked.release()
+    await value.orchestrator.drain()
+    expect(value.store.jobs().map((job) => job.state)).toEqual(["cancelled", "pr_ready"])
+    expect(value.runtime.code).toHaveBeenCalledTimes(2)
+    expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+    expect(value.github.currentIssue.labels).not.toContain("bot:approved")
+  })
+
+  describe.each(["comment", "assignment"] as const)("newer active %s request", (kind) => {
+    test.each(["coding", "triage"] as const)(
+      "a delayed material event consumes only the older source during %s",
+      async (phase) => {
+        const value = fixture()
+        const older = directRequest(value, kind === "comment" ? "assignment" : "comment")
+        const newer = directRequest(value, kind)
+        const entered = Promise.withResolvers<AbortSignal>()
+        const release = Promise.withResolvers<void>()
+        if (phase === "coding") {
+          value.runtime.code.mockImplementationOnce(async (snapshot, _prompt, signal) => {
+            entered.resolve(signal)
+            await waitForRelease(release.promise, signal)
+            return candidate(snapshot)
+          })
+        } else {
+          value.runtime.triage.mockImplementationOnce(async (_snapshot, _prompt, signal) => {
+            entered.resolve(signal)
+            await waitForRelease(release.promise, signal)
+            return output()
+          })
+        }
+        value.orchestrator.accept("newer-active-source", newer)
+        const signal = await entered.promise
+        const review = required(value.store.review(newer.ref))
+        const proposal = value.store.proposal(newer.ref)
+        value.store.acceptDelivery("older-pending-source", older)
+        value.orchestrator.accept(
+          "delayed-material-event",
+          value.work({
+            action: "edited",
+            material: true,
+            changedAt: required(older.request).createdAt + 500,
+          }),
+        )
+        expect(signal.aborted).toBe(false)
+        expect(value.store.review(newer.ref)).toEqual(review)
+        expect(value.store.proposal(newer.ref)).toEqual(proposal)
+        expect(value.store.deliveries().map((item) => item.id)).not.toContain(
+          "older-pending-source",
+        )
+        expect(value.store.deliveries().map((item) => item.id)).not.toContain(
+          "delayed-material-event",
+        )
+        expect(value.log.info).not.toHaveBeenCalledWith(
+          expect.objectContaining({
+            event: "triage_stale",
+            correlationId: "delayed-material-event",
+          }),
+        )
+        release.resolve()
+        await value.orchestrator.drain()
+        expect(value.store.jobs().map((job) => job.state)).toEqual(["pr_ready"])
+        expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+        expect(value.runtime.code).toHaveBeenCalledTimes(1)
+        expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+        expect(value.store.review(newer.ref)?.revision).toBe(review.revision)
+        expect(value.store.deliveries()).toEqual([])
+      },
+    )
+  })
+
+  test("a signed request cannot authorize issue content changed before intake", async () => {
+    const value = fixture()
+    const work = directRequest(value)
+    value.github.currentIssue.body += " New required behavior."
+    await value.deliver(work)
+    expect(value.runtime.triage).not.toHaveBeenCalled()
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(value.publisher.respond).not.toHaveBeenCalled()
+    expect(value.store.jobs()).toEqual([])
+    expectNoPublication(value)
+  })
+
+  test.each(["comment", "assignment"] as const)(
+    "%s does not bypass a needs-human assessment",
+    async (kind) => {
+      const value = fixture()
+      value.runtime.triage.mockResolvedValue(nonFix("needs_human"))
+      await value.deliver(directRequest(value, kind))
+      expect(value.publisher.respond).toHaveBeenCalledTimes(1)
+      expect(value.store.review(value.github.currentIssue.ref)?.outcome).toBe("needs_human")
+      expect(value.store.proposals()).toEqual([])
+      expect(value.store.jobs()).toEqual([])
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expectNoPublication(value)
+    },
+  )
+
+  test.each([outsider, { id: 98, login: "other-bot", type: "Bot" }])(
+    "$login cannot authorize a bot assignment",
+    async (actor) => {
+      const value = fixture()
+      value.github.permissions.set("other-bot", "write")
+      await value.deliver(directRequest(value, "assignment", actor))
+      expect(value.store.jobs()).toEqual([])
+      expect(value.runtime.triage).not.toHaveBeenCalled()
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expect(value.publisher.respond).not.toHaveBeenCalled()
+      expectNoPublication(value)
+    },
+  )
+
+  test.each(["comment edit", "comment delete", "unassignment", "skip", "base"])(
+    "%s synchronously revokes a running direct request",
+    async (change) => {
+      const value = fixture()
+      const work = directRequest(value, change === "unassignment" ? "assignment" : "comment")
+      const blocked = blockCoding(value)
+      value.orchestrator.accept("direct-running", work)
+      const signal = await blocked.entered
+      const job = required(value.store.jobs()[0])
+      now += 1_000
+      if (change === "base") {
+        value.github.baseline.sha = "c".repeat(40)
+        value.orchestrator.accept("direct-revoke", {
+          kind: "invalidate",
+          branch: "main",
+          disable: false,
+        })
+      } else {
+        const revoke = value.work({ actor: maintainer })
+        if (change === "comment edit") {
+          const comment = required(value.github.remoteComments.find((item) => item.id === 300))
+          comment.body = "@reina"
+          comment.updated_at = new Date(now).toISOString()
+          required(value.github.currentIssue.comments.find((item) => item.id === 300)).body =
+            comment.body
+          revoke.action = "edited"
+          revoke.material = true
+        } else if (change === "comment delete") {
+          value.github.remoteComments = value.github.remoteComments.filter(
+            (item) => item.id !== 300,
+          )
+          value.github.currentIssue.comments = value.github.currentIssue.comments.filter(
+            (item) => item.id !== 300,
+          )
+          revoke.action = "deleted"
+          revoke.material = true
+          revoke.cancel = true
+        } else if (change === "unassignment") {
+          value.github.currentIssue.assignees = []
+          value.github.events.push({
+            id: "2001",
+            event: "unassigned",
+            actor: maintainer,
+            assignee: { id: botId, login: "reina[bot]", type: "Bot" },
+            createdAt: now,
+          })
+          revoke.action = "unassigned"
+          revoke.cancel = true
+        } else {
+          value.github.currentIssue.labels.push("bot:skip")
+          revoke.action = "labeled"
+          revoke.label = "bot:skip"
+          revoke.cancel = true
+        }
+        value.orchestrator.accept("direct-revoke", revoke)
+      }
+      expect(signal.aborted).toBe(true)
+      expect(value.store.job(job.id)?.state).toBe("cancelled")
+      expect(value.store.proposal(job.ref)).toBeUndefined()
+      await value.orchestrator.drain()
+      expect(value.runtime.verify).not.toHaveBeenCalled()
+      expect(value.store.jobs()).toHaveLength(1)
+      expectNoPublication(value)
+    },
+  )
+
+  test.each(["comment edit", "comment delete", "unassignment", "permission", "base", "policy"])(
+    "live %s drift blocks direct publication without a webhook",
+    async (change) => {
+      const value = fixture()
+      const work = directRequest(value, change === "unassignment" ? "assignment" : "comment")
+      const verify = required(value.runtime.verify.getMockImplementation())
+      value.runtime.verify.mockImplementation(async (...args) => {
+        const results = await verify(...args)
+        now += 1_000
+        if (change === "comment edit") {
+          const comment = required(value.github.remoteComments.find((item) => item.id === 300))
+          comment.body += " changed"
+          comment.updated_at = new Date(now).toISOString()
+        }
+        if (change === "comment delete")
+          value.github.remoteComments = value.github.remoteComments.filter(
+            (item) => item.id !== 300,
+          )
+        if (change === "unassignment") value.github.currentIssue.assignees = []
+        if (change === "permission") value.github.permissions.set(maintainer.login, "read")
+        if (change === "base") value.github.baseline.sha = "c".repeat(40)
+        if (change === "policy") value.config.maxChangedFiles = 1
+        return results
+      })
+      await value.deliver(work)
+      expect(value.runtime.code).toHaveBeenCalledTimes(1)
+      expect(value.runtime.verify).toHaveBeenCalledTimes(1)
+      expect(value.store.jobs()[0].state).toBe("cancelled")
+      expectNoPublication(value)
+    },
+  )
+
+  test("unassignment during acknowledgement stops the revoked request before triage", async () => {
+    const value = fixture()
+    const work = directRequest(value, "assignment")
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    value.publisher.respond.mockImplementationOnce(async () => {
+      entered.resolve()
+      await release.promise
+    })
+    value.orchestrator.accept("revoked-during-ack", work)
+    await entered.promise
+    try {
+      now += 1_000
+      value.github.currentIssue.assignees = []
+      value.github.events.push({
+        id: "2001",
+        event: "unassigned",
+        actor: maintainer,
+        assignee: { id: botId, login: "reina[bot]", type: "Bot" },
+        createdAt: now,
+      })
+      value.orchestrator.accept(
+        "unassignment-after-request",
+        value.work({
+          action: "unassigned",
+          actor: maintainer,
+          changedAt: now,
+          cancel: true,
+        }),
+      )
+      expect(value.store.deliveries().some((item) => item.id === "revoked-during-ack")).toBe(false)
+    } finally {
+      release.resolve()
+    }
+    await value.orchestrator.drain()
+    expect(value.log.info).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event: "triage_started", correlationId: "revoked-during-ack" }),
+    )
+    expect(value.log.info).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event: "proposal_created", correlationId: "revoked-during-ack" }),
+    )
+    expect(value.log.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "cancelled",
+        correlationId: "revoked-during-ack",
+        reason: "job_cancelled",
+      }),
+    )
+    expect(value.store.jobs()).toEqual([])
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expectNoPublication(value)
+  })
+
+  describe.each(["comment", "assignment"] as const)("%s acknowledgement deferral", (kind) => {
+    test.each(["unchanged", "base", "branch", "policy", "evidence"])(
+      "retains the original binding across restart when %s",
+      async (change) => {
+        const value = fixture()
+        const work = directRequest(value, kind)
+        const binding = {
+          fingerprint: fingerprint(value.github.currentIssue, botId),
+          baseSha: value.github.baseline.sha,
+          baseBranch: value.github.baseline.branch,
+          policyHash: policyHash(value.config),
+        }
+        const retryAt = now + 30_000
+        let pendingAtResponse: unknown
+        value.publisher.respond.mockImplementationOnce(async () => {
+          pendingAtResponse = value.store.deliveries().find((item) => item.id === "deferred-ack")
+          throw new GitHubDeferred("github_rate_limit", retryAt)
+        })
+        await value.deliver(work, "deferred-ack")
+        expect(pendingAtResponse).toEqual({
+          id: "deferred-ack",
+          payload: { ...work, requestBinding: binding },
+        })
+        expect(value.store.blockedUntil()).toBe(retryAt)
+        expect(value.runtime.triage).not.toHaveBeenCalled()
+        expect(value.runtime.code).not.toHaveBeenCalled()
+        expectNoPublication(value)
+        await value.restart()
+        if (change === "base") value.github.baseline.sha = "c".repeat(40)
+        if (change === "branch") value.github.baseline.branch = "trunk"
+        if (change === "policy") value.config.maxChangedFiles = 1
+        if (change === "evidence") value.github.currentIssue.comments[0].body += " New evidence."
+        now = retryAt
+        expect(value.store.deliveries()).toContainEqual({
+          id: "deferred-ack",
+          payload: { ...work, requestBinding: binding },
+        })
+        await value.orchestrator.drain()
+        if (change === "unchanged") {
+          expect(value.store.jobs().map((job) => job.state)).toEqual(["pr_ready"])
+          expect(value.runtime.code).toHaveBeenCalledTimes(1)
+          expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+          expect(value.publisher.responses.size).toBe(1)
+        } else {
+          expect(value.store.jobs()).toEqual([])
+          expect(value.runtime.triage).not.toHaveBeenCalled()
+          expect(value.runtime.code).not.toHaveBeenCalled()
+          expect(value.publisher.respond).toHaveBeenCalledTimes(1)
+          expect(value.log.info).toHaveBeenCalledWith(
+            expect.objectContaining({
+              event: "cancelled",
+              correlationId: "deferred-ack",
+              reason: "proposal_stale",
+            }),
+          )
+          expectNoPublication(value)
+        }
+      },
+    )
+  })
+
+  test.each(["base", "policy", "evidence"])(
+    "a deferred direct request keeps its original %s binding across restart",
+    async (change) => {
+      const value = fixture()
+      const work = directRequest(value)
+      value.runtime.triage.mockRejectedValueOnce(new Error("model_request_transient"))
+      await value.deliver(work, "deferred-direct")
+      const review = required(value.store.review(work.ref))
+      expect(review.state).toBe("pending")
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      await value.restart()
+      if (change === "base") value.github.baseline.sha = "c".repeat(40)
+      if (change === "policy") value.config.maxChangedFiles = 1
+      if (change === "evidence")
+        value.github.currentIssue.comments.push({
+          id: 900,
+          authorId: maintainer.id,
+          body: "New evidence",
+        })
+      now = review.nextAttemptAt
+      expect(value.store.deliveries()).toContainEqual({
+        id: "deferred-direct",
+        payload: expect.objectContaining({
+          requestBinding: {
+            fingerprint: review.binding.fingerprint,
+            baseSha: review.binding.baseSha,
+            baseBranch: review.binding.baseBranch,
+            policyHash: review.binding.policyHash,
+          },
+        }),
+      })
+      await value.orchestrator.drain()
+      expect(value.store.jobs()).toEqual([])
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expectNoPublication(value)
+    },
+  )
+
+  test("material intake consumes an older deferred request before restart recovery", async () => {
+    const value = fixture()
+    const work = directRequest(value)
+    value.runtime.triage.mockRejectedValueOnce(new Error("model_request_transient"))
+    await value.deliver(work, "older-deferred-request")
+    const review = required(value.store.review(work.ref))
+    value.orchestrator.accept(
+      "new-material-event",
+      value.work({ action: "edited", material: true }),
+    )
+    now = review.nextAttemptAt
+    expect(value.store.deliveries().map((delivery) => delivery.id)).not.toContain(
+      "older-deferred-request",
+    )
+    await value.restart()
+    expect(value.store.jobs()).toEqual([])
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expectNoPublication(value)
+  })
+})
 
 describe("durable discovery through one trusted draft", () => {
   test("both agent phases receive repository instructions only as untrusted context", async () => {
@@ -2548,31 +3107,81 @@ describe("restart and shutdown", () => {
     expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
   })
 
-  test("reconciles publishing after response loss without coding, verification, or a second PR", async () => {
-    const value = fixture()
-    await value.propose()
-    value.publisher.crashAfterCreate = true
-    await value.approve()
-    const interrupted = value.store.jobs()[0]
-    expect(interrupted).toMatchObject({ state: "publishing", publication: { prIntent: true } })
-    expect(interrupted.publication?.prNumber).toBeUndefined()
-    expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
-    const previousRuntime = value.runtime
-    await value.restart()
-    expect(value.runtime.cleanup).toHaveBeenCalledTimes(1)
-    expect(value.runtime.preflight).toHaveBeenCalledTimes(1)
-    expect(value.runtime.code).not.toHaveBeenCalled()
-    expect(value.runtime.verify).not.toHaveBeenCalled()
-    expect(previousRuntime.code).toHaveBeenCalledTimes(1)
-    expect(value.store.job(interrupted.id)).toMatchObject({
-      state: "pr_ready",
-      artifact: interrupted.artifact,
-      publication: { prIntent: true, prNumber: 40, commitSha: "b".repeat(40) },
-    })
-    expect(value.publisher.publish).toHaveBeenCalledTimes(2)
-    expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
-    expect(value.github.currentIssue.labels).toEqual(["bot:triaged", "bot:pr_ready"])
-  })
+  test.each(["label", "comment", "assignment"] as const)(
+    "reconciles %s publication after response loss without another coding, verification, or PR",
+    async (source) => {
+      const value = fixture()
+      value.publisher.crashAfterCreate = true
+      if (source === "label") {
+        await value.propose()
+        await value.approve()
+      } else {
+        await value.deliver(directRequest(value, source))
+      }
+      const interrupted = value.store.jobs()[0]
+      expect(interrupted).toMatchObject({ state: "publishing", publication: { prIntent: true } })
+      expect(interrupted.publication?.prNumber).toBeUndefined()
+      expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+      const previousRuntime = value.runtime
+      await value.restart()
+      expect(value.runtime.cleanup).toHaveBeenCalledTimes(1)
+      expect(value.runtime.preflight).toHaveBeenCalledTimes(1)
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expect(value.runtime.verify).not.toHaveBeenCalled()
+      expect(previousRuntime.code).toHaveBeenCalledTimes(1)
+      expect(value.store.job(interrupted.id)).toMatchObject({
+        state: "pr_ready",
+        artifact: interrupted.artifact,
+        publication: { prIntent: true, prNumber: 40, commitSha: "b".repeat(40) },
+      })
+      expect(value.publisher.publish).toHaveBeenCalledTimes(2)
+      expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+      expect(value.github.currentIssue.labels).toEqual(["bot:triaged", "bot:pr_ready"])
+    },
+  )
+
+  test.each(["comment edit", "unassignment", "permission loss"] as const)(
+    "%s prevents direct-request publication recovery from restoring revoked authority",
+    async (change) => {
+      const value = fixture()
+      value.publisher.crashAfterCreate = true
+      await value.deliver(
+        directRequest(value, change === "unassignment" ? "assignment" : "comment"),
+      )
+      const interrupted = required(value.store.jobs()[0])
+      expect(interrupted.state).toBe("publishing")
+      expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+      const previousRuntime = value.runtime
+      now += 1_000
+      if (change === "comment edit") {
+        const comment = required(value.github.remoteComments.find((item) => item.id === 300))
+        comment.body = "@reina help"
+        comment.updated_at = new Date(now).toISOString()
+        required(value.github.currentIssue.comments.find((item) => item.id === 300)).body =
+          comment.body
+      } else if (change === "unassignment") {
+        value.github.currentIssue.assignees = []
+        value.github.events.push({
+          id: "2001",
+          event: "unassigned",
+          label: "",
+          actor: maintainer,
+          assignee: { id: botId, login: "reina[bot]", type: "Bot" },
+          createdAt: now,
+        })
+      } else {
+        value.github.permissions.set(maintainer.login, "read")
+      }
+      await value.restart()
+      expect(value.store.job(interrupted.id)?.state).toBe("cancelled")
+      expect(previousRuntime.code).toHaveBeenCalledTimes(1)
+      expect(previousRuntime.verify).toHaveBeenCalledTimes(1)
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expect(value.runtime.verify).not.toHaveBeenCalled()
+      expect(value.publisher.publish).toHaveBeenCalledTimes(1)
+      expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+    },
+  )
 
   test("restart fails undispatched approved jobs and never restores authority from labels", async () => {
     const value = fixture()
