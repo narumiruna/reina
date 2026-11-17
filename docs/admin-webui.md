@@ -308,6 +308,127 @@ saving the existing App ID and webhook secret in **Runtime**, remove their legac
 settings and the other dispatch variables. Keep the original encryption key and login bootstrap.
 No settings schema migration or credential reset is required.
 
+## Recover a worker fingerprint mismatch
+
+`worker_dependency_fingerprint_mismatch` means the target snapshot's `package.json` or
+`package-lock.json` does not match the prepared worker. The runtime compares each file's complete
+SHA-256 before creating a triage or coding container. A version-only release, formatting change,
+or dependency update can therefore require a replacement worker. This error is not an automatic
+model retry. Removing `bot:triage-failed` or restarting does not repair the mismatch.
+
+### Operator recovery procedure
+
+This procedure does not authorize production changes, GitHub writes, or paid inference. The
+**deployment operator** owns preparation and backups. The **Runtime administrator and provider
+account owner** must authorize the affected issues, model use, and automatic publication before
+applying the replacement. Use an authorized admin session; do not send credentials in chat.
+
+1. **Record the baseline and preserve recovery state.** Record the remote default-branch commit,
+   controller image ID, configured immutable worker ID from Runtime, affected issue numbers,
+   and safe `triage_failed` reason/revision/correlation fields. An available image tag is not
+   proof of the configured image. Keep issue bodies, raw model output, and secrets out of the
+   incident record. Inspect pending requests and approvals before any restart or Runtime apply;
+   those actions can resume other eligible work. Before production changes, follow the
+   [stopped-instance backup procedure](architecture.md#operator-actions), including both
+   databases, WAL state, the original encryption key, and previous image/configuration identities.
+2. **Pin approved source bytes and compare both fingerprints.** Obtain a separate source copy of
+   the approved commit without running its scripts on the host or creating a Git worktree.
+   Confirm its two package files match that commit. Set `APPROVED_SHA` to its full commit SHA
+   and `WORKER_ID` to the configured immutable image ID, then run these read-only checks in Bash
+   from the source repository:
+
+   ```bash
+   set -euo pipefail
+   : "${APPROVED_SHA:?Set the approved commit SHA}"
+   : "${WORKER_ID:?Set the configured immutable worker image ID}"
+   git show "${APPROVED_SHA}:package.json" | shasum -a 256
+   git show "${APPROVED_SHA}:package-lock.json" | shasum -a 256
+   docker image inspect "$WORKER_ID" --format \
+     'manifest={{index .Config.Labels "io.reina.package-manifest"}} lock={{index .Config.Labels "io.reina.dependency-lock"}}'
+   ```
+
+   Image label values include the `sha256:` prefix. A missing image, package file, or fingerprint
+   is a blocker, not permission to bypass the guard. Do not change package files merely to match
+   an old worker or relabel an incompatible image.
+3. **Prepare one replacement worker.** Authorize the required public image/package downloads
+   and Docker write access in a reviewed preparation environment. Preparation has host-level
+   Docker authority; do not expose production credentials or a shared host Docker socket to
+   untrusted repository code. Agent-run repository code requires a fresh disposable sandbox
+   with temporary source, a clean environment, no host secrets or sockets, and network access
+   limited to required destinations. If these controls are unavailable, preparation remains an
+   operator action. Run only one preparation at a time. Set `APPROVED_DIR` to the absolute path
+   of the approved source copy and, from the reviewed preparation checkout, use:
+
+   ```sh
+   TARGET_DIR="${APPROVED_DIR:?Set the approved source directory}" \
+     docker compose run --build --rm -T prepare-worker
+   ```
+
+   The command writes local image tags; it does not select the new worker in saved Runtime
+   settings. Retain the previous immutable images and record the printed replacement image ID.
+   On the controller's Docker daemon, repeat the fingerprint checks with that ID. Both labels
+   must match the approved package bytes. Unsupported manifests, missing integrity, failed
+   downloads, or cleanup failures must be resolved before applying; do not weaken preparation
+   limits, omit required dependencies, or continue after an unsuccessful preparation.
+4. **Recheck the target and apply only the worker change.** Re-read the remote default branch
+   immediately before apply. If either package file changed since preparation, stop and prepare
+   against the newly approved bytes; a different commit with identical package bytes does not
+   itself require rebuilding dependencies. In **Runtime → Immutable worker image ID**, enter
+   the verified replacement ID and select **Save and apply configuration**. Preserve unrelated
+   settings and existing limits. Saved Runtime settings, not a changed local tag or stale
+   environment variable, select the worker. The new image changes the policy binding and permits
+   a fresh assessment; it also invalidates old proposals. Do not reset SQLite records, replay
+   consumed requests, clear publication intents, or treat this operation as coding authorization.
+5. **Verify current-cycle publication for every still-eligible affected issue.** Require runtime
+   readiness, a fresh review revision, `triage_completed`, one current summary, `bot:triaged`,
+   and the matching `bot:needs-info` or `bot:needs-human` label when applicable. A fix candidate
+   needs neither outcome label. Confirm `bot:triage-failed` is absent. Closed or skipped issues
+   follow their inactive projection instead; record that state without claiming an assessment.
+   `runtime_ready`, `triage_started`, or label removal alone is insufficient. Preflight checks
+   isolation but does not compare a target snapshot's package bytes. Preserve existing PRs;
+   `bot:pr_ready` can coexist with failure of a newer assessment. Any later coding needs current
+   policy-bound authority and must not recreate an existing PR.
+
+If a new failure reason appears, stop and investigate it without increasing budgets or weakening
+controls. If apply fails or unexpected work starts, the operator must stop dispatch or stop the
+controller within the authorized maintenance window and preserve state and resource identities.
+Restoring the old worker cannot fix its mismatch with current source. Keep dispatch stopped until
+source and worker match; do not restore a database merely to reset attempts. Reconcile any remote
+comments, labels, branches, or PRs written before interruption. A local rollback does not undo
+GitHub writes or restore valid coding authority.
+
+### Worker fingerprint incident baseline (2026-11-17 UTC)
+
+Read-only checks at 14:05 UTC found open issues
+[#16](https://github.com/narumiruna/reina/issues/16),
+[#27](https://github.com/narumiruna/reina/issues/27),
+[#29](https://github.com/narumiruna/reina/issues/29),
+[#31](https://github.com/narumiruna/reina/issues/31), and
+[#34](https://github.com/narumiruna/reina/issues/34) labelled `bot:triage-failed`. Controller logs
+recorded `worker_dependency_fingerprint_mismatch` on attempt 1 in cycles at 12:16–12:21 UTC,
+before model invocation. Local HEAD and remote `main` were
+`56ac776f58993a561509711b44e0ecf0880a2947`. PR #28 changed parser dependencies; PR #33 then changed
+the package version to `0.4.0`, which also changed the manifest fingerprint.
+
+Recorded controller image:
+`sha256:e6f1dabf4737a6bc6f4e356a8ee9d0d6c9cfdd055a0db887ab2100223ad4bd37`.
+Available `reina-worker:direct-requests` image:
+`sha256:94911eea56d364acbb1571f550050235e122872d694cbf8bb53a5be03892765e`.
+Its labels matched source revision `a17718c2b7b203b088263f70d435098e21c7cee1`:
+
+| File                | Approved `56ac776` source SHA-256                                  | Available worker label SHA-256 (without prefix)                    |
+| ------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| `package.json`      | `e9e07b790153f65283fd6ef054c6924c3b0bb8dc57df74d1564e7d39241305a0` | `65ed131b3ea60bcf0449281a039a3416537b36422dfb9bc2ffd92d07bc78ad91` |
+| `package-lock.json` | `0a7db460aa0c0c267235694c439f7cb803ed652e018cb9ec7a0563b2cf358f4e` | `e1623f37de470460db909f5e213b1db9fa0ea1a6c62b9554f7cf219d2ff570bf` |
+
+The configured worker ID was not read through an authorized admin session; confirming it is a
+Runtime-administrator prerequisite, not an inference from the available tag. No production image
+was prepared or applied, and no model call or GitHub mutation was triggered by these checks.
+The operator handoff above remains open. Production isolation and live recovery remain unverified;
+do not describe this documentation change or passing fixtures as restored triage or release
+acceptance. Retain the verifier, target/replacement IDs, authorized scope, per-issue current-cycle
+results, and any unresolved checks before declaring production recovery complete.
+
 ## Onboarding
 
 Obtain authorization for paid provider use and test-repository changes before completing dispatch
