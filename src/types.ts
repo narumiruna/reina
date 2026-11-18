@@ -18,6 +18,8 @@ export interface Issue {
   labels: string[]
   state: "open" | "closed"
   pullRequest: boolean
+  /** Authoritative issue creation time, when supplied by GitHub. */
+  createdAt?: number
   assignees?: Actor[]
 }
 
@@ -75,6 +77,14 @@ export interface LabelEvent {
   actor: Actor
   assignee?: Actor
   createdAt: number
+}
+
+/** A pinned, read-only reassessment request; never coding or approval authority. */
+export interface RetriageRequest {
+  source: string
+  candidateKey: string
+  createdAt: number
+  actor: Actor
 }
 
 export type ExecutionRequest =

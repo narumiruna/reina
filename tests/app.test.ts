@@ -5,10 +5,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { pino } from "pino"
 import { Probot, ProbotOctokit } from "probot"
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
+import { afterEach, assert, beforeEach, describe, expect, test, vi } from "vitest"
 import { artifactHash } from "../src/agent/validate.js"
 import { httpServer, register, sanitizeWebhook, webhookWork } from "../src/app.js"
 import { Publisher, proposalBody } from "../src/github/publisher.js"
+import { RETRIAGE_LABEL, retriageCandidateKey } from "../src/github/retriage.js"
 import { branchFor, GitHub, type GitHubClient } from "../src/github/scanner.js"
 import { publishReview } from "../src/github/triage.js"
 import { Orchestrator } from "../src/jobs/orchestrator.js"
@@ -714,6 +715,128 @@ describe("webhook routing and bounded event data", () => {
     })
     expect(JSON.stringify(safe)).not.toContain(body)
     expect(JSON.stringify(safe)).not.toContain(rawIssueBody)
+  })
+
+  test("pins a human retriage candidate without retaining private source text", () => {
+    const event = payload({
+      action: "labeled",
+      label: { name: RETRIAGE_LABEL },
+      issue: { ...payload().issue, updated_at: new Date(now).toISOString() },
+    })
+    const safe = sanitizeWebhook(event)
+    const work = webhookWork("issues", safe, configuration(), botId)
+    const contentHash = createHash("sha256")
+      .update(JSON.stringify([event.issue.title, event.issue.body]))
+      .digest("hex")
+    expect(work).toMatchObject({
+      kind: "issue",
+      action: "labeled",
+      label: RETRIAGE_LABEL,
+      actor: maintainer,
+      retriage: {
+        candidateKey: retriageCandidateKey(
+          { ...configuration().repository, issueId: 1_012, number: 12 },
+          maintainer,
+          now,
+          contentHash,
+        ),
+        createdAt: now,
+      },
+      requestIssueHash: contentHash,
+      material: false,
+      cancel: false,
+    })
+    expect(work).not.toHaveProperty("request")
+    expect(work).not.toHaveProperty("approval")
+    expect(sanitizeWebhook(safe)).toEqual(safe)
+    expect(webhookWork("issues", sanitizeWebhook(safe), configuration(), botId)).toEqual(work)
+    for (const value of [rawIssueBody, event.issue.title]) {
+      expect(JSON.stringify(safe)).not.toContain(value)
+      expect(JSON.stringify(work)).not.toContain(value)
+    }
+  })
+
+  test.each([
+    "opened",
+    "unlabeled",
+    "other-label",
+    "missing-time",
+    "invalid-time",
+    "missing-content",
+    "no-sender",
+    "bot",
+    "other-bot",
+    "organization",
+    "invalid-login",
+  ])("does not turn %s label evidence into a retriage request", (kind) => {
+    const event = payload({
+      action: "labeled",
+      label: { name: RETRIAGE_LABEL },
+      issue: { ...payload().issue, updated_at: new Date(now).toISOString() },
+    })
+    const data: Record<string, unknown> = { ...event }
+    if (kind === "opened" || kind === "unlabeled") data.action = kind
+    if (kind === "other-label") data.label = { name: "bot:approved" }
+    if (kind === "missing-time") data.issue = { ...payload().issue }
+    if (kind === "invalid-time") data.issue = { ...payload().issue, updated_at: "not-a-date" }
+    if (kind === "missing-content")
+      data.issue = { id: 1_012, number: 12, updated_at: new Date(now).toISOString() }
+    if (kind === "no-sender") delete data.sender
+    if (kind === "bot") data.sender = { id: botId, login: "reina[bot]", type: "Bot" }
+    if (kind === "other-bot") data.sender = { id: 98, login: "other[bot]", type: "Bot" }
+    if (kind === "organization") data.sender = { ...maintainer, type: "Organization" }
+    if (kind === "invalid-login") data.sender = { ...maintainer, login: "not/a/login" }
+    const work = webhookWork("issues", data, configuration(), botId)
+    expect(work && "retriage" in work).toBeFalsy()
+    expect(work && "request" in work).toBeFalsy()
+  })
+
+  test.each(["installation", "repository", "issue-id", "issue-number", "actor"])(
+    "rejects unsafe retriage %s IDs at intake",
+    (kind) => {
+      const unsafe = Number.MAX_SAFE_INTEGER + 1
+      const event = payload({
+        action: "labeled",
+        label: { name: RETRIAGE_LABEL },
+        issue: { ...payload().issue, updated_at: new Date(now).toISOString() },
+      })
+      if (kind === "installation") event.installation.id = unsafe
+      if (kind === "repository") event.repository.id = unsafe
+      if (kind === "issue-id") event.issue.id = unsafe
+      if (kind === "issue-number") event.issue.number = unsafe
+      if (kind === "actor") event.sender.id = unsafe
+      expect(webhookWork("issues", event, configuration(), botId)).toBeUndefined()
+      expect(() => sanitizeWebhook(event)).toThrow()
+    },
+  )
+
+  test("normalizes retriage repository casing but pins source content and event time", () => {
+    const event = payload({
+      action: "labeled",
+      label: { name: RETRIAGE_LABEL },
+      issue: { ...payload().issue, updated_at: new Date(now).toISOString() },
+    })
+    const original = webhookWork("issues", event, configuration(), botId)
+    assert(original?.kind === "issue" && original.retriage)
+    event.repository.name = event.repository.name.toUpperCase()
+    event.repository.owner.login = event.repository.owner.login.toUpperCase()
+    expect(webhookWork("issues", event, configuration(), botId)).toEqual(original)
+    const changedBody = webhookWork(
+      "issues",
+      { ...event, issue: { ...event.issue, body: "Changed private body" } },
+      configuration(),
+      botId,
+    )
+    assert(changedBody?.kind === "issue" && changedBody.retriage)
+    expect(changedBody.retriage.candidateKey).not.toBe(original.retriage.candidateKey)
+    const changedTime = webhookWork(
+      "issues",
+      { ...event, issue: { ...event.issue, updated_at: new Date(now - 1000).toISOString() } },
+      configuration(),
+      botId,
+    )
+    assert(changedTime?.kind === "issue" && changedTime.retriage)
+    expect(changedTime.retriage.candidateKey).not.toBe(original.retriage.candidateKey)
   })
 
   test.each(["assigned", "unassigned"] as const)(

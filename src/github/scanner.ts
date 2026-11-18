@@ -148,6 +148,8 @@ function defer(code: string): never {
 }
 
 export function numericId(value: number | bigint): number {
+  if (typeof value !== "number" && typeof value !== "bigint")
+    throw new GitHubError("github_invalid_id")
   const id = Number(value)
   if (!Number.isSafeInteger(id) || id < 1) throw new GitHubError("github_invalid_id")
   return id
@@ -393,6 +395,13 @@ export class GitHub {
     )
     if (data.number !== number) throw new GitHubError("github_issue_mismatch")
     const issueId = numericId(data.id)
+    let createdAt: number | undefined
+    if (data.created_at !== undefined) {
+      createdAt = typeof data.created_at === "string" ? Date.parse(data.created_at) : Number.NaN
+      if (!Number.isSafeInteger(createdAt) || createdAt < 0 || createdAt > Date.now()) {
+        throw new GitHubIssueDeferred("github_invalid_issue_creation")
+      }
+    }
     const { comments, ordinaryBytes } = await this.readComments(number, issueId, data.comments)
     if (
       Buffer.byteLength(data.title) + Buffer.byteLength(data.body ?? "") + ordinaryBytes >
@@ -420,6 +429,7 @@ export class GitHub {
       labels: data.labels.map((label) => (typeof label === "string" ? label : (label.name ?? ""))),
       state: data.state === "open" ? "open" : "closed",
       pullRequest: data.pull_request !== undefined,
+      ...(createdAt !== undefined ? { createdAt } : {}),
       ...(assignees !== undefined ? { assignees } : {}),
     }
   }
@@ -579,9 +589,15 @@ export class GitHub {
     const labels: LabelEvent[] = []
     let previousTime = 0
     for (const event of events) {
-      const id = String(event.id)
-      if (!/^\d+$/.test(id) || id === "0" || ids.has(id))
+      if (
+        (typeof event.id !== "number" && typeof event.id !== "bigint") ||
+        !Number.isSafeInteger(Number(event.id)) ||
+        Number(event.id) < 1
+      ) {
         throw new GitHubError("github_ambiguous_history")
+      }
+      const id = String(event.id)
+      if (ids.has(id)) throw new GitHubError("github_ambiguous_history")
       ids.add(id)
       const labeled = event.event === "labeled" || event.event === "unlabeled"
       const assigned = event.event === "assigned" || event.event === "unassigned"
@@ -591,15 +607,11 @@ export class GitHub {
       const assignee = assigned && "assignee" in event ? event.assignee : undefined
       if (
         (labeled && !label) ||
-        !event.actor ||
-        !Number.isFinite(createdAt) ||
-        (assigned &&
-          (!assignee?.login ||
-            !assignee.type ||
-            !event.actor.login ||
-            !event.actor.type ||
-            createdAt < 0 ||
-            (typeof event.id === "number" && !Number.isSafeInteger(event.id))))
+        !event.actor?.login ||
+        !event.actor.type ||
+        !Number.isSafeInteger(createdAt) ||
+        createdAt < 0 ||
+        (assigned && (!assignee?.login || !assignee.type))
       ) {
         throw new GitHubError("github_ambiguous_history")
       }

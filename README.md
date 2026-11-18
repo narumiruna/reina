@@ -180,7 +180,8 @@ These steps are for the service operator, not each connecting user.
 1. Register the service GitHub App and install it only on approved repositories.
    - Create the label definitions `fix_available`, `bot:approved`, `bot:working`, `bot:pr_ready`,
      `bot:failed`, and `bot:skip`, plus `bot:triaged`, `bot:needs-info`, `bot:needs-human`, and
-     `bot:triage-failed`. See [label meanings](docs/architecture.md#approval-and-state).
+     `bot:triage-failed`, and the one-shot `bot:retriage` trigger.
+     See [label meanings](docs/architecture.md#approval-and-state).
      Reina applies status labels but does not provision their definitions.
 2. Give it Metadata read, Contents read/write, Issues read/write, and Pull requests read/write.
    Do not grant Actions or Workflows write, administration, or organization-member access.
@@ -306,14 +307,23 @@ For example, a bug report without reproduction details can receive `bot:triaged`
 `bot:needs-info`, with questions about the public version and minimal reproduction steps.
 Do not post credentials or private diagnostic data in response.
 
-Issue edits and non-Reina comment changes invalidate the previous review. Reina's own comments
-and label updates do not cause a paid reassessment loop. Non-fix results remain cached until their
-evidence or policy binding changes. Each persisted assessment cycle permits at most three model
-attempts, with one-minute and five-minute retry delays for allowed transient failures. Invalid
-output or unavailable isolation stops the cycle. Exhausted failures do not renew daily; removing
-labels or restarting does not reset the budget. GitHub publication recovery reuses the saved result.
-A successful fix-candidate cycle can renew after 24 hours, with a new assessment and fresh approval.
-See [triage lifecycle and recovery](docs/architecture.md#issue-triage).
+Reina automatically invokes triage at most once per eligible issue. Issue edits, human comments,
+base/policy changes, expiry, and reopening can invalidate a result, but never grant another model
+invocation. Failure, timeout, interruption, label repair, and restart do not retry inference.
+GitHub publication recovery reuses the saved result. A run can use read-only tool continuation;
+the limit is one assessment invocation, not one provider HTTP request.
+
+To request another read-only assessment, a human with write, maintain, or admin permission adds
+`bot:retriage`. Reina validates a fresh human transition, saves a one-use request, removes the
+trigger, and invokes triage at most once. To request another attempt after failure, add it again.
+The label is not coding approval and never creates a PR by itself. Label presence during a scan
+is not a request. A permission failure, ambiguous transition, or uncertain cleanup can require
+manual removal and a fresh add; do not reset state to retry. Normal users without the required
+repository permission need a maintainer to apply the label.
+
+Explicit coding requests retain their existing authorization and may use one needed assessment;
+a still-current result is reused. Unknown pre-upgrade issue history is manual-only, rather than
+risking an automatic repeat. See [triage lifecycle and recovery](docs/architecture.md#issue-triage).
 
 Labels are eventually consistent projections, not the job database or approval authority.
 `bot:triaged` means a validated assessment was published, not that a fix exists or tests passed.

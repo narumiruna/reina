@@ -2,12 +2,13 @@ import { createHash } from "node:crypto"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import type { Probot } from "probot"
 import { z } from "zod"
+import { RETRIAGE_LABEL, retriageCandidateKey } from "./github/retriage.js"
 import { logHttpFailure } from "./http-logging.js"
 import type { Orchestrator, Work } from "./jobs/orchestrator.js"
 import type { Config, Logger } from "./types.js"
 import type { AdminWeb } from "./web/admin.js"
 
-const id = z.number().int().positive()
+const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
 const envelope = z.object({
   action: z.string().max(64).optional(),
   installation: z.object({ id }).optional(),
@@ -149,6 +150,26 @@ export function webhookWork(
         ? { kind: "assignment" as const, assigneeId: botId, createdAt: assignedAt }
         : undefined
   const label = data.label?.name
+  const retriage =
+    name === "issues" &&
+    action === "labeled" &&
+    label === RETRIAGE_LABEL &&
+    data.sender?.type === "User" &&
+    data.sender.id !== botId &&
+    /^[a-z\d-]+$/i.test(data.sender.login) &&
+    Number.isSafeInteger(assignedAt) &&
+    assignedAt >= 0 &&
+    data.issue.contentHash
+      ? {
+          candidateKey: retriageCandidateKey(
+            { ...repo, issueId: data.issue.id, number: data.issue.number },
+            data.sender,
+            assignedAt,
+            data.issue.contentHash,
+          ),
+          createdAt: assignedAt,
+        }
+      : undefined
   const cancel =
     ["closed", "deleted", "unassigned"].includes(action) ||
     (action === "unlabeled" && label === "bot:approved") ||
@@ -162,7 +183,9 @@ export function webhookWork(
     ...(action !== "deleted" && Number.isFinite(name === "issue_comment" ? updatedAt : assignedAt)
       ? { changedAt: name === "issue_comment" ? updatedAt : assignedAt }
       : {}),
-    ...(request ? { request, requestIssueHash: data.issue.contentHash } : {}),
+    ...(request ? { request } : {}),
+    ...(retriage ? { retriage } : {}),
+    ...(request || retriage ? { requestIssueHash: data.issue.contentHash } : {}),
     material: name === "issue_comment" || action === "edited" || action === "reopened",
     cancel,
   }

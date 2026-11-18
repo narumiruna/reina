@@ -213,8 +213,9 @@ socket binds are required. Build-time transitive OS/npm packages are resolved du
 the approved immutable image binds their actual contents. Remote Docker daemons and Docker Desktop
 are unsupported by this deployment layout. OrbStack is unverified.
 
-Assessment cycles have a persisted three-attempt budget, separate from successful fix-candidate
-renewal after 24 hours. Failed cycles do not renew on a timer. See [issue triage](#issue-triage).
+Automatic assessment has one durable initial allowance per issue. Later inference requires a
+fresh permitted human request, including after failure or expiry. Scans and publication repair
+never renew the allowance. See [issue triage](#issue-triage).
 Discovery scans use a durable page cursor so skipped or previously assessed issues do not
 permanently hide older issues. Stored-review reconciliation has its own rotating cursor and the
 same per-scan issue limit; it does not depend on open-issue discovery.
@@ -422,7 +423,7 @@ fingerprint; intake ignores Reina's own comment and status-label events. Issue e
 and non-Reina comment creation/edit/deletion trigger current-evidence checks without a feedback loop.
 
 Observed evidence changes invalidate the old projection. Stale labels are removed and an existing
-summary is marked stale before replacement inference. Complete evidence, issue identity/state,
+summary is marked stale without automatically starting replacement inference. Complete evidence, issue identity/state,
 `bot:skip`, and base are checked again before a successful result is published. Changed results are
 discarded as current evidence, not marked reviewed. GitHub writes cannot be atomic with issue edits;
 later intake and scans repair races. A reviewed label never proves freshness for execution.
@@ -433,22 +434,25 @@ marks an existing summary inactive. Deleted/unavailable or incomplete evidence i
 stored review with a safe reason; failed reads/writes are not reported as successful cleanup.
 Excluded or incompletely read issues do not start inference. Recovery does not require their return
 in open-issue discovery. Evidence-read diagnostics are separate from the model-attempt failure.
-A temporary read failure preserves the consumed attempts and retry deadline. Complete evidence
-clears that diagnostic, but does not reopen a permanent or exhausted failure.
+A temporary read failure preserves consumed inference authority. Complete evidence clears that
+diagnostic, but does not reopen a failed or interrupted invocation.
 
 After a same-owner repository rename, the operator must update the configured name. A stored
 review can retain its old name during intake invalidation. Only a successful live GitHub read
 with unchanged repository ID, installation ID, owner, issue ID, and issue number can rebind that
 name. Rebinding uses revision CAS, invalidates old proposal/job authority in the same transaction,
-and requires a fresh policy-bound assessment. Old approval and job references remain immutable.
+and requires an explicit human request for any fresh assessment. Old approval and job references remain immutable.
 Owner transfers and cross-repository moves are not supported.
 
 ### Attempts and publication recovery
 
 Review states are `pending`, `running`, `assessed` (validated but unpublished), `complete`, `stale`,
-and `failed`. The store persists the binding, cycle revision, attempt count, retry deadline, safe
-failure code, validated result, comment identity, and publication intent/confirmation. It keeps one
-bounded current record per issue, not raw prompts, model streams, credentials, or extra snapshots.
+and `failed`. The store persists the binding, cycle revision, historical attempt count, safe
+failure code, validated result, comment identity, and publication intent/confirmation. A separate
+permanent issue marker prevents a new revision from restoring automatic inference eligibility.
+Explicit read-only admissions retain their unique source, binding, state, and one-use cleanup
+intent. It keeps one bounded current review per issue, not raw prompts, model streams, credentials,
+or extra snapshots.
 The immutable review/result representation must fit 60 KiB, reserving 4 KiB of the 64 KiB
 whole-record limit for mutable lifecycle metadata. This measurement is identical before and
 after publication or invalidation. Escaped comments must also fit their publication limit. Restored near-limit assessments
@@ -456,22 +460,46 @@ fail safely or are compacted during invalidation, without blocking durable revoc
 Legacy `assessments` hashes are attempt history, not completed reviews. Delivery acceptance,
 proposal revocation, and review invalidation commit in one transaction before active work is aborted.
 
-Each cycle permits at most three model attempts. Host-observed HTTP 408/429/5xx, allowlisted
-transport failures, and request deadlines can use one-minute then five-minute delays. The gateway
-passes only safe transient classification to the triage controller; generic Pi errors, authentication
-rejections, invalid output, local limits, and unavailable isolation do not grant retries.
-Request intake has a 30-second bound. After intake, an absolute 60-second provider deadline closes
-the worker response and records trusted timeout evidence, even if streaming heartbeats continue.
-Cancellation, gateway expiry, and revocation do not grant a timeout retry.
-An interrupted attempt consumes the persisted budget. Duplicate delivery, restart, and manual
-label changes cannot reset attempts. A failed cycle stays suppressed until evidence or policy
-changes. Successful non-fix results do not expire daily. A successful `fix_candidate` can start a
-new cycle after 24 hours; this is a new assessment and proposal requiring fresh approval, not a
-retry or a timestamp extension. There is no lifetime three-cycle limit on successful renewal.
-Revoking a candidate proposal or closing/reopening it also requires a fresh assessment before a
-replacement proposal. A host review-cycle UUID binds the replacement hash even in the same second;
-legacy callers without this value keep their original hash and stored proposal format.
-Existing single-slot execution, cancellation, worker limits, and GitHub cooldowns still apply.
+The initial automatic invocation is claimed atomically before entering the triage runtime.
+An explicit human admission also reserves the initial allowance, preventing a later scan from
+adding an automatic invocation. A claimed invocation is never refunded, even if a worker fails
+before contacting the provider or a process loses an uncertain result. Timeout, transport/model
+errors, interruption, invalid output, and isolation failures do not schedule another assessment.
+A single invocation can still use read-only tool continuation; this is not a one-HTTP-request cap.
+The existing 30-second request-intake and absolute 60-second provider deadlines remain enforced.
+
+A human with current write, maintain, or admin permission can add `bot:retriage` to request a
+read-only reassessment. The signed webhook is a candidate, not authority. Live numeric identity,
+issue eligibility, human permission, source content, and a unique current label-history transition
+are checked. The normalized candidate digest and authoritative event identity are durable replay
+keys, independent of delivery GUID. Timestamp disagreement, same-time human transition ambiguity,
+unsafe IDs, incomplete history, and more than 1,000 raw issue events fail closed. Pre-existing
+label presence is not a request. Requests expire after 24 hours; deferred work cannot silently
+change its evidence/base/policy binding.
+
+Admission commits before trigger removal. A durable one-use cleanup intent commits before DELETE;
+known bot-owned cleanup can reconcile a restart without another write. An uncertain response or
+replacement race cannot authorize blind removal or inference. A maintainer may need to remove
+and re-add the trigger after such a failure. The publisher never adds this trigger and it is not
+part of `REVIEW_LABELS`. Bot cleanup is not a new request or a revocation of its own admission.
+Closure, skip, permission loss, and newer or same-time material changes revoke pending authority.
+An older event does not revoke an exact newer retriage receipt while it is pending. After the
+claim, only a match to the current review revision preserves the work. Confirmed evidence changes
+still invalidate the result. A retryable issue read preserves an unused direct grant for the same
+bound receipt. Saved-result publication does not require another model invocation. Terminal
+retriage failures log bounded reason codes, not raw GitHub errors.
+
+The retriage handler ends after read-only publication and cannot execute code or create a PR.
+It revokes old proposal/job authority and persists a per-issue cutoff against older coding
+requests, including deliveries not received yet, rather than letting its result revive them.
+A subsequent direct coding request must be created strictly after that retriage transition;
+same-second ordering fails closed. Existing explicit coding requests remain separate: they reuse a
+current result or authorize one needed assessment, then follow their normal coding checks.
+A later scan can publish a proposal from a current fix candidate. Coding still requires fresh,
+valid authority for that proposal. Ordinary comments, label repair, reopening, settings changes,
+and 24-hour proposal expiry do not grant reassessment. A host review-cycle UUID still binds each
+replacement proposal; timestamps are never extended to claim freshness. Existing single-slot
+execution, cancellation, worker limits, and GitHub cooldowns apply.
 
 Publication retries use the saved assessment, not another model call. The publisher checks
 repository, issue, installation, bot authorship, stable issue marker, and stored comment ID before
@@ -575,35 +603,47 @@ SQLite stores reviews, proposals, consumed approval events, inbox deliveries, jo
 It uses foreign keys, WAL, full synchronous durability, and an independent process-lifetime
 SQLite lock. The OS releases that lock after a crash. The directory is service-owned and private.
 Ephemeral storage, network filesystems, and multiple service instances are unsupported.
-Job database `reina.sqlite` schema 6 retains schema-5 reviews and their separate cursor, as well
-as schema-4 cooldown separation. Its transactional 5-to-6 migration adds indexed receipt keys and
-an explicit `request_epoch` cutoff. Valid retained sources are backfilled. Legacy unbound pending
-requests are completed without coding because their original baseline cannot be proved. Unknown
-sources created at or before the upgrade cutoff require a new human request: old completed
-receipts no longer contain enough data to reconstruct their identity. Known bound pending sources
-retain their original bindings. Fresh databases have no legacy cutoff.
+Job database `reina.sqlite` schema 7 retains reviews, cursors, cooldown separation, coding request
+receipts, and the schema-6 `request_epoch`. Its transactional migration adds permanent initial
+allowance markers, separate read-only admissions, per-issue coding-request cutoffs, and
+label/automatic admission baselines.
+Known legacy reviews, proposals, and jobs reserve initial eligibility. This includes zero-attempt
+pending reviews: a prior replacement cycle may have overwritten an earlier attempt. Running or
+previously attempted pending inference becomes failed without retry; saved results can publish.
+Historical counts of two or three remain history, not a new budget.
 
-Existing claimed approvals and publication records remain intact; no review completion or approval
-is fabricated. Migration failure rolls back. This is separate from encrypted `settings.sqlite`
-schema 3. Stop the service and take a consistent backup before an upgrade. Older binaries cannot
-open schema 6: a downgrade needs the matching pre-upgrade application and state backup, not manual
-removal of receipt keys, source fields, or consumed event IDs.
+Opaque legacy attempt hashes cannot identify every previously assessed issue. After upgrade,
+uncertain issues created at or before the automatic cutoff require an explicit human request.
+Only authoritative creation time after that cutoff proves new-issue initial eligibility; absent
+creation time fails closed. Fresh databases do not impose this legacy automatic cutoff. Every
+persisted label baseline also excludes pre-existing label requests. Label candidates have
+separate durable replay identities, including rejected deliveries; they never become coding
+request receipts or approval authority. Existing coding request baselines remain unchanged.
+
+No review completion or approval is fabricated. Existing claimed approvals and publication records
+remain intact. Migration failure rolls back. Encrypted `settings.sqlite` remains at schema 3.
+Stop the service and take a consistent backup before upgrade. Older binaries cannot open schema 7.
+A downgrade needs matching pre-upgrade application/state backups, not deleted receipts or lowered
+schema numbers. Older code also restores its automatic retry/renewal policy; keep dispatch stopped
+if the single-shot guarantee is required. Restoring older state loses later one-use claims and does not undo remote writes;
+keep dispatch stopped until remote state and replay baselines are reconciled.
 
 Normal job states are approved, working, validating, publishing, and pr_ready. Failed and
 cancelled jobs cannot resume coding. The public labels are projections of state:
 
-| Label               | Meaning                                                                                    |
-| ------------------- | ------------------------------------------------------------------------------------------ |
-| `bot:triaged`       | A validated assessment was published for the stored reviewed version, not merely attempted |
-| `bot:needs-info`    | Successful triage needs more evidence; mutually exclusive with `bot:needs-human`           |
-| `bot:needs-human`   | Successful triage requires a maintainer decision; not a coding failure                     |
-| `bot:triage-failed` | Assessment failed without a valid current result; not `bot:triaged`                        |
-| `fix_available`     | A concrete fix proposal has been confirmed                                                 |
-| `bot:approved`      | A human added a label approval transition; direct requests use separate validated evidence |
-| `bot:working`       | Coding, validation, or publication is in progress                                          |
-| `bot:pr_ready`      | A confirmed draft PR exists                                                                |
-| `bot:failed`        | An attempt failed or publication needs recovery                                            |
-| `bot:skip`          | Maintainer-controlled exclusion; Reina never removes it                                    |
+| Label               | Meaning                                                                                     |
+| ------------------- | ------------------------------------------------------------------------------------------- |
+| `bot:triaged`       | A validated assessment was published for the stored reviewed version, not merely attempted  |
+| `bot:needs-info`    | Successful triage needs more evidence; mutually exclusive with `bot:needs-human`            |
+| `bot:needs-human`   | Successful triage requires a maintainer decision; not a coding failure                      |
+| `bot:triage-failed` | Assessment failed without a valid current result; not `bot:triaged`                         |
+| `bot:retriage`      | One-shot permitted human request for read-only reassessment; bot removes it after admission |
+| `fix_available`     | A concrete fix proposal has been confirmed                                                  |
+| `bot:approved`      | A human added a label approval transition; direct requests use separate validated evidence  |
+| `bot:working`       | Coding, validation, or publication is in progress                                           |
+| `bot:pr_ready`      | A confirmed draft PR exists                                                                 |
+| `bot:failed`        | An attempt failed or publication needs recovery                                             |
+| `bot:skip`          | Maintainer-controlled exclusion; Reina never removes it                                     |
 
 Live GitHub checks occur immediately before execution and publication. Received revocations,
 material edits, closure, and access loss cancel pending work and interrupt running containers.
@@ -658,7 +698,7 @@ changed, do not resume remote writes. Existing remote effects require operator r
    - There is no built-in key rotation. Do not blindly regenerate the key; replacing the environment
      value does not re-encrypt existing state. See [credential recovery](admin-webui.md#secret-storage-and-recovery).
 3. Version and restore the application, compatible databases, and original encryption key together.
-   A downgrade after job schema 6 or settings schema 3 requires matching pre-upgrade backups;
+   A downgrade after job schema 7 or settings schema 3 requires matching pre-upgrade backups;
    never lower schema versions or delete review, approval, job, or OAuth records by hand.
    Restored backups can restore old provider credentials and sessions. Revoke affected sessions
    and review provider authorization before enabling dispatch.
@@ -667,12 +707,15 @@ changed, do not resume remote writes. Existing remote effects require operator r
    branches/PRs and triage comments/labels before enabling work. Restoring SQLite does not undo
    GitHub writes or guarantee that restored review projections are current. Preserve maintainer
    labels and immutable proposal evidence. Labels cannot reconstruct authorization.
-5. For an interrupted coding attempt, inspect its failure and have a maintainer remove/re-add
-   approval only if the proposal is still current. Otherwise wait for a new proposal.
+5. For an interrupted coding attempt, inspect its failure. If the proposal is still current, have
+   a maintainer remove and re-add `bot:approved`. If the proposal expired or is otherwise stale,
+   have a permitted maintainer add `bot:retriage`. If that label is already present, remove it and
+   then re-add it. Review and separately approve any new proposal. Alternatively, submit a fresh
+   authorized direct coding request.
 6. For unknown publication, inspect the stored intent and matching GitHub resources. Do not
    delete a branch/PR or reset an intent without explicit maintainer authorization.
 7. On rollback, stop scans/dispatch, cancel workers, preserve resource IDs, and restore a compatible
-   application. Older binaries cannot open job schema 6 or interpret its request receipt state.
+   application. Older binaries cannot open job schema 7 or interpret its admission/receipt state.
    Restore a matching state backup before using an older version. Do not automatically close
    existing PRs or delete branches.
 
@@ -749,7 +792,7 @@ application type checking. Recheck this workaround when upgrading Probot or Node
 
 ### External acceptance owners
 
-1. **App owner:** register and install the App, create all ten label definitions, and confirm
+1. **App owner:** register and install the App, create all eleven label definitions, and confirm
    minimum permissions, subscribed events, installation authentication, and signed delivery.
    Supply App credentials securely; upload the PEM through the authenticated UI.
 2. **Pocket ID account owner and realm operator:** configure the confidential client, exact

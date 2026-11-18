@@ -16,7 +16,7 @@ import { backup, DatabaseSync } from "node:sqlite"
 import { fileURLToPath } from "node:url"
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 import { loadConfig, loadRuntimeConfig } from "../src/config.js"
-import { type RequestBinding, Store } from "../src/jobs/store.js"
+import { type RequestBinding, Store, type TriageAdmission } from "../src/jobs/store.js"
 import { dispatchInputSchema, dispatchSettingsSchema } from "../src/settings/dispatch.js"
 import {
   allowedPath,
@@ -200,6 +200,46 @@ function pendingReview(value: Proposal): Review {
     updatedAt: value.createdAt,
     nextAttemptAt: 0,
   }
+}
+
+function triageAdmission(
+  review: Review,
+  source = `fix-comment:${review.ref.id}:${review.ref.issueId}:300`,
+  candidateKey?: string,
+): TriageAdmission {
+  return {
+    source,
+    ref: review.ref,
+    binding: review.binding,
+    createdAt: Date.now(),
+    ...(candidateKey === undefined ? {} : { candidateKey }),
+  }
+}
+
+function retriageAdmission(review: Review, eventId = 700, candidateKey = "a".repeat(64)) {
+  const { ref } = review
+  return triageAdmission(
+    review,
+    `retriage:${ref.installationId}:${ref.id}:${ref.issueId}:${ref.number}:${eventId}`,
+    candidateKey,
+  )
+}
+
+function acceptRetriage(store: Store, admission: TriageAdmission, id = "candidate-guid") {
+  const payload = {
+    kind: "issue",
+    ref: admission.ref,
+    actor: { id: 50, login: "maintainer", type: "User" },
+    retriage: { candidateKey: required(admission.candidateKey), createdAt: admission.createdAt },
+  }
+  expect(store.acceptDelivery(id, payload).queued).toBe(true)
+  return id
+}
+
+function dropTriageTables(db: DatabaseSync): void {
+  db.exec(
+    "DROP TABLE triage_admissions; DROP TABLE triage_initial; DROP TABLE triage_epoch; DROP TABLE triage_coding_cutoffs;",
+  )
 }
 
 function inspect<T>(operation: (db: DatabaseSync) => T): T {
@@ -479,7 +519,12 @@ describe("durable request sources and selective revocation", () => {
       )
       expect(result.queued).toBe(false)
       expect(result.revocations).toEqual([
-        { ref: value.ref, preservedJobIds: [], preservedBindings: bound ? [binding(value)] : [] },
+        {
+          ref: value.ref,
+          preservedJobIds: [],
+          preservedBindings: bound ? [binding(value)] : [],
+          preservedTriageSources: [],
+        },
       ])
       expect(store.job(job.id)?.state).toBe("cancelled")
       expect(store.proposal(value.ref)).toEqual(bound ? value : undefined)
@@ -524,7 +569,12 @@ describe("durable request sources and selective revocation", () => {
       expect(result).toEqual({
         queued: false,
         revocations: [
-          { ref: value.ref, preservedJobIds: [job.id], preservedBindings: [binding(value)] },
+          {
+            ref: value.ref,
+            preservedJobIds: [job.id],
+            preservedBindings: [binding(value)],
+            preservedTriageSources: [],
+          },
         ],
         reviews: [],
       })
@@ -610,6 +660,10 @@ describe("durable request sources and selective revocation", () => {
     const bound = directApproval(value, "comment")
     const boundId = acceptRequest(store, value, bound, "legacy-bound")
     const boundPayload = required(store.deliveries().find((item) => item.id === boundId)).payload
+    const boundRequest = required(bound.request)
+    if (boundRequest.kind !== "comment") throw new Error("Expected a comment fixture")
+    const review = pendingReview(value)
+    const grant = { ...triageAdmission(review), createdAt: boundRequest.createdAt }
     const unbound = {
       kind: "issue",
       ref: issue(2).ref,
@@ -624,16 +678,17 @@ describe("durable request sources and selective revocation", () => {
     store.acceptDelivery("legacy-failed", failed)
     for (let attempt = 0; attempt < 8; attempt++) store.deferDelivery("legacy-failed", 5_000)
     const deadline = store.blockedUntil()
-    store.saveReview(pendingReview(value))
+    store.saveReview(review)
     store.saveScanPage(17)
     store.close()
     const db = new DatabaseSync(join(directory, "state", "reina.sqlite"))
+    dropTriageTables(db)
     db.exec(`DROP TABLE request_epoch; DROP INDEX deliveries_by_request;
       ALTER TABLE deliveries DROP COLUMN request_key; PRAGMA user_version = 5;`)
     db.close()
     vi.setSystemTime(initial + 1_000)
     store = openStore()
-    expect(inspect((db) => db.prepare("PRAGMA user_version").get()?.user_version)).toBe(6)
+    expect(inspect((db) => db.prepare("PRAGMA user_version").get()?.user_version)).toBe(7)
     expect(
       inspect((db) => db.prepare("SELECT reject_before FROM request_epoch").get()?.reject_before),
     ).toBe(initial + 1_000)
@@ -654,6 +709,28 @@ describe("durable request sources and selective revocation", () => {
     expect(
       inspect((db) => db.prepare("SELECT COUNT(*) AS count FROM approvals").get()?.count),
     ).toBe(0)
+    const receipt = { deliveryId: boundId, request: boundRequest }
+    expect(store.admitTriage(grant)).toBe(false)
+    expect(store.admitTriage(grant, { ...receipt, deliveryId: "legacy-lost" })).toBe(false)
+    expect(store.admitTriage(grant, { ...receipt, deliveryId: "legacy-failed" })).toBe(false)
+    expect(
+      store.admitTriage(grant, {
+        ...receipt,
+        request: { ...boundRequest, bodyHash: "d".repeat(64) },
+      }),
+    ).toBe(false)
+    expect(store.admitTriage({ ...grant, ref: issue(5).ref }, receipt)).toBe(false)
+    expect(store.admitTriage({ ...grant, source: `${grant.source}1` }, receipt)).toBe(false)
+    expect(
+      store.admitTriage(
+        { ...grant, binding: { ...grant.binding, baseSha: "b".repeat(40) } },
+        receipt,
+      ),
+    ).toBe(false)
+    expect(store.acceptDelivery("replay-bound", boundPayload).queued).toBe(false)
+    expect(store.admitTriage(grant, receipt)).toBe(true)
+    expect(store.claimTriage(review, grant.source)?.state).toBe("running")
+    expect(store.admitTriage(grant, receipt)).toBe(false)
     expect(store.claim(value, bound, boundId)).toBeDefined()
     const atCutoff = {
       ...unbound,
@@ -669,6 +746,42 @@ describe("durable request sources and selective revocation", () => {
     expect(store.acceptDelivery("lost-after-restart", lost).queued).toBe(false)
   })
 
+  test.each(["approval", "attempt", "retirement"])(
+    "the migrated receipt exception does not renew a source with %s evidence",
+    (evidence) => {
+      vi.useFakeTimers()
+      vi.setSystemTime(1_800_000_000_000)
+      let store = openStore()
+      const value = proposal()
+      const approval = directApproval(value, "assignment")
+      const request = required(approval.request)
+      const id = acceptRequest(store, value, approval, "legacy-assignment")
+      const review = pendingReview(value)
+      if (evidence === "approval") {
+        store.saveProposal(value)
+        expect(store.claim(value, approval, id)).toBeDefined()
+      } else if (evidence === "attempt") {
+        store.saveReview(review)
+        expect(store.claimTriage(review)?.state).toBe("running")
+      }
+      store.close()
+      const db = new DatabaseSync(join(directory, "state", "reina.sqlite"))
+      dropTriageTables(db)
+      db.exec(`DROP TABLE request_epoch; DROP INDEX deliveries_by_request;
+        ALTER TABLE deliveries DROP COLUMN request_key; PRAGMA user_version = 5;`)
+      db.close()
+      vi.advanceTimersByTime(1)
+      store = openStore()
+      if (evidence === "retirement") store.retireCodingRequests(value.ref, request.createdAt)
+      const grant = {
+        ...triageAdmission(review, `fix-assignment:${review.ref.id}:${review.ref.issueId}:300`),
+        createdAt: request.createdAt,
+      }
+      expect(store.admitTriage(grant, { deliveryId: id, request })).toBe(false)
+      expect(store.triageAdmission(grant.source)).toBeUndefined()
+    },
+  )
+
   test("schema 5 migration rolls back its column, epoch and source cleanup together", () => {
     let store = openStore()
     const payload = {
@@ -681,6 +794,7 @@ describe("durable request sources and selective revocation", () => {
     store.close()
     const path = join(directory, "state", "reina.sqlite")
     const db = new DatabaseSync(path)
+    dropTriageTables(db)
     db.exec(`DROP TABLE request_epoch; DROP INDEX deliveries_by_request;
       ALTER TABLE deliveries DROP COLUMN request_key; PRAGMA user_version = 5;`)
     db.prepare("UPDATE deliveries SET payload = ? WHERE id = 'corrupt'").run("{")
@@ -726,6 +840,886 @@ describe("durable request sources and selective revocation", () => {
     db.prepare("UPDATE deliveries SET request_key = NULL WHERE id = ?").run(source)
     db.close()
     expect(store.acceptDelivery("legacy-approval-replay", payload).queued).toBe(false)
+  })
+})
+
+describe("single-shot triage grants", () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_800_000_000_000)
+  })
+
+  test("atomically claims the current initial review once and never retries after restart", async () => {
+    let store = openStore()
+    const review = pendingReview(proposal())
+    expect(store.automaticTriageAllowed(review.ref)).toBe(true)
+    expect(store.saveReview(review)).toBe(true)
+    const claims = await Promise.all(
+      Array.from({ length: 20 }, () => Promise.resolve().then(() => store.claimTriage(review))),
+    )
+    expect(claims.filter(Boolean)).toHaveLength(1)
+    const running = required(claims.find(Boolean))
+    expect(running).toMatchObject({ state: "running", attempts: 1, nextAttemptAt: 0 })
+    expect(store.review(review.ref)).toEqual(running)
+    expect(store.claimTriage(review)).toBeUndefined()
+    expect(store.claimTriage(running)).toBeUndefined()
+    expect(store.automaticTriageAllowed(review.ref)).toBe(false)
+    store.close()
+    store = openStore()
+    const failed = required(store.review(review.ref))
+    expect(failed).toMatchObject({
+      state: "failed",
+      attempts: 1,
+      error: "triage_interrupted",
+      nextAttemptAt: 0,
+    })
+    const replacement = { ...review, revision: randomUUID(), updatedAt: failed.updatedAt }
+    expect(store.saveReview(replacement, failed.revision)).toBe(true)
+    expect(store.claimTriage(replacement)).toBeUndefined()
+    const admission = triageAdmission(replacement)
+    expect(store.admitTriage(admission)).toBe(true)
+    expect(store.claimTriage(replacement, admission.source)?.state).toBe("running")
+    expect(store.triageAdmission(admission.source)?.status).toBe("claimed")
+    expect(store.claimTriage(replacement, admission.source)).toBeUndefined()
+    expect(store.admitTriage(admission)).toBe(false)
+    expect(store.jobs()).toEqual([])
+    expect(
+      inspect((db) => db.prepare("SELECT COUNT(*) AS count FROM approvals").get()?.count),
+    ).toBe(0)
+  })
+
+  test("admission reserves initial eligibility, is idempotent only while identical and pending", () => {
+    let store = openStore()
+    const review = pendingReview(proposal())
+    vi.advanceTimersByTime(1)
+    const admission = retriageAdmission(review)
+    const id = acceptRetriage(store, admission)
+    expect(store.admitTriage(admission)).toBe(false)
+    expect(store.beginRetriage(admission, "missing-receipt")).toBe(false)
+    expect(store.beginRetriage(admission, id)).toBe(true)
+    expect(store.beginRetriage(admission, id)).toBe(true)
+    expect(store.automaticTriageAllowed(review.ref)).toBe(false)
+    for (const conflict of [
+      { ...admission, createdAt: admission.createdAt - 1 },
+      { ...admission, ref: { ...review.ref, installationId: 999 } },
+      { ...admission, binding: { ...review.binding, fingerprint: "f".repeat(64) } },
+      { ...admission, candidateKey: "b".repeat(64) },
+      retriageAdmission(review, 701),
+    ])
+      expect(store.beginRetriage(conflict, id)).toBe(false)
+    expect(store.triageAdmissionForCandidate(required(admission.candidateKey))).toEqual({
+      ...admission,
+      status: "pending",
+      cleanupIntent: false,
+    })
+    store.revokeTriage(admission.source)
+    store.revokeTriage(admission.source)
+    expect(store.beginRetriage(admission, id)).toBe(false)
+    store.close()
+    store = openStore()
+    expect(store.triageAdmission(admission.source)?.status).toBe("revoked")
+    expect(store.beginRetriage(retriageAdmission(review, 702), id)).toBe(false)
+    expect(store.automaticTriageAllowed(review.ref)).toBe(false)
+    vi.advanceTimersByTime(1)
+    const fresh = retriageAdmission(review, 703, "b".repeat(64))
+    expect(store.beginRetriage(fresh, acceptRetriage(store, fresh, "fresh-candidate"))).toBe(true)
+  })
+
+  test("the label baseline rejects old and same-time candidates but not fresh-database fix sources", () => {
+    const store = openStore()
+    const review = pendingReview(proposal())
+    const label = retriageAdmission(review)
+    expect(store.beginRetriage(label, "missing-candidate")).toBe(false)
+    expect(store.automaticTriageAllowed(review.ref)).toBe(true)
+    const fix = { ...triageAdmission(review), createdAt: label.createdAt - 10_000 }
+    expect(store.admitTriage(fix)).toBe(true)
+    vi.advanceTimersByTime(1)
+    const fresh = { ...label, createdAt: Date.now() }
+    const id = acceptRetriage(store, fresh)
+    expect(store.beginRetriage(label, id)).toBe(false)
+    expect(store.beginRetriage({ ...label, createdAt: label.createdAt - 1 }, id)).toBe(false)
+    expect(store.beginRetriage({ ...fresh, createdAt: fresh.createdAt + 1 }, id)).toBe(false)
+    expect(store.beginRetriage(fresh, id)).toBe(true)
+  })
+
+  test.each(["complete", "exhausted", "revoked"] as const)(
+    "rejected label candidate receipts survive %s and a changed GUID/envelope",
+    (outcome) => {
+      let store = openStore()
+      vi.advanceTimersByTime(1)
+      const payload = {
+        kind: "issue",
+        ref: issue().ref,
+        actor: { id: 50, login: "maintainer", type: "User" },
+        retriage: { candidateKey: "a".repeat(64), createdAt: Date.now() },
+      }
+      expect(store.acceptDelivery("candidate-guid", payload).queued).toBe(true)
+      if (outcome === "complete") store.completeDelivery("candidate-guid")
+      else if (outcome === "exhausted")
+        for (let attempt = 0; attempt < 8; attempt++) store.deferDelivery("candidate-guid", 0)
+      else
+        store.acceptDelivery(
+          "cancel-candidate",
+          { kind: "issue", ref: payload.ref, cancel: true },
+          [payload.ref],
+        )
+      expect(
+        inspect(
+          (db) =>
+            db.prepare("SELECT status FROM deliveries WHERE id = 'candidate-guid'").get()?.status,
+        ),
+      ).toBe(outcome === "exhausted" ? "failed" : "complete")
+      store.completeDelivery("cancel-candidate")
+      store.close()
+      store = openStore()
+      expect(
+        store.acceptDelivery("different-guid", {
+          ...payload,
+          actor: { ...payload.actor, login: "renamed-maintainer" },
+          ref: { ...payload.ref, name: "renamed-project", installationId: 999 },
+        }).queued,
+      ).toBe(false)
+      expect(store.deliveries()).toEqual([])
+      expect(store.triageAdmissionForCandidate(payload.retriage.candidateKey)).toBeUndefined()
+      expect(store.automaticTriageAllowed(payload.ref)).toBe(true)
+      expect(() => store.bindRequest("different-guid", binding(proposal()))).toThrow(
+        "job_cancelled",
+      )
+      expect(
+        inspect(
+          (db) =>
+            db.prepare("SELECT request_key FROM deliveries WHERE id = 'candidate-guid'").get()
+              ?.request_key,
+        ),
+      ).toMatch(/^[a-f0-9]{64}$/)
+      expect(store.jobs()).toEqual([])
+    },
+  )
+
+  test.each(["material", "cancel"] as const)(
+    "%s intake seals queued retriage and cannot be raced by admission",
+    (change) => {
+      let store = openStore()
+      const review = pendingReview(proposal())
+      vi.advanceTimersByTime(1)
+      const older = retriageAdmission(review)
+      const olderId = acceptRetriage(store, older, "queued-retriage")
+      const cutoff = Date.now()
+      vi.advanceTimersByTime(1)
+      const newer = retriageAdmission(review, 701, "b".repeat(64))
+      const newerId = acceptRetriage(store, newer, "newer-queued-retriage")
+      const unrelated = retriageAdmission(pendingReview(proposal(2)), 702, "c".repeat(64))
+      const unrelatedId = acceptRetriage(store, unrelated, "unrelated-queued-retriage")
+      const payload = required(store.deliveries().find(({ id }) => id === olderId)).payload
+      store.acceptDelivery(
+        "revoke-queued-retriage",
+        { kind: "issue", ref: review.ref, [change]: true, changedAt: cutoff },
+        [review.ref],
+      )
+      expect(store.beginRetriage(older, olderId)).toBe(false)
+      expect(store.beginRetriage(newer, olderId)).toBe(false)
+      expect(store.triageAdmissionForCandidate(required(older.candidateKey))).toBeUndefined()
+      expect(store.automaticTriageAllowed(review.ref)).toBe(true)
+      store.close()
+      store = openStore()
+      expect(store.acceptDelivery("replay-revoked-queued-retriage", payload).queued).toBe(false)
+      expect(store.beginRetriage(older, olderId)).toBe(false)
+      expect(store.beginRetriage(newer, newerId)).toBe(true)
+      expect(store.beginRetriage(unrelated, unrelatedId)).toBe(true)
+    },
+  )
+
+  test("old label deliveries are sealed at the startup baseline and never bind coding authority", () => {
+    const store = openStore()
+    const payload = {
+      kind: "issue",
+      ref: issue().ref,
+      actor: { id: 50, login: "maintainer", type: "User" },
+      retriage: { candidateKey: "a".repeat(64), createdAt: Date.now() },
+    }
+    expect(store.acceptDelivery("old-candidate", payload).queued).toBe(false)
+    vi.advanceTimersByTime(1)
+    expect(store.acceptDelivery("new-guid-old-candidate", payload).queued).toBe(false)
+    const fresh = { ...payload, retriage: { candidateKey: "b".repeat(64), createdAt: Date.now() } }
+    expect(store.acceptDelivery("fresh-candidate", fresh).queued).toBe(true)
+    expect(() => store.bindRequest("fresh-candidate", binding(proposal()))).toThrow(
+      "proposal_stale",
+    )
+    expect(store.triageAdmissionForCandidate(fresh.retriage.candidateKey)).toBeUndefined()
+  })
+
+  test("claim rejects stale CAS, bindings and identity without consuming the explicit grant", () => {
+    const store = openStore()
+    const review = pendingReview(proposal())
+    store.saveReview(review)
+    const admission = triageAdmission(review)
+    store.admitTriage(admission)
+    for (const changed of [
+      { ...review, revision: randomUUID() },
+      { ...review, updatedAt: review.updatedAt + 1 },
+      { ...review, ref: { ...review.ref, id: 999 } },
+      { ...review, ref: { ...review.ref, issueId: 999 } },
+      { ...review, ref: { ...review.ref, number: 999 } },
+      { ...review, ref: { ...review.ref, installationId: 999 } },
+      { ...review, ref: { ...review.ref, owner: "other" } },
+      { ...review, ref: { ...review.ref, name: "other" } },
+      ...[
+        { fingerprint: "f".repeat(64) },
+        { baseSha: "e".repeat(40) },
+        { baseBranch: "other" },
+        { policyHash: "d".repeat(64) },
+        { protocolRevision: "other" },
+      ].map((pins) => ({ ...review, binding: { ...review.binding, ...pins } })),
+    ]) {
+      expect(store.claimTriage(changed, admission.source)).toBeUndefined()
+      expect(store.triageAdmission(admission.source)?.status).toBe("pending")
+      expect(store.review(review.ref)).toEqual(review)
+    }
+    expect(store.claimTriage(review, "fix-comment:456:1001:missing")).toBeUndefined()
+    const mismatched = triageAdmission(
+      { ...review, binding: { ...review.binding, baseSha: "e".repeat(40) } },
+      "fix-comment:456:1001:301",
+    )
+    expect(store.admitTriage(mismatched)).toBe(true)
+    expect(store.claimTriage(review, mismatched.source)).toBeUndefined()
+    const wrongIssue = triageAdmission({ ...review, ref: issue(2).ref }, "fix-comment:456:1002:302")
+    expect(store.admitTriage(wrongIssue)).toBe(true)
+    expect(store.claimTriage(review, wrongIssue.source)).toBeUndefined()
+    expect(store.claimTriage(review, admission.source)?.state).toBe("running")
+    store.revokeTriage(admission.source)
+    expect(store.triageAdmission(admission.source)?.status).toBe("claimed")
+  })
+
+  test("proposal invalidation does not revoke a read-only grant; stale, cancellation and rename do", () => {
+    const store = openStore()
+    const value = proposal()
+    const review = pendingReview(value)
+    store.saveReview(review)
+    const admission = triageAdmission(review)
+    store.admitTriage(admission)
+    store.saveProposal(value)
+    store.invalidate(review.ref)
+    expect(store.triageAdmission(admission.source)?.status).toBe("pending")
+    expect(
+      store.saveReview({ ...review, state: "stale", inactiveReason: "changed" }, review.revision),
+    ).toBe(true)
+    expect(store.triageAdmission(admission.source)?.status).toBe("revoked")
+    const projectionGrant = triageAdmission(review, "fix-comment:456:1001:projection")
+    expect(store.admitTriage(projectionGrant)).toBe(true)
+    const stale = required(store.review(review.ref))
+    expect(store.saveReview({ ...stale, commentIntent: true }, stale.revision)).toBe(true)
+    expect(store.triageAdmission(projectionGrant.source)?.status).toBe("pending")
+    const replacement = { ...review, revision: randomUUID() }
+    store.saveReview(replacement, review.revision)
+    expect(store.triageAdmission(projectionGrant.source)?.status).toBe("pending")
+    const cancelled = triageAdmission(replacement, "fix-comment:456:1001:301")
+    store.admitTriage(cancelled)
+    store.cancel(review.ref)
+    expect(store.triageAdmission(cancelled.source)?.status).toBe("revoked")
+    const renamed = triageAdmission(replacement, "fix-comment:456:1001:302")
+    store.admitTriage(renamed)
+    expect(
+      store.rebindReview({ ...review.ref, name: "new-name" }, replacement.revision)?.state,
+    ).toBe("stale")
+    expect(store.triageAdmission(renamed.source)?.status).toBe("revoked")
+    for (const ref of [
+      review.ref,
+      { ...review.ref, name: "new-name" },
+      { ...review.ref, installationId: 999 },
+    ])
+      expect(store.automaticTriageAllowed(ref)).toBe(false)
+  })
+
+  test("material changes preserve only newer matching grants, including at equal timestamps", () => {
+    const store = openStore()
+    const value = proposal()
+    const review = pendingReview(value)
+    vi.advanceTimersByTime(1)
+    const older = retriageAdmission(review)
+    const olderId = acceptRetriage(store, older, "older-retriage")
+    vi.advanceTimersByTime(2)
+    const newer = retriageAdmission(review, 701, "b".repeat(64))
+    expect(store.beginRetriage(newer, acceptRetriage(store, newer, "newer-retriage"))).toBe(true)
+    expect(store.beginRetriage(older, olderId)).toBe(true)
+    store.saveReview(review)
+    store.saveProposal(value)
+    const oldJob = required(store.claim(value, approval(value)))
+    const change = (id: string, changedAt: number) =>
+      store.acceptDelivery(
+        id,
+        { kind: "issue", ref: review.ref, material: true, changedAt },
+        [review.ref],
+        [{ ref: review.ref, reason: "changed" }],
+      )
+    const delayed = change("older-material", newer.createdAt - 1)
+    expect(delayed.queued).toBe(false)
+    expect(delayed.revocations).toEqual([
+      {
+        ref: review.ref,
+        preservedJobIds: [],
+        preservedBindings: [],
+        preservedTriageSources: [newer.source],
+      },
+    ])
+    expect(store.triageAdmission(older.source)?.status).toBe("revoked")
+    expect(store.triageAdmission(newer.source)?.status).toBe("pending")
+    expect(store.review(review.ref)?.state).toBe("pending")
+    expect(store.proposal(review.ref)).toBeUndefined()
+    expect(store.job(oldJob.id)?.state).toBe("cancelled")
+    expect(change("same-time-material", newer.createdAt).queued).toBe(true)
+    expect(store.triageAdmission(newer.source)?.status).toBe("revoked")
+    expect(store.review(review.ref)?.state).toBe("stale")
+    expect(store.automaticTriageAllowed(review.ref)).toBe(false)
+  })
+
+  test("an older claimed source cannot preserve a different review revision", () => {
+    const store = openStore()
+    const review = pendingReview(proposal())
+    vi.advanceTimersByTime(1)
+    const admission = retriageAdmission(review)
+    const id = acceptRetriage(store, admission)
+    expect(store.beginRetriage(admission, id)).toBe(true)
+    expect(store.saveReview(review)).toBe(true)
+    expect(store.claimTriage(review, admission.source)?.state).toBe("running")
+    expect(store.triageAdmission(admission.source)?.claimRevision).toBe(review.revision)
+
+    const replacement = { ...review, revision: randomUUID(), updatedAt: Date.now() }
+    expect(store.saveReview(replacement, review.revision)).toBe(true)
+    const change = store.acceptDelivery(
+      "delayed-material-for-replacement",
+      { kind: "issue", ref: review.ref, material: true, changedAt: admission.createdAt - 1 },
+      [review.ref],
+      [{ ref: review.ref, reason: "changed" }],
+    )
+    expect(change.queued).toBe(true)
+    expect(change.revocations[0]?.preservedTriageSources).toEqual([])
+    expect(store.review(review.ref)?.state).toBe("stale")
+    expect(store.triageAdmission(admission.source)?.status).toBe("claimed")
+  })
+
+  test("admission and claim transactions roll back without partially spending a grant", () => {
+    const store = openStore()
+    const review = pendingReview(proposal())
+    store.saveReview(review)
+    const admission = triageAdmission(review)
+    const db = new DatabaseSync(join(directory, "state", "reina.sqlite"))
+    try {
+      db.exec(`CREATE TRIGGER reject_initial BEFORE INSERT ON triage_initial
+        BEGIN SELECT RAISE(ABORT,'fixture rollback'); END;`)
+      expect(() => store.admitTriage(admission)).toThrow("fixture rollback")
+      expect(store.triageAdmission(admission.source)).toBeUndefined()
+      expect(store.automaticTriageAllowed(review.ref)).toBe(true)
+      expect(() => store.claimTriage(review)).toThrow("fixture rollback")
+      expect(store.review(review.ref)).toEqual(review)
+      expect(store.automaticTriageAllowed(review.ref)).toBe(true)
+      db.exec("DROP TRIGGER reject_initial")
+      store.admitTriage(admission)
+      db.exec(`CREATE TRIGGER reject_running BEFORE UPDATE ON reviews
+        BEGIN SELECT RAISE(ABORT,'fixture rollback'); END;`)
+      expect(() => store.claimTriage(review, admission.source)).toThrow("fixture rollback")
+      expect(store.triageAdmission(admission.source)?.status).toBe("pending")
+      expect(store.review(review.ref)).toEqual(review)
+      db.exec("DROP TRIGGER reject_running")
+      expect(store.claimTriage(review, admission.source)?.state).toBe("running")
+    } finally {
+      db.close()
+    }
+  })
+
+  test("read-only admission retires old coding deliveries without spending newer or label sources", () => {
+    let store = openStore()
+    const ref = issue().ref
+    const cutoff = Date.now()
+    const older = {
+      kind: "issue",
+      ref,
+      request: {
+        kind: "comment",
+        commentId: 300,
+        bodyHash: "c".repeat(64),
+        createdAt: cutoff - 1,
+        updatedAt: cutoff - 1,
+      },
+    }
+    const equal = {
+      kind: "issue",
+      ref,
+      request: { kind: "assignment", assigneeId: 99, createdAt: cutoff },
+    }
+    store.acceptDelivery("older-fix", older)
+    store.acceptDelivery("same-time-fix", equal)
+    store.acceptDelivery("unrelated-fix", { ...older, ref: issue(2).ref })
+    store.acceptDelivery("ordinary-comment", { kind: "issue", ref })
+    vi.advanceTimersByTime(1)
+    const newer = {
+      ...older,
+      request: { ...older.request, commentId: 301, createdAt: Date.now(), updatedAt: Date.now() },
+    }
+    store.acceptDelivery("newer-fix", newer)
+    const label = {
+      kind: "issue",
+      ref,
+      actor: { id: 50, login: "maintainer", type: "User" },
+      retriage: { candidateKey: "a".repeat(64), createdAt: Date.now() },
+    }
+    store.acceptDelivery("label-candidate", label)
+    expect(() => store.retireCodingRequests(ref, Number.NaN)).toThrow()
+    expect(store.deliveries()).toHaveLength(6)
+    store.retireCodingRequests({ ...ref, name: "renamed-project" }, cutoff)
+    store.close()
+    store = openStore()
+    expect(
+      store
+        .deliveries()
+        .map((delivery) => delivery.id)
+        .sort(),
+    ).toEqual(["label-candidate", "newer-fix", "ordinary-comment", "unrelated-fix"])
+    expect(store.acceptDelivery("old-new-guid", older).queued).toBe(false)
+    expect(store.acceptDelivery("same-new-guid", equal).queued).toBe(false)
+    expect(store.acceptDelivery("label-new-guid", label).queued).toBe(false)
+    expect(store.acceptDelivery("newer-new-guid", newer).queued).toBe(false)
+    expect(store.automaticTriageAllowed(ref)).toBe(true)
+    store.retireCodingRequests(ref, cutoff - 100)
+    const lateComment = {
+      ...older,
+      request: { ...older.request, commentId: 999, createdAt: cutoff - 2, updatedAt: cutoff - 2 },
+    }
+    const lateAssignment = { ...equal, request: { ...equal.request, createdAt: cutoff - 2 } }
+    expect(store.acceptDelivery("never-seen-old-comment", lateComment).queued).toBe(false)
+    expect(store.acceptDelivery("never-seen-old-assignment", lateAssignment).queued).toBe(false)
+    const oldAdmission = { ...triageAdmission(pendingReview(proposal())), createdAt: cutoff - 2 }
+    expect(store.admitTriage(oldAdmission)).toBe(false)
+    expect(
+      store.acceptDelivery("fresh-after-cutoff", {
+        ...newer,
+        request: { ...newer.request, commentId: 998 },
+      }).queued,
+    ).toBe(true)
+    store.close()
+    store = openStore()
+    expect(
+      store.acceptDelivery("another-late-comment", {
+        ...lateComment,
+        request: { ...lateComment.request, commentId: 997 },
+      }).queued,
+    ).toBe(false)
+  })
+
+  test("starting older retriage atomically invalidates old coding and keeps a newer matching grant", () => {
+    const store = openStore()
+    const value = proposal()
+    const review = pendingReview(value)
+    store.saveReview(review)
+    store.saveProposal(value)
+    const job = required(store.claim(value, approval(value)))
+    vi.advanceTimersByTime(1)
+    const retriage = retriageAdmission(review)
+    const retriageId = acceptRetriage(store, retriage)
+    const older = directApproval(value, "comment", 300, retriage.createdAt - 1)
+    const olderId = acceptRequest(store, value, older, "older-fix-receipt")
+    const oldGrant = { ...triageAdmission(review), createdAt: older.createdAt }
+    expect(
+      store.admitTriage(oldGrant, { deliveryId: olderId, request: required(older.request) }),
+    ).toBe(true)
+    vi.advanceTimersByTime(1)
+    const newer = directApproval(value, "assignment", 400, Date.now())
+    const newerId = acceptRequest(store, value, newer, "newer-assignment-receipt")
+    const newGrant = triageAdmission(
+      review,
+      `fix-assignment:${value.ref.id}:${value.ref.issueId}:400`,
+    )
+    expect(
+      store.admitTriage(newGrant, { deliveryId: newerId, request: required(newer.request) }),
+    ).toBe(true)
+    const unrelated = triageAdmission(
+      review,
+      `fix-comment:${value.ref.id}:${value.ref.issueId}:401`,
+    )
+    expect(store.admitTriage(unrelated)).toBe(true)
+    const db = new DatabaseSync(join(directory, "state", "reina.sqlite"))
+    try {
+      db.exec(`CREATE TRIGGER reject_stale BEFORE UPDATE ON reviews
+        BEGIN SELECT RAISE(ABORT,'fixture rollback'); END;`)
+      expect(() => store.beginRetriage(retriage, retriageId)).toThrow("fixture rollback")
+      expect(store.proposal(value.ref)).toEqual(value)
+      expect(store.job(job.id)?.state).toBe("approved")
+      expect(store.deliveries().some(({ id }) => id === olderId)).toBe(true)
+      expect(store.triageAdmission(oldGrant.source)?.status).toBe("pending")
+      expect(store.triageAdmission(retriage.source)).toBeUndefined()
+      db.exec("DROP TRIGGER reject_stale")
+    } finally {
+      db.close()
+    }
+    expect(store.beginRetriage(retriage, retriageId)).toBe(true)
+    expect(store.proposal(value.ref)).toBeUndefined()
+    expect(store.job(job.id)?.state).toBe("cancelled")
+    expect(store.triageAdmission(oldGrant.source)?.status).toBe("revoked")
+    expect(store.triageAdmission(unrelated.source)?.status).toBe("revoked")
+    expect(store.triageAdmission(newGrant.source)?.status).toBe("pending")
+    expect(
+      store
+        .deliveries()
+        .map(({ id }) => id)
+        .sort(),
+    ).toEqual([retriageId, newerId].sort())
+    const stale = required(store.review(value.ref))
+    expect(stale.state).toBe("stale")
+    const reassessment = { ...review, revision: randomUUID(), updatedAt: stale.updatedAt }
+    expect(store.saveReview(reassessment, stale.revision)).toBe(true)
+    const running = required(store.claimTriage(reassessment, retriage.source))
+    expect(
+      store.saveReview(
+        { ...running, state: "failed", error: "triage_invalid_output" },
+        running.revision,
+      ),
+    ).toBe(true)
+    const retry = { ...reassessment, revision: randomUUID() }
+    expect(store.saveReview(retry, running.revision)).toBe(true)
+    expect(
+      store.admitTriage(newGrant, { deliveryId: newerId, request: required(newer.request) }),
+    ).toBe(true)
+    expect(store.claimTriage(retry, newGrant.source)?.state).toBe("running")
+  })
+
+  test("label cleanup intent is one-use and survives crashes without a second DELETE grant", () => {
+    let store = openStore()
+    const review = pendingReview(proposal())
+    vi.advanceTimersByTime(1)
+    const admission = retriageAdmission(review, 700, "c".repeat(64))
+    const id = acceptRetriage(store, admission)
+    expect(store.beginRetriage(admission, id)).toBe(true)
+    expect(store.triageAdmission(admission.source)?.cleanupIntent).toBe(false)
+    expect(store.startTriageCleanup(admission.source)).toBe(true)
+    expect(store.startTriageCleanup(admission.source)).toBe(false)
+    expect(store.beginRetriage(admission, id)).toBe(true)
+    store.close()
+    store = openStore()
+    expect(store.triageAdmission(admission.source)?.cleanupIntent).toBe(true)
+    expect(store.startTriageCleanup(admission.source)).toBe(false)
+    store.revokeTriage(admission.source)
+    expect(store.startTriageCleanup(admission.source)).toBe(false)
+    vi.advanceTimersByTime(1)
+    const direct = triageAdmission(review, "fix-comment:456:1001:cleanup")
+    expect(store.admitTriage(direct)).toBe(true)
+    expect(store.startTriageCleanup(direct.source)).toBe(false)
+    expect(store.startTriageCleanup("retriage:missing")).toBe(false)
+  })
+
+  test.each(["inference", "cleanup"])("expired %s authority is revoked atomically", (operation) => {
+    const store = openStore()
+    const review = pendingReview(proposal())
+    vi.advanceTimersByTime(1)
+    const admission = retriageAdmission(review, 700, "e".repeat(64))
+    expect(store.beginRetriage(admission, acceptRetriage(store, admission))).toBe(true)
+    store.saveReview(review)
+    vi.advanceTimersByTime(86_400_000)
+    if (operation === "inference")
+      expect(store.claimTriage(review, admission.source)).toBeUndefined()
+    else expect(store.startTriageCleanup(admission.source)).toBe(false)
+    expect(store.triageAdmission(admission.source)?.status).toBe("revoked")
+    expect(store.review(review.ref)).toEqual(review)
+    expect(store.automaticTriageAllowed(review.ref)).toBe(false)
+  })
+
+  test("a claimed label grant survives crash without refund or a new automatic allowance", () => {
+    let store = openStore()
+    const review = pendingReview(proposal())
+    vi.advanceTimersByTime(1)
+    const admission = retriageAdmission(review)
+    const id = acceptRetriage(store, admission)
+    expect(store.beginRetriage(admission, id)).toBe(true)
+    store.saveReview(review)
+    store.close()
+    store = openStore()
+    expect(store.triageAdmission(admission.source)?.status).toBe("pending")
+    expect(store.claimTriage(review, admission.source)?.attempts).toBe(1)
+    store.close()
+    store = openStore()
+    const interrupted = required(store.review(review.ref))
+    expect(interrupted).toMatchObject({ state: "failed", error: "triage_interrupted" })
+    expect(store.triageAdmission(admission.source)?.status).toBe("claimed")
+    expect(store.triageAdmissionForCandidate(required(admission.candidateKey))?.source).toBe(
+      admission.source,
+    )
+    expect(store.beginRetriage(admission, id)).toBe(false)
+    expect(store.beginRetriage(retriageAdmission(review, 701), id)).toBe(false)
+    expect(store.automaticTriageAllowed(review.ref)).toBe(false)
+    const renewed = { ...review, revision: randomUUID(), updatedAt: interrupted.updatedAt }
+    expect(store.saveReview(renewed, interrupted.revision)).toBe(true)
+    expect(store.claimTriage(renewed, admission.source)).toBeUndefined()
+    expect(store.claimTriage(renewed)).toBeUndefined()
+  })
+
+  test("direct admission honors existing request cutoffs and saved failures reserve initial work", () => {
+    const store = openStore()
+    const review = pendingReview(proposal())
+    const db = new DatabaseSync(join(directory, "state", "reina.sqlite"))
+    db.prepare("UPDATE request_epoch SET reject_before = ? WHERE id = 1").run(Date.now())
+    db.close()
+    const admission = triageAdmission(review)
+    expect(store.admitTriage(admission)).toBe(false)
+    vi.advanceTimersByTime(1)
+    expect(store.admitTriage({ ...admission, createdAt: Date.now() })).toBe(true)
+    const failed: Review = {
+      ...pendingReview(proposal(2)),
+      state: "failed",
+      error: "triage_invalid_output",
+    }
+    expect(store.saveReview(failed)).toBe(true)
+    expect(store.automaticTriageAllowed(failed.ref)).toBe(false)
+    const renewed = { ...pendingReview(proposal(2)), revision: randomUUID() }
+    expect(store.saveReview(renewed, failed.revision)).toBe(true)
+    expect(store.claimTriage(renewed)).toBeUndefined()
+  })
+
+  test("rejects unbounded or malformed admission records without reserving eligibility", () => {
+    const store = openStore()
+    const review = pendingReview(proposal())
+    const admission = triageAdmission(review)
+    for (const invalid of [
+      { ...admission, source: "no-namespace" },
+      { ...admission, source: "fix:bad\nsource" },
+      { ...admission, source: `fix:${"a".repeat(200)}` },
+      { ...admission, candidateKey: "A".repeat(64) },
+      { ...admission, createdAt: -1 },
+      { ...admission, createdAt: Number.MAX_SAFE_INTEGER + 1 },
+      { ...admission, ref: { ...review.ref, issueId: 0 } },
+      { ...admission, binding: { ...review.binding, protocolRevision: "x".repeat(101) } },
+      { ...admission, binding: { ...review.binding, baseSha: "wrong" } },
+      { ...admission, token: "fixture-secret" },
+      { ...admission, body: "must not persist" },
+    ])
+      expect(store.admitTriage(invalid)).toBe(false)
+    expect(store.automaticTriageAllowed(review.ref)).toBe(true)
+    expect(
+      inspect((db) => db.prepare("SELECT COUNT(*) AS count FROM triage_admissions").get()?.count),
+    ).toBe(0)
+  })
+})
+
+describe("schema 7 triage migration", () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_800_000_000_000)
+  })
+
+  test("backfills every known cycle, preserves results and authority, and seals unknown old issues", () => {
+    let store = openStore()
+    const reviews: Review[] = []
+    const states = [
+      "pending",
+      "pending",
+      "running",
+      "assessed",
+      "complete",
+      "failed",
+      "stale",
+    ] as const
+    for (const [index, state] of states.entries()) {
+      const base = pendingReview(proposal(index + 1))
+      const result = {
+        assessment: {
+          kind: "documentation" as const,
+          summary: "Correct the example.",
+          missingInfo: [],
+          fix: decision(),
+        },
+        outcome: "fix_candidate" as const,
+        assessedAt: base.updatedAt,
+      }
+      const review: Review = {
+        ...base,
+        state,
+        attempts: [0, 2, 3, 3, 2, 3, 0][index],
+        ...(state === "running" ? { nextAttemptAt: Date.now() + 300_000 } : {}),
+        ...(state === "pending" && index === 1
+          ? { error: "triage_runtime_unavailable", nextAttemptAt: Date.now() + 60_000 }
+          : {}),
+        ...(state === "assessed" || state === "complete" ? result : {}),
+        ...(state === "complete"
+          ? { commentId: 77, commentIntent: true, publishedRevision: base.revision }
+          : {}),
+        ...(state === "failed" ? { error: "triage_invalid_output" } : {}),
+        ...(state === "stale" ? { inactiveReason: "changed" as const } : {}),
+      }
+      expect(store.saveReview(review)).toBe(true)
+      reviews.push(review)
+    }
+    const proposalOnly = proposal(8)
+    store.saveProposal(proposalOnly)
+    const job = publishing(store, claim(store, 9))
+    store.rememberAssessment("opaque-legacy-assessment")
+    store.acceptDelivery("pending-inbox", { kind: "issue", ref: issue(10).ref })
+    vi.advanceTimersByTime(1)
+    const oldCandidate = {
+      kind: "issue",
+      ref: issue(11).ref,
+      actor: { id: 50, login: "maintainer", type: "User" },
+      retriage: { candidateKey: "d".repeat(64), createdAt: Date.now() },
+    }
+    expect(store.acceptDelivery("legacy-label-candidate", oldCandidate).queued).toBe(true)
+    store.saveScanPage(17)
+    store.reviewBatch(3)
+    const cursor = inspect(
+      (db) => db.prepare("SELECT issue_key FROM review_cursor").get()?.issue_key,
+    )
+    const requestEpoch = inspect(
+      (db) => db.prepare("SELECT reject_before FROM request_epoch").get()?.reject_before,
+    )
+    store.close()
+    const db = new DatabaseSync(join(directory, "state", "reina.sqlite"))
+    dropTriageTables(db)
+    db.exec("PRAGMA user_version = 6")
+    db.close()
+    vi.advanceTimersByTime(1_000)
+    const cutoff = Date.now()
+    store = openStore()
+    expect(inspect((db) => db.prepare("PRAGMA user_version").get()?.user_version)).toBe(7)
+    expect(
+      inspect((db) => db.prepare("SELECT reject_before FROM request_epoch").get()?.reject_before),
+    ).toBe(requestEpoch)
+    expect(
+      inspect((db) => db.prepare("SELECT issue_key FROM review_cursor").get()?.issue_key),
+    ).toBe(cursor)
+    expect(store.review(reviews[0].ref)).toEqual(reviews[0])
+    expect(store.review(reviews[1].ref)).toMatchObject({
+      state: "failed",
+      attempts: 2,
+      error: "triage_runtime_unavailable",
+      nextAttemptAt: 0,
+    })
+    expect(store.review(reviews[2].ref)).toMatchObject({
+      state: "failed",
+      attempts: 3,
+      error: "triage_interrupted",
+      nextAttemptAt: 0,
+    })
+    for (const review of reviews.slice(3)) expect(store.review(review.ref)).toEqual(review)
+    for (const ref of [...reviews.map((review) => review.ref), proposalOnly.ref, job.ref]) {
+      expect(store.automaticTriageAllowed(ref)).toBe(false)
+      expect(store.automaticTriageAllowed(ref, cutoff + 1)).toBe(false)
+    }
+    expect(store.claimTriage(reviews[0])).toBeUndefined()
+    expect(store.proposal(proposalOnly.ref)).toEqual(proposalOnly)
+    expect(store.review(proposalOnly.ref)).toBeUndefined()
+    expect(store.job(job.id)).toEqual(job)
+    expect(store.claim(required(store.proposal(job.ref)), job.approval)).toBeUndefined()
+    expect(store.assessed("opaque-legacy-assessment")).toBe(true)
+    expect(store.scanPage()).toBe(17)
+    expect(store.deliveries()).toEqual([
+      { id: "pending-inbox", payload: { kind: "issue", ref: issue(10).ref } },
+    ])
+    expect(store.acceptDelivery("legacy-candidate-replay", oldCandidate).queued).toBe(false)
+    expect(store.triageAdmissionForCandidate(oldCandidate.retriage.candidateKey)).toBeUndefined()
+    const unknown = issue(20).ref
+    for (const createdAt of [undefined, cutoff - 1, cutoff, Number.NaN, -1])
+      expect(store.automaticTriageAllowed(unknown, createdAt)).toBe(false)
+    vi.advanceTimersByTime(1)
+    expect(store.automaticTriageAllowed(unknown, cutoff + 1)).toBe(true)
+    const direct = triageAdmission(pendingReview(proposal(21)))
+    expect(store.admitTriage({ ...direct, createdAt: cutoff - 10_000 })).toBe(true)
+    const label = retriageAdmission(reviews[0])
+    const labelId = acceptRetriage(store, label, "post-upgrade-candidate")
+    expect(store.beginRetriage({ ...label, createdAt: cutoff }, labelId)).toBe(false)
+    expect(store.beginRetriage(label, labelId)).toBe(true)
+    store.close()
+    vi.advanceTimersByTime(86_400_000)
+    store = openStore()
+    expect(store.automaticTriageAllowed(unknown)).toBe(false)
+    expect(store.automaticTriageAllowed(unknown, cutoff + 1)).toBe(true)
+    expect(store.triageAdmission(label.source)?.status).toBe("pending")
+    expect(
+      inspect(
+        (db) => db.prepare("SELECT automatic_after FROM triage_epoch").get()?.automatic_after,
+      ),
+    ).toBe(cutoff)
+  })
+
+  test("schema 6 invalid identities roll back tables, markers and the upgrade baseline", () => {
+    let store = openStore()
+    const review: Review = { ...pendingReview(proposal()), state: "running", attempts: 2 }
+    store.saveReview(review)
+    store.saveProposal(proposal(2))
+    store.close()
+    const path = join(directory, "state", "reina.sqlite")
+    const db = new DatabaseSync(path)
+    dropTriageTables(db)
+    db.exec("PRAGMA user_version = 6")
+    db.prepare("UPDATE proposals SET issue_key = ?").run("456:999")
+    db.close()
+    expect(() => openStore()).toThrow("Inconsistent proposal identity")
+    expect(inspect((db) => db.prepare("PRAGMA user_version").get()?.user_version)).toBe(6)
+    expect(inspect((db) => db.prepare("SELECT state FROM reviews").get()?.state)).toBe("running")
+    expect(
+      inspect((db) =>
+        db.prepare("SELECT name FROM sqlite_master WHERE name LIKE 'triage_%'").all(),
+      ),
+    ).toEqual([])
+    const repaired = new DatabaseSync(path)
+    repaired.prepare("UPDATE proposals SET issue_key = ?").run("456:1002")
+    repaired.close()
+    store = openStore()
+    expect(store.review(review.ref)).toMatchObject({
+      state: "failed",
+      attempts: 2,
+      error: "triage_interrupted",
+    })
+    expect(store.automaticTriageAllowed(review.ref)).toBe(false)
+  })
+
+  test("retirement failure rolls back earlier review updates with the schema migration", () => {
+    let store = openStore()
+    const first: Review = { ...pendingReview(proposal()), state: "running", attempts: 1 }
+    const second: Review = { ...pendingReview(proposal(2)), state: "running", attempts: 2 }
+    store.saveReview(first)
+    store.saveReview(second)
+    store.close()
+    const path = join(directory, "state", "reina.sqlite")
+    const db = new DatabaseSync(path)
+    dropTriageTables(db)
+    db.exec(`PRAGMA user_version = 6;
+      CREATE TRIGGER reject_retirement BEFORE UPDATE ON reviews
+      WHEN OLD.issue_key = '456:1002'
+      BEGIN SELECT RAISE(ABORT,'fixture retirement rollback'); END;`)
+    db.close()
+    expect(() => openStore()).toThrow("fixture retirement rollback")
+    expect(inspect((db) => db.prepare("PRAGMA user_version").get()?.user_version)).toBe(6)
+    expect(
+      inspect((db) => db.prepare("SELECT state FROM reviews ORDER BY issue_key").all()),
+    ).toEqual([{ state: "running" }, { state: "running" }])
+    expect(
+      inspect((db) =>
+        db.prepare("SELECT name FROM sqlite_master WHERE name = 'triage_epoch'").get(),
+      ),
+    ).toBeUndefined()
+    const repaired = new DatabaseSync(path)
+    repaired.exec("DROP TRIGGER reject_retirement")
+    repaired.close()
+    store = openStore()
+    expect(store.review(first.ref)).toMatchObject({ state: "failed", attempts: 1 })
+    expect(store.review(second.ref)).toMatchObject({ state: "failed", attempts: 2 })
+    expect(store.automaticTriageAllowed(first.ref)).toBe(false)
+  })
+
+  test("a fake downgrade cannot silently discard existing permanent receipts", () => {
+    let store = openStore()
+    const admission = triageAdmission(pendingReview(proposal()))
+    store.admitTriage(admission)
+    store.close()
+    const path = join(directory, "state", "reina.sqlite")
+    const db = new DatabaseSync(path)
+    db.exec("PRAGMA user_version = 6")
+    db.close()
+    expect(() => openStore()).toThrow()
+    expect(inspect((db) => db.prepare("SELECT status FROM triage_admissions").get()?.status)).toBe(
+      "pending",
+    )
+    const repaired = new DatabaseSync(path)
+    repaired.exec("PRAGMA user_version = 7")
+    repaired.close()
+    store = openStore()
+    expect(store.automaticTriageAllowed(admission.ref)).toBe(false)
+    expect(store.admitTriage(admission)).toBe(true)
   })
 })
 
@@ -1487,6 +2481,7 @@ describe("durable store", () => {
       store.close()
       const path = join(directory, "state", "reina.sqlite")
       const db = new DatabaseSync(path)
+      dropTriageTables(db)
       db.exec(`DROP TABLE reviews; DROP TABLE review_cursor;
         DROP TABLE request_epoch; DROP INDEX deliveries_by_request;
         ALTER TABLE deliveries DROP COLUMN request_key;
@@ -1503,7 +2498,7 @@ describe("durable store", () => {
       expect(store.assessed("migrated")).toBe(true)
       const migrated = new DatabaseSync(path, { readOnly: true })
       try {
-        expect(migrated.prepare("PRAGMA user_version").get()?.user_version).toBe(6)
+        expect(migrated.prepare("PRAGMA user_version").get()?.user_version).toBe(7)
         expect(
           migrated
             .prepare("SELECT id,global_until FROM deliveries ORDER BY id")
@@ -1540,6 +2535,7 @@ describe("durable store", () => {
     store.close()
     const path = join(directory, "state", "reina.sqlite")
     const db = new DatabaseSync(path)
+    dropTriageTables(db)
     db.exec(`DROP TABLE reviews; DROP TABLE review_cursor;
       DROP TABLE request_epoch; DROP INDEX deliveries_by_request;
       ALTER TABLE deliveries DROP COLUMN request_key; PRAGMA user_version = 4;`)
@@ -1558,7 +2554,7 @@ describe("durable store", () => {
     ])
     const migrated = new DatabaseSync(path, { readOnly: true })
     try {
-      expect(migrated.prepare("PRAGMA user_version").get()?.user_version).toBe(6)
+      expect(migrated.prepare("PRAGMA user_version").get()?.user_version).toBe(7)
       expect(migrated.prepare("SELECT COUNT(*) AS count FROM reviews").get()?.count).toBe(0)
       expect(migrated.prepare("SELECT COUNT(*) AS count FROM review_cursor").get()?.count).toBe(1)
     } finally {
@@ -1988,6 +2984,13 @@ describe("durable store", () => {
       () => store.saveScanPage(2),
       () => store.review(issue().ref),
       () => store.reviewBatch(10),
+      () => store.automaticTriageAllowed(issue().ref),
+      () => store.triageAdmission("fix:closed"),
+      () => store.triageAdmissionForCandidate("a".repeat(64)),
+      () => store.admitTriage(triageAdmission(pendingReview(proposal()))),
+      () => store.claimTriage(pendingReview(proposal())),
+      () => store.revokeTriage("fix:closed"),
+      () => store.retireCodingRequests(issue().ref, Date.now()),
     ])
       expect(operation).toThrow(/closed/)
     expect(() => openStore()).not.toThrow()

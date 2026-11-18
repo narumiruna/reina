@@ -1,11 +1,15 @@
 import { randomUUID } from "node:crypto"
 import type { Publisher } from "../github/publisher.js"
-import { type GitHub, GitHubIssueDeferred, sameRepository } from "../github/scanner.js"
+import {
+  type GitHub,
+  GitHubDeferred,
+  GitHubIssueDeferred,
+  sameRepository,
+} from "../github/scanner.js"
 import { reviewBody } from "../github/triage.js"
 import { ASSESSMENT_PROTOCOL_REVISION, assessmentOutcome } from "../triage/assessment.js"
 import { fingerprint, policyHash } from "../triage/policy.js"
 import {
-  REVIEW_RETRY_DELAYS as RETRY_DELAYS,
   REVIEW_RESULT_LIMIT,
   type Review,
   type ReviewBinding,
@@ -18,9 +22,10 @@ import type { AgentRuntime, Config, Issue, IssueRef } from "../types.js"
 import type { Store } from "./store.js"
 
 const DAY = 86_400_000
-const retryable = new Set(["runtime_timeout", "model_request_transient", "triage_interrupted"])
 const safeFailures = new Set([
-  ...retryable,
+  "runtime_timeout",
+  "model_request_transient",
+  "triage_interrupted",
   "triage_invalid_issue",
   "triage_invalid_baseline",
   "triage_evidence_limit",
@@ -46,6 +51,12 @@ const safeFailures = new Set([
 type Events = (event: string, ref: IssueRef, fields?: Record<string, unknown>) => void
 type Head = { branch: string; sha: string }
 
+export interface TriageAuthority {
+  source: string
+  force: boolean
+  validate: () => Promise<unknown>
+}
+
 export function reviewBinding(
   issue: Issue,
   head: Head,
@@ -61,13 +72,25 @@ export function reviewBinding(
   }
 }
 
-function sameBinding(a: ReviewBinding, b: ReviewBinding): boolean {
+export function sameBinding(a: ReviewBinding, b: ReviewBinding): boolean {
   return (
     a.fingerprint === b.fingerprint &&
     a.baseBranch === b.baseBranch &&
     a.baseSha === b.baseSha &&
     a.policyHash === b.policyHash &&
     a.protocolRevision === b.protocolRevision
+  )
+}
+
+/** A fix candidate stops being reusable at the proposal's whole-second deadline. */
+export function reviewResultFresh(review: Review | undefined, now = Date.now()): boolean {
+  return (
+    review?.assessment !== undefined &&
+    review.outcome !== undefined &&
+    review.assessedAt !== undefined &&
+    (review.state === "assessed" || review.state === "complete") &&
+    (review.outcome !== "fix_candidate" ||
+      Math.floor(review.assessedAt / 1_000) * 1_000 + DAY > now)
   )
 }
 
@@ -123,6 +146,7 @@ export class IssueTriage {
         assessedAt: _at,
         publishedRevision: _published,
         inactiveReason: _inactive,
+        evidenceError: _evidence,
         ...metadata
       } = review
       review = this.save(
@@ -185,24 +209,77 @@ export class IssueTriage {
     publisher: Publisher,
     signal: AbortSignal,
     correlationId: string,
+    explicit?: TriageAuthority,
   ): Promise<Review | undefined> {
     signal.throwIfAborted()
     if (issue.state !== "open" || issue.pullRequest || issue.labels.includes("bot:skip")) return
     const binding = reviewBinding(issue, head, this.config, this.botId)
     let review = this.store.review(issue.ref)
     const changed = review && !sameBinding(review.binding, binding)
-    if (changed || review?.state === "stale") {
-      review = this.invalidate(issue.ref, review?.inactiveReason ?? "changed", correlationId)
-      if (review) review = await this.project(review, publisher, signal, correlationId)
-    }
+    if (changed) review = this.invalidate(issue.ref, "changed", correlationId)
+    else if (review?.state === "stale" && reviewResultBytes(review) > REVIEW_RESULT_LIMIT)
+      review = this.invalidate(issue.ref, review.inactiveReason ?? "changed", correlationId)
+    if (review?.state === "stale")
+      review = await this.project(review, publisher, signal, correlationId)
     signal.throwIfAborted()
-    const renew =
-      review?.outcome === "fix_candidate" &&
-      review.assessment !== undefined &&
-      review.assessedAt !== undefined &&
-      (review.state === "stale" ||
-        (review.state === "complete" && review.assessedAt + DAY <= Date.now()))
-    if (!review || changed || renew) {
+    if (
+      !changed &&
+      review?.assessment &&
+      assessmentOutcome(review.assessment, this.config) !== review.outcome
+    )
+      throw new Error("triage_result_mismatch")
+    // Only a temporary read failure of a validated, unchanged result permits
+    // restoration. Never restore the inference grant or change assessment time.
+    if (
+      !changed &&
+      review?.state === "stale" &&
+      review.assessment &&
+      review.attempts >= 1 &&
+      review.error === undefined &&
+      review.inactiveReason === "unavailable" &&
+      review.evidenceError === "triage_evidence_unavailable"
+    ) {
+      const { inactiveReason: _inactive, evidenceError: _evidence, ...saved } = review
+      review = this.save(
+        { ...saved, state: "assessed", updatedAt: updated(review) },
+        review.revision,
+      )
+    }
+    const admission = explicit ? this.store.triageAdmission(explicit.source) : undefined
+    if (admission && !sameBinding(admission.binding, binding)) {
+      this.store.revokeTriage(admission.source)
+      return review
+    }
+    const reusable = !changed && reviewResultFresh(review)
+    const initial =
+      !explicit &&
+      this.store.automaticTriageAllowed(issue.ref, issue.createdAt) &&
+      (!review || (review.attempts === 0 && !review.assessment && !review.error))
+    const admitted = admission?.status === "pending" && (explicit?.force || !reusable)
+    if (!initial && !admitted) {
+      if (!review) return
+      review = await this.project(review, publisher, signal, correlationId)
+      // Projection can cross the deadline. Fall through to the single claim
+      // path only for the same pending direct grant, never for a scan or replay.
+      if (
+        !explicit ||
+        !reusable ||
+        admission?.status !== "pending" ||
+        admission.candidateKey !== undefined ||
+        !sameBinding(review.binding, binding)
+      )
+        return review
+      const currentAdmission = this.store.triageAdmission(explicit.source)
+      if (currentAdmission?.status !== "pending" || !sameBinding(currentAdmission.binding, binding))
+        return review
+      const now = Date.now()
+      if (reviewResultFresh(review, now)) return review
+      if (currentAdmission.createdAt > now || currentAdmission.createdAt + DAY <= now) {
+        this.store.revokeTriage(explicit.source)
+        return review
+      }
+    }
+    if (!review || changed || review.state !== "pending" || review.attempts !== 0) {
       const now = Date.now()
       const previous = review
       review = this.save(
@@ -226,40 +303,6 @@ export class IssueTriage {
         previous?.revision,
       )
     }
-    if (review.state === "stale") {
-      const {
-        inactiveReason: _inactive,
-        evidenceError: _evidenceError,
-        error,
-        publishedRevision: _published,
-        ...previous
-      } = review
-      review = this.save(
-        {
-          ...previous,
-          state: review.assessment
-            ? "assessed"
-            : review.attempts >= 3 || (error && !retryable.has(error))
-              ? "failed"
-              : "pending",
-          ...(review.assessment || error === undefined ? {} : { error }),
-          updatedAt: updated(review),
-        },
-        review.revision,
-      )
-    }
-    if (review.assessment && assessmentOutcome(review.assessment, this.config) !== review.outcome) {
-      throw new Error("triage_result_mismatch")
-    }
-    if (["assessed", "complete", "failed"].includes(review.state)) {
-      return this.project(review, publisher, signal, correlationId)
-    }
-    if (review.nextAttemptAt > Date.now()) {
-      throw new GitHubIssueDeferred("triage_retry_pending", review.nextAttemptAt)
-    }
-    if (review.state === "running")
-      throw new GitHubIssueDeferred("triage_busy", Date.now() + 60_000)
-    if (review.attempts >= 3) throw new Error("triage_attempt_limit")
     const snapshot = await github.snapshotAt(head.branch, head.sha)
     signal.throwIfAborted()
     // Snapshot and stale-projection work can take time. Do not charge inference for
@@ -285,25 +328,39 @@ export class IssueTriage {
     const currentHead = await github.head()
     signal.throwIfAborted()
     if (!sameBinding(binding, reviewBinding(current, currentHead, this.config, this.botId))) {
-      const stale = this.invalidate(issue.ref, "changed", correlationId)
-      if (stale) await this.project(stale, publisher, signal, correlationId)
+      if (explicit) this.store.revokeTriage(explicit.source)
+      await this.inactive(issue.ref, "changed", publisher, signal, correlationId)
       return
     }
-    review = this.save(
-      {
-        ...review,
-        state: "running",
-        attempts: review.attempts + 1,
-        nextAttemptAt: 0,
-        error: undefined,
-        updatedAt: updated(review),
-      },
-      review.revision,
-    )
+    if (explicit) {
+      try {
+        await explicit.validate()
+      } catch (error) {
+        // Intake can already revoke the grant. An abort is not a denial of authority.
+        signal.throwIfAborted()
+        if (!(error instanceof GitHubDeferred) && !(error instanceof GitHubIssueDeferred))
+          this.store.revokeTriage(explicit.source)
+        throw error
+      }
+      signal.throwIfAborted()
+      // Validation reads live authority and can outlast a base change. A failed
+      // head read does not establish drift and must leave the unused grant alone.
+      const finalHead = await github.head()
+      signal.throwIfAborted()
+      if (!sameBinding(binding, reviewBinding(current, finalHead, this.config, this.botId))) {
+        this.store.revokeTriage(explicit.source)
+        await this.inactive(issue.ref, "changed", publisher, signal, correlationId)
+        return
+      }
+    }
+    const claimed = this.store.claimTriage(review, explicit?.source, issue.createdAt)
+    if (!claimed) throw new Error("triage_stale")
+    review = claimed
     this.event("triage_started", issue.ref, {
       correlationId,
       revision: review.revision,
       attempt: review.attempts,
+      source: explicit?.source ?? "initial",
     })
     let assessed: Review
     try {
@@ -330,12 +387,11 @@ export class IssueTriage {
       // Intake advances the revision before aborting work. Never overwrite its invalidation.
       if (this.store.review(issue.ref)?.revision !== review.revision) throw error
       if (signal.aborted) {
-        const delay = RETRY_DELAYS[review.attempts - 1]
         this.save(
           {
             ...review,
-            state: delay === undefined ? "failed" : "pending",
-            nextAttemptAt: delay === undefined ? 0 : Date.now() + delay,
+            state: "failed",
+            nextAttemptAt: 0,
             error: "triage_interrupted",
             updatedAt: updated(review),
           },
@@ -347,20 +403,16 @@ export class IssueTriage {
         error instanceof Error && safeFailures.has(error.message)
           ? error.message
           : "triage_assessment_failed"
-      const delay = retryable.has(code) ? RETRY_DELAYS[review.attempts - 1] : undefined
       review = this.save(
         {
           ...review,
-          state: delay === undefined ? "failed" : "pending",
-          nextAttemptAt: delay === undefined ? 0 : Date.now() + delay,
+          state: "failed",
+          nextAttemptAt: 0,
           updatedAt: updated(review),
           error: code,
         },
         review.revision,
       )
-      if (delay !== undefined) {
-        throw new GitHubIssueDeferred("triage_retry_pending", review.nextAttemptAt)
-      }
       this.event("triage_failed", issue.ref, {
         correlationId,
         revision: review.revision,

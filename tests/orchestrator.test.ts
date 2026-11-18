@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, type Mock, test, vi } from "vi
 import { artifactHash } from "../src/agent/validate.js"
 import { authorize } from "../src/github/approval.js"
 import { Publisher, proposalBody } from "../src/github/publisher.js"
+import { currentRetriage, inspectRetriage, retriageCandidateKey } from "../src/github/retriage.js"
 import {
   branchFor,
   GitHub,
@@ -14,10 +15,12 @@ import {
   GitHubError,
   GitHubIssueDeferred,
   GitHubOutcomeUnknown,
+  githubWrite,
 } from "../src/github/scanner.js"
 import { publishReview } from "../src/github/triage.js"
 import { Orchestrator, type Work } from "../src/jobs/orchestrator.js"
 import { Store } from "../src/jobs/store.js"
+import { reviewBinding } from "../src/jobs/triage.js"
 import type { Assessment } from "../src/triage/assessment.js"
 import { fingerprint, policyHash } from "../src/triage/policy.js"
 import {
@@ -35,6 +38,7 @@ import type {
   Job,
   LabelEvent,
   Proposal,
+  RetriageRequest,
   Snapshot,
   SourceFile,
   TriageDecision,
@@ -301,12 +305,21 @@ function fakeOctokit(reader: () => MockGitHub) {
             data: {
               id: issue.ref.issueId,
               number: issue.ref.number,
+              title: issue.title,
+              body: issue.body,
+              comments: reader().remoteComments.length,
+              created_at:
+                issue.createdAt === undefined ? undefined : new Date(issue.createdAt).toISOString(),
               state: issue.state,
               labels: [...issue.labels],
               ...(issue.pullRequest ? { pull_request: {} } : {}),
             },
           }
         }),
+        listComments: vi.fn(async ({ issue_number }: { issue_number: number }) => ({
+          data: reader().remoteComments.filter((value) => value.issueNumber === issue_number),
+          headers: {},
+        })),
         createComment: vi.fn(
           async ({ issue_number, body }: { issue_number: number; body: string }) => {
             expect(issue_number).toBe(reader().currentIssue.ref.number)
@@ -349,10 +362,20 @@ function fakeOctokit(reader: () => MockGitHub) {
         removeLabel: vi.fn(
           async ({ issue_number, name }: { issue_number: number; name: string }) => {
             expect(issue_number).toBe(reader().currentIssue.ref.number)
-            expect(REVIEW_LABELS).toContain(name)
+            expect([...REVIEW_LABELS, "bot:retriage"]).toContain(name)
             reader().currentIssue.labels = reader().currentIssue.labels.filter(
               (label) => label !== name,
             )
+            if (name === "bot:retriage") {
+              now += 1_000
+              reader().events.push({
+                id: String(3_000 + reader().events.length),
+                event: "unlabeled",
+                label: name,
+                actor: { id: botId, login: "reina[bot]", type: "Bot" },
+                createdAt: now,
+              })
+            }
             return { data: reader().currentIssue.labels.map((name) => ({ name })) }
           },
         ),
@@ -387,6 +410,29 @@ class MockPublisher extends Publisher {
   override review = vi.fn(
     async (review: Review, save: (value: Review) => void, signal?: AbortSignal) =>
       publishReview(this.reader, review, save, signal),
+  )
+
+  // Keep the real transition/permission validation and one-use DELETE boundary.
+  // Publisher's private reader cannot use this fixture's overridden GitHub reads.
+  override consumeRetriage = vi.fn(
+    async (issue: Issue, request: RetriageRequest, claimRemoval: () => boolean) => {
+      const current = await currentRetriage(this.reader, issue, request)
+      if (!current.present) return
+      expect(this.store().triageAdmission(request.source)?.status).toBe("pending")
+      if (!claimRemoval()) throw new GitHubOutcomeUnknown("publication_retriage_cleanup_uncertain")
+      try {
+        await githubWrite(() =>
+          this.reader.octokit.rest.issues.removeLabel({
+            issue_number: current.issue.ref.number,
+            name: "bot:retriage",
+          }),
+        )
+      } catch (error) {
+        if (error instanceof GitHubDeferred) throw error
+      }
+      const confirmed = await currentRetriage(this.reader, issue, request)
+      if (confirmed.present) throw new GitHubOutcomeUnknown("github_retriage_outcome_unknown")
+    },
   )
 
   override respond = vi.fn(async (ref: Issue["ref"], requestId: string, message: string) => {
@@ -653,6 +699,51 @@ function directRequest(
   })
 }
 
+function retriageRequest(value: TestFixture, actor = maintainer): IssueWork {
+  // A label at the database's creation timestamp is pre-baseline, not fresh.
+  now += 1_000
+  for (const comment of value.github.currentIssue.comments) {
+    if (value.github.remoteComments.some((item) => item.id === comment.id)) continue
+    value.github.remoteComments.push({
+      issueNumber: value.github.currentIssue.ref.number,
+      id: comment.id,
+      user:
+        comment.authorId === botId
+          ? { id: botId, login: "reina[bot]", type: "Bot" }
+          : { id: comment.authorId, login: maintainer.login, type: "User" },
+      body: comment.body,
+      created_at: new Date(now - 1_000).toISOString(),
+      updated_at: new Date(now - 1_000).toISOString(),
+    })
+  }
+  const issue = value.github.currentIssue
+  const requestIssueHash = createHash("sha256")
+    .update(JSON.stringify([issue.title, issue.body]))
+    .digest("hex")
+  issue.labels = [...new Set([...issue.labels, "bot:retriage"])]
+  value.github.events.push({
+    id: String(3_000 + value.github.events.length),
+    event: "labeled",
+    label: "bot:retriage",
+    actor: { ...actor },
+    createdAt: now,
+  })
+  return value.work({
+    action: "labeled",
+    label: "bot:retriage",
+    actor,
+    requestIssueHash,
+    retriage: {
+      candidateKey: retriageCandidateKey(issue.ref, actor, now, requestIssueHash),
+      createdAt: now,
+    },
+  })
+}
+
+function retriageAdmission(value: TestFixture, work: IssueWork) {
+  return value.store.triageAdmissionForCandidate(required(work.retriage).candidateKey)
+}
+
 async function waitForRelease<T>(gate: Promise<T>, signal: AbortSignal): Promise<T> {
   signal.throwIfAborted()
   const aborted = Promise.withResolvers<never>()
@@ -699,6 +790,145 @@ function deferIssueRead(value: TestFixture, at: number, error: GitHubIssueDeferr
 }
 
 describe("direct human requests use the existing policy-bound workflow", () => {
+  test.each(["deferred metadata", "slow projection"] as const)(
+    "proposal expiry during %s preserves one fresh assignment assessment",
+    async (mode) => {
+      const value = fixture()
+      const proposal = await value.propose()
+      now = proposal.expiresAt - 2_000
+      const work = directRequest(value, "assignment")
+      const project = required(value.publisher.review.getMockImplementation())
+      const retryAt = now + 5_000
+      value.publisher.review.mockImplementationOnce(async (...args) => {
+        const review = await project(...args)
+        if (mode === "slow projection") now = retryAt
+        else
+          value.github.comments.mockRejectedValueOnce(
+            new GitHubIssueDeferred("github_fixture_read", retryAt),
+          )
+        return review
+      })
+      await value.deliver(work, "request-awaiting-metadata")
+      if (mode === "deferred metadata") {
+        expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+        expect(value.runtime.code).not.toHaveBeenCalled()
+        expect(value.log.info).toHaveBeenCalledWith(
+          expect.objectContaining({
+            event: "deferred",
+            correlationId: "request-awaiting-metadata",
+            reason: "github_fixture_read",
+          }),
+        )
+        now = retryAt
+        await value.orchestrator.drain()
+      }
+      expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+      expect(value.runtime.code).toHaveBeenCalledTimes(1)
+      const jobs = value.store.jobs()
+      expect(jobs.map((job) => job.state)).toEqual(["pr_ready"])
+      expect(jobs[0].proposalRevision).not.toBe(proposal.revision)
+      await value.deliver(work, "expired-proposal-request-replay")
+      expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+      expect(value.runtime.code).toHaveBeenCalledTimes(1)
+      expect(value.store.jobs()).toHaveLength(1)
+    },
+  )
+
+  test("a retryable issue read preserves an unused assignment grant through review expiry", async () => {
+    const value = fixture()
+    const proposal = await value.propose()
+    const reusable = required(value.store.review(proposal.ref))
+    expect(reusable).toMatchObject({ state: "complete", outcome: "fix_candidate" })
+    now = proposal.expiresAt - 5_000
+    const work = directRequest(value, "assignment")
+    const source = `fix-assignment:${work.ref.id}:${work.ref.issueId}:2000`
+    const receipt = "assignment-awaiting-projection"
+    const projectionRetryAt = now + 1_000
+    const issueRetryAt = proposal.expiresAt + 1_000
+    value.publisher.review.mockRejectedValueOnce(
+      new GitHubIssueDeferred("github_fixture_projection", projectionRetryAt),
+    )
+    await value.deliver(work, receipt)
+    const pending = required(value.store.triageAdmission(source))
+    expect(pending).toMatchObject({ status: "pending", binding: reusable.binding })
+    expect(value.store.review(work.ref)).toEqual(reusable)
+
+    now = projectionRetryAt
+    value.github.issue.mockRejectedValueOnce(
+      new GitHubIssueDeferred("github_issue_changed_during_read", issueRetryAt),
+    )
+    await value.orchestrator.drain()
+    expect(value.log.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "deferred",
+        correlationId: receipt,
+        reason: "github_issue_changed_during_read",
+      }),
+    )
+    expect(value.store.review(work.ref)).toEqual(reusable)
+    expect(value.store.triageAdmission(source)).toEqual(pending)
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    expect(value.runtime.code).not.toHaveBeenCalled()
+
+    now = issueRetryAt
+    await value.orchestrator.drain()
+    expect(value.store.triageAdmission(source)).toMatchObject({ ...pending, status: "claimed" })
+    const reassessed = required(value.store.review(work.ref))
+    expect(reassessed).toMatchObject({ state: "complete", attempts: 1, assessedAt: issueRetryAt })
+    expect(reassessed.revision).not.toBe(reusable.revision)
+    await value.deliver(work, "assignment-after-claim-new-guid")
+    expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+    expect(value.runtime.code).toHaveBeenCalledTimes(1)
+    expect(value.store.jobs().map((job) => job.state)).toEqual(["pr_ready"])
+    expect(value.store.deliveries()).toEqual([])
+  })
+
+  test("head drift during explicit permission validation revokes an unused assignment grant", async () => {
+    const value = fixture()
+    const work = directRequest(value, "assignment")
+    const source = `fix-assignment:${work.ref.id}:${work.ref.issueId}:2000`
+    const baseSha = value.github.baseline.sha
+    const permission = required(value.github.permission.getMockImplementation())
+    let changedHead = false
+    value.github.permission.mockImplementation(async (login) => {
+      const result = await permission(login)
+      if (!changedHead && value.store.review(work.ref)?.state === "pending") {
+        expect(value.store.triageAdmission(source)?.status).toBe("pending")
+        value.github.baseline.sha = "c".repeat(40)
+        changedHead = true
+      }
+      return result
+    })
+    await value.deliver(work, "head-drift-at-validation")
+    expect(changedHead).toBe(true)
+    expect(value.store.triageAdmission(source)?.status).toBe("revoked")
+    expect(value.runtime.triage).not.toHaveBeenCalled()
+    value.github.baseline.sha = baseSha
+    await value.deliver(work, "revoked-assignment-replay")
+    expect(value.runtime.triage).not.toHaveBeenCalled()
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(value.store.jobs()).toEqual([])
+    expectNoPublication(value)
+  })
+
+  test("a fresh assignment after unseen base movement keeps its new assessment grant", async () => {
+    const value = fixture()
+    await value.propose()
+    value.github.baseline.sha = "c".repeat(40)
+    const work = directRequest(value, "assignment")
+    await value.deliver(work, "fresh-assignment-after-base-movement")
+    expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+    expect(value.store.review(work.ref)).toMatchObject({
+      state: "complete",
+      binding: { baseSha: "c".repeat(40) },
+    })
+    expect(value.runtime.code).toHaveBeenCalledTimes(1)
+    expect(value.store.jobs()).toHaveLength(1)
+    await value.deliver(work, "fresh-assignment-replay")
+    expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+    expect(value.runtime.code).toHaveBeenCalledTimes(1)
+  })
+
   test("assignment can authorize an existing proposal without another assessment", async () => {
     const value = fixture()
     const proposal = await value.propose()
@@ -1130,15 +1360,23 @@ describe("direct human requests use the existing policy-bound workflow", () => {
   })
 
   test.each(["base", "policy", "evidence"])(
-    "a deferred direct request keeps its original %s binding across restart",
+    "a failed direct assessment cannot retry after %s drift or restart",
     async (change) => {
       const value = fixture()
       const work = directRequest(value)
       value.runtime.triage.mockRejectedValueOnce(new Error("model_request_transient"))
       await value.deliver(work, "deferred-direct")
       const review = required(value.store.review(work.ref))
-      expect(review.state).toBe("pending")
+      expect(review).toMatchObject({
+        state: "failed",
+        attempts: 1,
+        error: "model_request_transient",
+        nextAttemptAt: 0,
+      })
+      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
       expect(value.runtime.code).not.toHaveBeenCalled()
+      expect(value.store.deliveries()).toEqual([])
+      const originalRuntime = value.runtime
       await value.restart()
       if (change === "base") value.github.baseline.sha = "c".repeat(40)
       if (change === "policy") value.config.maxChangedFiles = 1
@@ -1148,42 +1386,793 @@ describe("direct human requests use the existing policy-bound workflow", () => {
           authorId: maintainer.id,
           body: "New evidence",
         })
-      now = review.nextAttemptAt
-      expect(value.store.deliveries()).toContainEqual({
-        id: "deferred-direct",
-        payload: expect.objectContaining({
-          requestBinding: {
-            fingerprint: review.binding.fingerprint,
-            baseSha: review.binding.baseSha,
-            baseBranch: review.binding.baseBranch,
-            policyHash: review.binding.policyHash,
-          },
-        }),
+      now += 2 * 86_400_000
+      await value.deliver(work, "failed-direct-new-guid")
+      await reconcile(value)
+      expect(originalRuntime.triage).toHaveBeenCalledTimes(1)
+      expect(value.runtime.triage).not.toHaveBeenCalled()
+      expect(value.store.review(work.ref)).toMatchObject({
+        attempts: 1,
+        error: "model_request_transient",
+        nextAttemptAt: 0,
       })
-      await value.orchestrator.drain()
       expect(value.store.jobs()).toEqual([])
       expect(value.runtime.code).not.toHaveBeenCalled()
       expectNoPublication(value)
     },
   )
 
-  test("material intake consumes an older deferred request before restart recovery", async () => {
+  test("material intake cannot revive an older failed direct assessment after restart", async () => {
     const value = fixture()
     const work = directRequest(value)
     value.runtime.triage.mockRejectedValueOnce(new Error("model_request_transient"))
     await value.deliver(work, "older-deferred-request")
     const review = required(value.store.review(work.ref))
+    expect(review).toMatchObject({ state: "failed", attempts: 1, nextAttemptAt: 0 })
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    const originalRuntime = value.runtime
     value.orchestrator.accept(
       "new-material-event",
       value.work({ action: "edited", material: true }),
     )
-    now = review.nextAttemptAt
+    now += 86_400_000
     expect(value.store.deliveries().map((delivery) => delivery.id)).not.toContain(
       "older-deferred-request",
     )
     await value.restart()
+    await value.deliver(work, "old-failed-request-replay")
+    expect(originalRuntime.triage).toHaveBeenCalledTimes(1)
+    expect(value.runtime.triage).not.toHaveBeenCalled()
+    expect(value.store.review(work.ref)).toMatchObject({ attempts: 1, nextAttemptAt: 0 })
     expect(value.store.jobs()).toEqual([])
     expect(value.runtime.code).not.toHaveBeenCalled()
+    expectNoPublication(value)
+  })
+})
+
+describe("fresh fix assessment authority", () => {
+  test("a new fix request can assess a spent failed issue once and cannot replay that grant", async () => {
+    const value = fixture()
+    value.runtime.triage.mockRejectedValueOnce(new Error("model_request_transient"))
+    const failed = directRequest(value)
+    await value.deliver(failed, "failed-fix-assessment")
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    expect(value.store.review(failed.ref)).toMatchObject({ state: "failed", nextAttemptAt: 0 })
+    await value.deliver(failed, "failed-fix-replay")
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    const fresh = directRequest(value, "assignment")
+    await value.deliver(fresh, "fresh-fix-assessment")
+    await value.deliver(fresh, "fresh-fix-new-guid")
+    await reconcile(value)
+    expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+    expect(value.runtime.code).toHaveBeenCalledTimes(1)
+    expect(value.runtime.verify).toHaveBeenCalledTimes(1)
+    expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+    expect(value.store.jobs().map((job) => job.state)).toEqual(["pr_ready"])
+    const originalRuntime = value.runtime
+    await value.restart()
+    await value.deliver(fresh, "fresh-fix-after-restart")
+    expect(originalRuntime.triage).toHaveBeenCalledTimes(2)
+    expect(value.runtime.triage).not.toHaveBeenCalled()
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(value.store.jobs()).toHaveLength(1)
+  })
+})
+
+describe("one-shot human read-only retriage", () => {
+  test.each(["comment", "assignment"] as const)(
+    "a delayed older %s cannot turn read-only results into coding",
+    async (kind) => {
+      const value = fixture()
+      const older = directRequest(value, kind)
+      const manual = retriageRequest(value)
+      value.runtime.triage.mockImplementationOnce(async () => {
+        value.orchestrator.accept("older-during-manual-inference", older)
+        return output()
+      })
+      await value.deliver(manual, "manual-before-delayed-coding")
+      await value.orchestrator.drain()
+      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expect(value.store.jobs()).toEqual([])
+      const original = value.runtime
+      await value.restart()
+      await value.deliver(older, "older-after-restart-new-guid")
+      await reconcile(value)
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expect(value.runtime.triage).not.toHaveBeenCalled()
+      expectNoPublication(value)
+      const newer = directRequest(value, kind === "assignment" ? "comment" : "assignment")
+      await value.deliver(newer, "newer-explicit-coding-request")
+      expect(original.triage).toHaveBeenCalledTimes(1)
+      expect(value.runtime.triage).toHaveBeenCalledTimes(kind === "assignment" ? 1 : 0)
+      expect(value.runtime.code).toHaveBeenCalledTimes(1)
+      expect(value.store.jobs()).toHaveLength(1)
+    },
+  )
+
+  test.each(["global", "issue"])(
+    "a %s validation read deferral preserves its unused manual grant",
+    async (scope) => {
+      const value = fixture()
+      const manual = retriageRequest(value)
+      const consume = required(value.publisher.consumeRetriage.getMockImplementation())
+      let retryAt = 0
+      value.publisher.consumeRetriage.mockImplementationOnce(async (...args) => {
+        await consume(...args)
+        retryAt = now + 30_000
+        value.github.permission.mockRejectedValueOnce(
+          scope === "global"
+            ? new GitHubDeferred("github_rate_limit", retryAt)
+            : new GitHubIssueDeferred("github_permission_evidence", retryAt),
+        )
+      })
+      await value.deliver(manual, "manual-validation-rate-limit")
+      expect(retriageAdmission(value, manual)?.status).toBe("pending")
+      expect(retriageAdmission(value, manual)?.cleanupIntent).toBe(true)
+      expect(value.runtime.triage).not.toHaveBeenCalled()
+      const pending = required(retriageAdmission(value, manual))
+      const original = value.runtime
+      await value.restart()
+      now = retryAt
+      const issueRetryAt = now + 15_000
+      value.github.issue.mockRejectedValueOnce(
+        new GitHubIssueDeferred("github_issue_changed_during_read", issueRetryAt),
+      )
+      await value.orchestrator.drain()
+      expect(retriageAdmission(value, manual)).toEqual(pending)
+      expect(value.runtime.triage).not.toHaveBeenCalled()
+      expect(value.github.currentIssue.labels).not.toContain("bot:retriage")
+      now = issueRetryAt
+      await value.orchestrator.drain()
+      expect(original.triage).not.toHaveBeenCalled()
+      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+      expect(retriageAdmission(value, manual)?.status).toBe("claimed")
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expect(value.store.jobs()).toEqual([])
+    },
+  )
+
+  test("an older retriage cannot revoke a newer matching assignment's unused grant", async () => {
+    const value = fixture()
+    const manual = retriageRequest(value)
+    const assignment = directRequest(value, "assignment")
+    const source = `fix-assignment:${assignment.ref.id}:${assignment.ref.issueId}:2000`
+    const retryAt = now + 30_000
+    value.github.snapshotAt.mockRejectedValueOnce(
+      new GitHubIssueDeferred("github_fixture_snapshot", retryAt),
+    )
+    await value.deliver(assignment, "newer-deferred-assignment")
+    const pending = required(value.store.triageAdmission(source))
+    expect(pending.status).toBe("pending")
+    expect(value.runtime.triage).not.toHaveBeenCalled()
+
+    value.runtime.triage.mockRejectedValueOnce(new Error("pi_agent_error"))
+    await value.deliver(manual, "older-retriage")
+    expect(retriageAdmission(value, manual)?.status).toBe("claimed")
+    expect(value.store.review(manual.ref)?.state).toBe("failed")
+    expect(value.store.triageAdmission(source)).toEqual(pending)
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(value.store.jobs()).toEqual([])
+
+    now = retryAt
+    await value.orchestrator.drain()
+    expect(value.store.triageAdmission(source)?.status).toBe("claimed")
+    expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+    expect(value.runtime.code).toHaveBeenCalledTimes(1)
+    expect(value.store.jobs().map((job) => job.state)).toEqual(["pr_ready"])
+  })
+
+  test.each(["before cleanup", "pre-DELETE read"] as const)(
+    "shutdown during %s leaves an unchanged retriage for restart",
+    async (phase) => {
+      const value = fixture()
+      const work = retriageRequest(value)
+      const entered = Promise.withResolvers<void>()
+      const release = Promise.withResolvers<void>()
+      if (phase === "before cleanup") {
+        const labels = required(value.publisher.labels.getMockImplementation())
+        value.publisher.labels.mockImplementationOnce(async (...args) => {
+          entered.resolve()
+          await release.promise
+          return labels(...args)
+        })
+      } else {
+        const consume = required(value.publisher.consumeRetriage.getMockImplementation())
+        const read = required(value.github.issue.getMockImplementation())
+        value.publisher.consumeRetriage.mockImplementationOnce((...args) => {
+          value.github.issue.mockImplementationOnce(async (number) => {
+            entered.resolve()
+            await release.promise
+            return read(number)
+          })
+          return consume(...args)
+        })
+      }
+      const originalRuntime = value.runtime
+      const receipt = "retriage-before-shutdown"
+      const delivery = value.deliver(work, receipt)
+      await entered.promise
+      const stopping = value.orchestrator.stop()
+      release.resolve()
+      await Promise.all([delivery, stopping])
+      expect(retriageAdmission(value, work)).toMatchObject({
+        status: "pending",
+        cleanupIntent: false,
+      })
+      expect(value.store.deliveries()).toContainEqual({ id: receipt, payload: work })
+      expect(value.github.currentIssue.labels).toContain("bot:retriage")
+      const remove = value.github.octokit.rest.issues.removeLabel
+      expect(remove).not.toHaveBeenCalled()
+      if (phase === "before cleanup") expect(value.publisher.consumeRetriage).not.toHaveBeenCalled()
+      expect(originalRuntime.triage).not.toHaveBeenCalled()
+
+      await value.restart()
+      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+      expect(retriageAdmission(value, work)?.status).toBe("claimed")
+      expect(value.github.currentIssue.labels).not.toContain("bot:retriage")
+      expect(remove.mock.calls.filter(([input]) => input.name === "bot:retriage")).toHaveLength(1)
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expect(value.store.jobs()).toEqual([])
+    },
+  )
+
+  describe.each(["before the first review", "at the snapshot", "during inference"] as const)(
+    "material intake after retriage cleanup %s",
+    (phase) => {
+      test.each([
+        { title: "an older edit preserves retriage", offset: -1_000, preserve: true },
+        { title: "a same-time edit revokes retriage", offset: 0, preserve: false },
+        { title: "a newer edit revokes retriage", offset: 1_000, preserve: false },
+      ])("$title", async ({ offset, preserve }) => {
+        const value = fixture()
+        const work = retriageRequest(value)
+        const entered = Promise.withResolvers<AbortSignal | undefined>()
+        const release = Promise.withResolvers<void>()
+        const running = phase === "during inference"
+        if (phase === "before the first review") {
+          const consume = required(value.publisher.consumeRetriage.getMockImplementation())
+          value.publisher.consumeRetriage.mockImplementationOnce(async (...args) => {
+            await consume(...args)
+            entered.resolve(undefined)
+            await release.promise
+          })
+        } else if (phase === "at the snapshot") {
+          const snapshot = required(value.github.snapshotAt.getMockImplementation())
+          value.github.snapshotAt.mockImplementationOnce(async (...args) => {
+            entered.resolve(undefined)
+            await release.promise
+            return snapshot(...args)
+          })
+        } else {
+          value.runtime.triage.mockImplementationOnce(async (_snapshot, _prompt, signal) => {
+            entered.resolve(signal)
+            await waitForRelease(release.promise, signal)
+            return output()
+          })
+        }
+        const receipt = "manual-request-after-cleanup"
+        const delivery = value.deliver(work, receipt)
+        const signal = await entered.promise
+        const review = value.store.review(work.ref)
+        try {
+          const admission = required(retriageAdmission(value, work))
+          expect(admission).toMatchObject({
+            status: running ? "claimed" : "pending",
+            cleanupIntent: true,
+          })
+          expect(value.github.currentIssue.labels).not.toContain("bot:retriage")
+          expect(review?.state).toBe(
+            phase === "before the first review" ? undefined : running ? "running" : "pending",
+          )
+
+          now += 1_000
+          // Change only the intake timestamp, not live evidence, to test its cutoff.
+          value.orchestrator.accept(
+            "material-event-after-cleanup",
+            value.work({
+              action: "edited",
+              material: true,
+              changedAt: required(work.retriage).createdAt + offset,
+            }),
+          )
+          if (running) expect(required(signal).aborted).toBe(!preserve)
+          const receipts = value.store.deliveries().map((item) => item.id)
+          expect(receipts.includes(receipt)).toBe(preserve)
+          if (preserve) {
+            expect(value.store.review(work.ref)).toEqual(review)
+            expect(retriageAdmission(value, work)).toEqual(admission)
+          } else {
+            expect(retriageAdmission(value, work)?.status).toBe(running ? "claimed" : "revoked")
+            if (review) {
+              expect(value.store.review(work.ref)?.state).toBe("stale")
+              expect(value.store.review(work.ref)?.revision).not.toBe(review.revision)
+            }
+          }
+        } finally {
+          release.resolve()
+          await delivery
+        }
+        const finished = value.store.review(work.ref)
+        if (preserve) {
+          expect(retriageAdmission(value, work)?.status).toBe("claimed")
+          expect(finished).toMatchObject({ state: "complete", attempts: 1 })
+          if (review) expect(finished?.revision).toBe(review.revision)
+        } else if (review) {
+          expect(finished).toMatchObject({ state: "stale", inactiveReason: "changed" })
+        } else {
+          expect(finished).toBeUndefined()
+        }
+        expect(value.runtime.triage).toHaveBeenCalledTimes(preserve || running ? 1 : 0)
+        expect(value.runtime.code).not.toHaveBeenCalled()
+        expect(value.store.proposals()).toEqual([])
+        expect(value.store.jobs()).toEqual([])
+      })
+    },
+  )
+
+  test.each(["queued", "inspecting"] as const)(
+    "a material lifecycle event retires a %s retriage before it grants admission",
+    async (phase) => {
+      const value = fixture()
+      // Spend automatic eligibility so any further inference would require a grant.
+      value.runtime.triage.mockResolvedValue(nonFix("needs_info"))
+      await value.deliver()
+      const work = retriageRequest(value)
+      const receipt = `fixture-retriage-${phase}`
+      const entered = Promise.withResolvers<void>()
+      const release = Promise.withResolvers<void>()
+      let delivery: Promise<void> | undefined
+      if (phase === "queued") {
+        value.store.acceptDelivery(receipt, work)
+        value.store.deferDelivery(receipt, 15_000, "issue")
+      } else {
+        const permission = required(value.github.permission.getMockImplementation())
+        value.github.permission.mockImplementationOnce(async (login) => {
+          entered.resolve()
+          await release.promise
+          return permission(login)
+        })
+        delivery = value.deliver(work, receipt)
+        await entered.promise
+      }
+      try {
+        expect(retriageAdmission(value, work)).toBeUndefined()
+        now += 1_000
+        // Synthetic local intake event only; no change to the mocked remote evidence.
+        value.orchestrator.accept(
+          "fixture-material-revocation",
+          value.work({ action: "fixture-material", material: true, changedAt: now }),
+        )
+        now += 15_000
+        expect(value.store.deliveries().map((item) => item.id)).not.toContain(receipt)
+      } finally {
+        release.resolve()
+      }
+      await delivery
+      await value.orchestrator.drain()
+      expect(retriageAdmission(value, work)).toBeUndefined()
+      expect(value.publisher.consumeRetriage).not.toHaveBeenCalled()
+      expect(value.github.currentIssue.labels).toContain("bot:retriage")
+      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expect(value.store.jobs()).toEqual([])
+    },
+  )
+
+  test("a fresh human label grants one read-only invocation and exhausts initial eligibility", async () => {
+    const value = fixture()
+    const work = retriageRequest(value)
+    await value.deliver(work, "human-first-retriage")
+    expect(retriageAdmission(value, work)?.status).toBe("claimed")
+    expect(value.store.review(work.ref)).toMatchObject({ state: "complete", attempts: 1 })
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    expect(value.publisher.consumeRetriage).toHaveBeenCalledTimes(1)
+    expect(value.github.currentIssue.labels).not.toContain("bot:retriage")
+    expect(value.github.events.at(-1)).toMatchObject({
+      event: "unlabeled",
+      label: "bot:retriage",
+      actor: { id: botId, login: "reina[bot]", type: "Bot" },
+    })
+    expect(value.publisher.propose).not.toHaveBeenCalled()
+    expect(value.store.proposals()).toEqual([])
+    await value.deliver(work, "human-first-retriage")
+    await value.deliver(work, "same-transition-new-guid")
+    await reconcile(value)
+    now += 2 * 86_400_000
+    await reconcile(value)
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(value.runtime.verify).not.toHaveBeenCalled()
+    expect(value.store.jobs()).toEqual([])
+    expectNoPublication(value)
+  })
+
+  test("a spent issue accepts only distinct fresh adds, not concurrent GUIDs or restart", async () => {
+    const value = fixture()
+    await value.propose()
+    const original = required(value.store.review(value.github.currentIssue.ref))
+    const work = retriageRequest(value)
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    value.runtime.triage.mockImplementationOnce(async (_snapshot, _prompt, signal) => {
+      entered.resolve()
+      await waitForRelease(release.promise, signal)
+      return output()
+    })
+    value.orchestrator.accept("fresh-add", work)
+    await entered.promise
+    value.orchestrator.accept("fresh-add", work)
+    value.orchestrator.accept("same-add-other-guid", work)
+    expect(retriageAdmission(value, work)?.status).toBe("claimed")
+    expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+    release.resolve()
+    await value.orchestrator.drain()
+    const current = required(value.store.review(work.ref))
+    expect(current.revision).not.toBe(original.revision)
+    expect(current.commentId).toBe(original.commentId)
+    expect(triageComments(value)).toHaveLength(1)
+    const originalRuntime = value.runtime
+    await value.restart()
+    await value.deliver(work, "same-add-after-restart")
+    await reconcile(value)
+    expect(originalRuntime.triage).toHaveBeenCalledTimes(2)
+    expect(value.runtime.triage).not.toHaveBeenCalled()
+    expect(value.store.review(work.ref)?.revision).toBe(current.revision)
+    const fresh = retriageRequest(value)
+    expect(fresh.retriage?.candidateKey).not.toBe(work.retriage?.candidateKey)
+    await value.deliver(fresh, "fresh-readd")
+    await value.deliver(fresh, "fresh-readd-new-guid")
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    expect(retriageAdmission(value, fresh)?.status).toBe("claimed")
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(value.store.jobs()).toEqual([])
+    expectNoPublication(value)
+  })
+
+  test.each(["runtime_timeout", "model_request_transient", "pi_agent_error"])(
+    "%s consumes a manual grant and needs another human add to retry",
+    async (code) => {
+      const value = fixture()
+      const work = retriageRequest(value)
+      value.runtime.triage.mockRejectedValueOnce(new Error(code))
+      await value.deliver(work, "manual-failure")
+      expect(retriageAdmission(value, work)?.status).toBe("claimed")
+      expect(value.store.review(work.ref)).toMatchObject({
+        state: "failed",
+        attempts: 1,
+        error: code,
+        nextAttemptAt: 0,
+      })
+      await value.deliver(work, "manual-failure-new-guid")
+      now += 300_000
+      await reconcile(value)
+      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+      expect(value.github.currentIssue.labels).toEqual(["bot:triage-failed"])
+      const originalRuntime = value.runtime
+      await value.restart()
+      now += 2 * 86_400_000
+      await reconcile(value)
+      expect(value.runtime.triage).not.toHaveBeenCalled()
+      const fresh = retriageRequest(value)
+      await value.deliver(fresh, "manual-retry")
+      expect(originalRuntime.triage).toHaveBeenCalledTimes(1)
+      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+      expect(value.store.review(work.ref)).toMatchObject({ state: "complete", attempts: 1 })
+      expect(retriageAdmission(value, fresh)?.status).toBe("claimed")
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expect(value.runtime.verify).not.toHaveBeenCalled()
+      expect(value.store.jobs()).toEqual([])
+      expectNoPublication(value)
+    },
+  )
+
+  test.each(["outsider", "bot", "missing actor", "actor mismatch", "ambiguous history"])(
+    "%s cannot turn a label candidate into assessment authority",
+    async (kind) => {
+      const value = fixture()
+      value.runtime.triage.mockResolvedValue(nonFix("needs_info"))
+      await value.deliver()
+      const previous = required(value.store.review(value.github.currentIssue.ref))
+      const actor =
+        kind === "outsider"
+          ? outsider
+          : kind === "bot"
+            ? { id: botId, login: "reina[bot]", type: "Bot" }
+            : maintainer
+      const work = retriageRequest(value, actor)
+      if (kind === "missing actor") delete work.actor
+      if (kind === "actor mismatch") required(value.github.events.at(-1)).actor = outsider
+      if (kind === "ambiguous history")
+        value.github.events.push({ ...required(value.github.events.at(-1)), id: "9999" })
+      await value.deliver(work, "untrusted-retriage")
+      await value.deliver(work, "untrusted-retriage-new-guid")
+      await reconcile(value)
+      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+      expect(value.store.review(work.ref)?.revision).toBe(previous.revision)
+      expect(retriageAdmission(value, work)).toBeUndefined()
+      expect(value.publisher.consumeRetriage).not.toHaveBeenCalled()
+      expect(value.github.currentIssue.labels).toContain("bot:retriage")
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expect(value.store.jobs()).toEqual([])
+      expectNoPublication(value)
+    },
+  )
+
+  test.each([
+    ["permission denial", "retriage_permission_denied"],
+    ["transition mismatch", "retriage_transition_not_current"],
+    ["unknown GitHub error", "request_rejected_or_failed"],
+  ] as const)("terminal retriage %s logs only %s", async (failure, reason) => {
+    const value = fixture()
+    const work = retriageRequest(value)
+    const receipt = "terminal-retriage-rejection"
+    const diagnostic = "retriage_error: private fixture diagnostic"
+    if (failure === "permission denial") value.github.permissions.set(maintainer.login, "read")
+    else if (failure === "transition mismatch")
+      required(value.github.events.at(-1)).actor = outsider
+    else value.github.permission.mockRejectedValueOnce(new GitHubError(diagnostic, 500))
+    await value.deliver(work, receipt)
+    expect(value.log.error).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ event: "failed", correlationId: receipt, reason }),
+    )
+    expect(JSON.stringify([value.log.info.mock.calls, value.log.error.mock.calls])).not.toContain(
+      diagnostic,
+    )
+    expect(value.store.deliveries()).toEqual([])
+    expect(retriageAdmission(value, work)).toBeUndefined()
+    expect(value.publisher.consumeRetriage).not.toHaveBeenCalled()
+    expect(value.runtime.triage).not.toHaveBeenCalled()
+  })
+
+  test("ordinary label presence and scans do not infer a human retriage request", async () => {
+    const value = fixture()
+    value.runtime.triage.mockResolvedValue(nonFix("needs_info"))
+    await value.deliver()
+    value.github.currentIssue.labels.push("bot:retriage")
+    await value.deliver(value.work({ action: "labeled", label: "bot:retriage", actor: maintainer }))
+    value.github.discovered = [12]
+    await reconcile(value)
+    const originalRuntime = value.runtime
+    await value.restart()
+    await reconcile(value)
+    expect(originalRuntime.triage).toHaveBeenCalledTimes(1)
+    expect(value.runtime.triage).not.toHaveBeenCalled()
+    expect(value.publisher.consumeRetriage).not.toHaveBeenCalled()
+    expect(value.github.currentIssue.labels).toContain("bot:retriage")
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(value.store.jobs()).toEqual([])
+    expectNoPublication(value)
+  })
+
+  test.each(["permission", "body", "base", "policy"])(
+    "%s loss during cleanup cannot claim or rebind the admitted inference",
+    async (change) => {
+      const value = fixture()
+      await value.propose()
+      const work = retriageRequest(value)
+      const consume = required(value.publisher.consumeRetriage.getMockImplementation())
+      value.publisher.consumeRetriage.mockImplementationOnce(async (...args) => {
+        await consume(...args)
+        if (change === "permission") value.github.permissions.set(maintainer.login, "read")
+        if (change === "body") value.github.currentIssue.body += " Changed during cleanup."
+        if (change === "base") value.github.baseline.sha = "c".repeat(40)
+        if (change === "policy") value.config.maxPatchBytes = 32_768
+      })
+      await value.deliver(work, "cleanup-drift")
+      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+      expect(retriageAdmission(value, work)?.status).not.toBe("claimed")
+      expect(value.github.currentIssue.labels).not.toContain("bot:retriage")
+      value.github.permissions.set(maintainer.login, "write")
+      await value.deliver(work, "cleanup-drift-replay")
+      await reconcile(value)
+      const originalRuntime = value.runtime
+      await value.restart()
+      await value.deliver(work, "cleanup-drift-after-restart")
+      expect(originalRuntime.triage).toHaveBeenCalledTimes(1)
+      expect(value.runtime.triage).not.toHaveBeenCalled()
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expect(value.store.jobs()).toEqual([])
+      expectNoPublication(value)
+    },
+  )
+
+  test.each(["admitted", "cleanup intent", "cleaned", "claimed"] as const)(
+    "restart at the durable %s boundary never recreates an inference grant",
+    async (phase) => {
+      const value = fixture()
+      const work = retriageRequest(value)
+      value.store.acceptDelivery("interrupted-retriage", work)
+      const issue = await value.github.issue(12)
+      const request = await inspectRetriage(
+        value.github,
+        issue,
+        required(work.retriage),
+        maintainer,
+      )
+      const binding = reviewBinding(issue, await value.github.head(), value.config, botId)
+      expect(
+        value.store.beginRetriage(
+          {
+            source: request.source,
+            candidateKey: request.candidateKey,
+            createdAt: request.createdAt,
+            ref: issue.ref,
+            binding,
+          },
+          "interrupted-retriage",
+        ),
+      ).toBe(true)
+      if (phase === "cleanup intent")
+        expect(value.store.startTriageCleanup(request.source)).toBe(true)
+      if (phase === "cleaned" || phase === "claimed")
+        await value.publisher.consumeRetriage(issue, request, () =>
+          value.store.startTriageCleanup(request.source),
+        )
+      if (phase === "claimed") {
+        const pending: Review = {
+          ref: issue.ref,
+          revision: randomUUID(),
+          binding,
+          state: "pending",
+          attempts: 0,
+          createdAt: now,
+          updatedAt: now,
+          nextAttemptAt: 0,
+        }
+        expect(value.store.saveReview(pending)).toBe(true)
+        expect(value.store.claimTriage(pending, request.source)?.state).toBe("running")
+      }
+      await value.restart()
+      await value.deliver(work, "interrupted-retriage-new-guid")
+      await reconcile(value)
+      expect(retriageAdmission(value, work)?.status).toBe(
+        phase === "cleanup intent" ? "revoked" : "claimed",
+      )
+      expect(value.runtime.triage).toHaveBeenCalledTimes(
+        phase === "claimed" || phase === "cleanup intent" ? 0 : 1,
+      )
+      if (phase === "cleanup intent") {
+        expect(value.store.review(work.ref)).toBeUndefined()
+        expect(value.github.currentIssue.labels).toContain("bot:retriage")
+        expect(value.github.octokit.rest.issues.removeLabel).not.toHaveBeenCalled()
+      } else {
+        expect(value.store.review(work.ref)).toMatchObject(
+          phase === "claimed"
+            ? { state: "failed", error: "triage_interrupted", attempts: 1, nextAttemptAt: 0 }
+            : { state: "complete", attempts: 1 },
+        )
+      }
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expect(value.runtime.verify).not.toHaveBeenCalled()
+      expect(value.store.jobs()).toEqual([])
+      expectNoPublication(value)
+    },
+  )
+
+  test.each([false, true])(
+    "an unknown label DELETE with accepted=%s requires authoritative bot cleanup, never a blind retry",
+    async (accepted) => {
+      const value = fixture()
+      const work = retriageRequest(value)
+      const remove = value.github.octokit.rest.issues.removeLabel
+      const perform = required(remove.getMockImplementation())
+      remove.mockImplementationOnce(async (input) => {
+        if (accepted) await perform(input)
+        throw new Error("fixture_lost_delete_response")
+      })
+      await value.deliver(work, "unknown-label-delete")
+      expect(retriageAdmission(value, work)?.status).toBe(accepted ? "claimed" : "revoked")
+      expect(value.runtime.triage).toHaveBeenCalledTimes(accepted ? 1 : 0)
+      const calls = remove.mock.calls.filter(([input]) => input.name === "bot:retriage").length
+      expect(calls).toBe(1)
+      const originalRuntime = value.runtime
+      await value.restart()
+      await value.deliver(work, "unknown-delete-new-guid")
+      await reconcile(value)
+      expect(originalRuntime.triage).toHaveBeenCalledTimes(accepted ? 1 : 0)
+      expect(value.runtime.triage).not.toHaveBeenCalled()
+      expect(remove.mock.calls.filter(([input]) => input.name === "bot:retriage")).toHaveLength(1)
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expect(value.store.jobs()).toEqual([])
+      expectNoPublication(value)
+    },
+  )
+
+  test("a lost result save cannot replay a claimed manual invocation after restart", async () => {
+    const value = fixture()
+    const work = retriageRequest(value)
+    const save = value.store.saveReview.bind(value.store)
+    const failure = vi.spyOn(value.store, "saveReview").mockImplementation((review, expected) => {
+      if (review.state === "assessed") throw new Error("fixture_result_save_failed")
+      return save(review, expected)
+    })
+    await value.deliver(work, "lost-result-save")
+    expect(retriageAdmission(value, work)?.status).toBe("claimed")
+    expect(value.store.review(work.ref)).toMatchObject({ state: "running", attempts: 1 })
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    failure.mockRestore()
+    const originalRuntime = value.runtime
+    await value.restart()
+    await value.deliver(work, "lost-result-save-new-guid")
+    now += 2 * 86_400_000
+    await reconcile(value)
+    expect(originalRuntime.triage).toHaveBeenCalledTimes(1)
+    expect(value.runtime.triage).not.toHaveBeenCalled()
+    expect(value.store.review(work.ref)).toMatchObject({
+      state: "failed",
+      attempts: 1,
+      error: "triage_interrupted",
+      nextAttemptAt: 0,
+    })
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(value.store.jobs()).toEqual([])
+    expectNoPublication(value)
+  })
+
+  test("saved manual publication recovers after restart without reclaiming inference", async () => {
+    const value = fixture()
+    const work = retriageRequest(value)
+    value.github.octokit.rest.issues.getLabel.mockRejectedValueOnce(
+      Object.assign(new Error("missing_label"), { status: 404 }),
+    )
+    await value.deliver(work, "manual-publication-failure")
+    const saved = required(value.store.review(work.ref))
+    expect(saved).toMatchObject({ state: "assessed", attempts: 1 })
+    expect(saved.commentId).toBeDefined()
+    expect(retriageAdmission(value, work)?.status).toBe("claimed")
+    const originalRuntime = value.runtime
+    await value.restart()
+    await value.deliver(work, "manual-publication-replay")
+    expect(originalRuntime.triage).toHaveBeenCalledTimes(1)
+    expect(value.runtime.triage).not.toHaveBeenCalled()
+    expect(value.store.review(work.ref)).toMatchObject({
+      revision: saved.revision,
+      state: "complete",
+      commentId: saved.commentId,
+      attempts: 1,
+    })
+    expect(value.github.octokit.rest.issues.createComment).toHaveBeenCalledTimes(1)
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(value.runtime.verify).not.toHaveBeenCalled()
+    expect(value.store.jobs()).toEqual([])
+    expectNoPublication(value)
+  })
+
+  test("retriage retires old pending fix receipts and cannot code beside old approvals or later scans", async () => {
+    const value = fixture()
+    const proposal = await value.propose()
+    const pending = directRequest(value)
+    value.store.acceptDelivery("old-pending-fix", pending)
+    value.store.deferDelivery("old-pending-fix", 3_600_000, "issue")
+    const oldApproval = value.approval()
+    const work = retriageRequest(value)
+    await value.deliver(work, "read-only-over-old-authority")
+    expect(retriageAdmission(value, work)?.status).toBe("claimed")
+    expect(value.store.proposal(proposal.ref)).toBeUndefined()
+    expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+    expect(value.publisher.propose).toHaveBeenCalledTimes(1)
+    expect(value.github.currentIssue.labels).not.toContain("bot:approved")
+    await value.deliver(pending, "old-pending-fix-new-guid")
+    await value.deliver(oldApproval, "old-approval-new-guid")
+    value.github.discovered = [12]
+    await reconcile(value)
+    expect(required(value.store.proposal(work.ref)).revision).not.toBe(proposal.revision)
+    expect(value.store.jobs()).toEqual([])
+    const originalRuntime = value.runtime
+    await value.restart()
+    now += 3_600_000
+    expect(value.store.deliveries().map((item) => item.id)).not.toContain("old-pending-fix")
+    await value.orchestrator.drain()
+    await value.deliver(pending, "old-pending-fix-after-restart")
+    await reconcile(value)
+    expect(originalRuntime.triage).toHaveBeenCalledTimes(2)
+    expect(value.runtime.triage).not.toHaveBeenCalled()
+    expect(originalRuntime.code).not.toHaveBeenCalled()
+    expect(originalRuntime.verify).not.toHaveBeenCalled()
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(value.runtime.verify).not.toHaveBeenCalled()
+    expect(value.store.jobs()).toEqual([])
     expectNoPublication(value)
   })
 })
@@ -1423,6 +2412,41 @@ describe("durable discovery through one trusted draft", () => {
     expect(value.store.scanPage()).toBe(1)
   })
 
+  test("a malformed issue creation timestamp does not block later issues or the scan cursor", async () => {
+    const value = fixture()
+    const read = required(value.github.issue.getMockImplementation())
+    value.github.issue.mockImplementation((number) =>
+      number === 11 ? GitHub.prototype.issue.call(value.github, number) : read(number),
+    )
+    value.github.octokit.rest.issues.get.mockResolvedValueOnce({
+      data: {
+        id: 1_011,
+        number: 11,
+        title: "Issue with malformed metadata",
+        body: "Fixture issue.",
+        comments: 0,
+        created_at: "invalid timestamp",
+        state: "open",
+        labels: [],
+      },
+    })
+    value.github.discover.mockResolvedValueOnce({ numbers: [11, 12], nextPage: 2 })
+    await reconcile(value)
+    expect(value.github.issue.mock.calls.slice(0, 2)).toEqual([[11], [12]])
+    expect(value.log.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "deferred",
+        issue: 11,
+        reason: "github_invalid_issue_creation",
+      }),
+    )
+    expect(value.store.blockedUntil()).toBe(0)
+    expect(value.store.scanPage()).toBe(2)
+    expect(value.store.review(value.github.currentIssue.ref)?.state).toBe("complete")
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    expect(value.runtime.code).not.toHaveBeenCalled()
+  })
+
   test("issue-local evidence limits do not pause unrelated deliveries", async () => {
     const value = fixture()
     value.github.issue.mockRejectedValueOnce(new GitHubIssueDeferred("github_comments_limit"))
@@ -1584,6 +2608,43 @@ describe("durable general issue triage", () => {
     },
   )
 
+  test.each(["skip removal", "model", "image"])(
+    "%s cannot restore spent automatic eligibility, including after restart",
+    async (change) => {
+      const value = fixture()
+      const proposal = await value.propose()
+      const previous = required(value.store.review(proposal.ref))
+      if (change === "skip removal") {
+        value.github.currentIssue.labels.push("bot:skip")
+        await value.deliver(value.work({ action: "labeled", label: "bot:skip", cancel: true }))
+        value.github.currentIssue.labels = value.github.currentIssue.labels.filter(
+          (label) => label !== "bot:skip",
+        )
+        await value.deliver(value.work({ action: "unlabeled", label: "bot:skip" }))
+      }
+      if (change === "model") value.config.model = "openai/other-fixture-model"
+      if (change === "image") value.config.image = `sha256:${"e".repeat(64)}`
+      await reconcile(value)
+      expect(value.store.review(proposal.ref)).toMatchObject({
+        state: "stale",
+        attempts: 1,
+        assessment: previous.assessment,
+        assessedAt: previous.assessedAt,
+        binding: previous.binding,
+      })
+      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+      const originalRuntime = value.runtime
+      await value.restart()
+      await value.deliver(value.work(), "spent-settings-or-unskip")
+      expect(originalRuntime.triage).toHaveBeenCalledTimes(1)
+      expect(value.runtime.triage).not.toHaveBeenCalled()
+      expect(value.store.proposal(proposal.ref)).toBeUndefined()
+      expect(value.store.jobs()).toEqual([])
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expectNoPublication(value)
+    },
+  )
+
   test("non-fix cache survives days, key rotation, own comments, and manual status-label changes", async () => {
     const value = fixture()
     value.runtime.triage.mockResolvedValue(nonFix("needs_info"))
@@ -1624,7 +2685,7 @@ describe("durable general issue triage", () => {
     "comment deletion",
     "another bot comment",
   ])(
-    "%s invalidates old labels before inference and updates the same mutable comment",
+    "%s invalidates old claims and updates the same summary without another inference",
     async (change) => {
       const value = fixture()
       value.runtime.triage.mockResolvedValue(nonFix("needs_info"))
@@ -1640,29 +2701,27 @@ describe("durable general issue triage", () => {
       if (change === "comment edit")
         value.github.currentIssue.comments[0].body += " Edited evidence."
       if (change === "comment deletion") value.github.currentIssue.comments.shift()
-      let labelsAtInference: string[] | undefined
-      value.runtime.triage.mockImplementationOnce(async () => {
-        labelsAtInference = [...value.github.currentIssue.labels]
-        return nonFix("needs_human")
-      })
       await value.deliver(value.work({ action: "edited", material: true }))
+      await reconcile(value)
       const current = required(value.store.review(value.github.currentIssue.ref))
-      expect(labelsAtInference).toBeDefined()
-      expect(labelsAtInference).not.toContain("bot:triaged")
-      expect(labelsAtInference).not.toContain("bot:needs-info")
       expect(current).toMatchObject({
-        state: "complete",
-        outcome: "needs_human",
+        state: "stale",
+        outcome: "needs_info",
         attempts: 1,
         commentId: previous.commentId,
+        assessedAt: previous.assessedAt,
+        binding: previous.binding,
+        assessment: previous.assessment,
       })
       expect(current.revision).not.toBe(previous.revision)
-      expect(current.binding.fingerprint).not.toBe(previous.binding.fingerprint)
-      expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
       expect(triageComments(value)).toHaveLength(1)
-      expect(triageComments(value)[0].body).toContain("Next action: needs_human")
+      expect(triageComments(value)[0].body).toContain("Previous assessment (not current)")
       expect(value.github.octokit.rest.issues.updateComment).toHaveBeenCalled()
-      expect(value.github.currentIssue.labels).toEqual(["bot:needs-human", "bot:triaged"])
+      expect(value.github.currentIssue.labels).toEqual([])
+      expect(value.store.proposals()).toEqual([])
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expectNoPublication(value)
     },
   )
 
@@ -1782,7 +2841,7 @@ describe("durable general issue triage", () => {
   )
 
   test.each(["runtime_timeout", "model_request_transient"])(
-    "%s keeps its retry budget when issue evidence is temporarily unavailable",
+    "%s remains spent after temporary evidence failure, read recovery, and restart",
     async (code) => {
       const value = fixture()
       value.runtime.triage.mockRejectedValueOnce(new Error(code))
@@ -1804,25 +2863,57 @@ describe("durable general issue triage", () => {
       now += 15_000
       await value.orchestrator.drain()
       expect(value.store.review(first.ref)).toMatchObject({
-        state: "pending",
+        state: "stale",
         attempts: 1,
         error: code,
-        nextAttemptAt: first.nextAttemptAt,
+        nextAttemptAt: 0,
       })
-      expect(value.store.review(first.ref)?.evidenceError).toBeUndefined()
       const previousRuntime = value.runtime
       await value.restart()
-      value.runtime.triage.mockResolvedValue(nonFix("needs_info"))
-      expect(value.runtime.triage).not.toHaveBeenCalled()
-      now = first.nextAttemptAt
-      await value.orchestrator.drain()
+      now += 2 * 86_400_000
+      await reconcile(value)
+      await value.deliver(value.work(), "recovered-evidence-new-guid")
       expect(previousRuntime.triage).toHaveBeenCalledTimes(1)
-      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
-      expect(value.store.review(first.ref)).toMatchObject({ state: "complete", attempts: 2 })
-      expect(value.github.currentIssue.labels).not.toContain("bot:triage-failed")
+      expect(value.runtime.triage).not.toHaveBeenCalled()
+      expect(value.store.review(first.ref)).toMatchObject({
+        state: "stale",
+        attempts: 1,
+        error: code,
+        nextAttemptAt: 0,
+      })
+      expect(value.github.currentIssue.labels).not.toContain("bot:triaged")
       expect(value.runtime.code).not.toHaveBeenCalled()
+      expectNoPublication(value)
     },
   )
+
+  test("a temporary issue read failure cannot restore a review made stale by closure", async () => {
+    const value = fixture()
+    const proposal = await value.propose()
+    value.github.currentIssue.state = "closed"
+    await value.deliver(value.work({ action: "closed", cancel: true }), "close-reviewed-issue")
+    expect(value.store.review(proposal.ref)).toMatchObject({
+      state: "stale",
+      inactiveReason: "closed",
+    })
+    expect(value.store.proposal(proposal.ref)).toBeUndefined()
+    value.github.currentIssue.state = "open"
+    await value.deliver(value.work({ action: "reopened" }), "reopen-with-unchanged-evidence")
+    const retryAt = now + 15_000
+    value.github.issue.mockRejectedValueOnce(
+      new GitHubIssueDeferred("github_issue_changed_during_read", retryAt),
+    )
+    await value.deliver(value.work({ action: "scan" }), "temporary-read-after-reopen")
+    now = retryAt
+    await value.orchestrator.drain()
+    expect(value.store.review(proposal.ref)?.state).toBe("stale")
+    expect(value.github.currentIssue.labels).not.toContain("bot:triaged")
+    expect(value.github.currentIssue.labels).not.toContain("fix_available")
+    expect(value.store.proposal(proposal.ref)).toBeUndefined()
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(value.store.jobs()).toEqual([])
+  })
 
   test("read recovery does not reopen a permanent assessment failure", async () => {
     const value = fixture()
@@ -1839,11 +2930,11 @@ describe("durable general issue triage", () => {
     })
     await reconcile(value)
     expect(value.store.review(failed.ref)).toMatchObject({
-      state: "failed",
+      state: "stale",
       error: "pi_agent_error",
       attempts: 1,
+      nextAttemptAt: 0,
     })
-    expect(value.store.review(failed.ref)?.evidenceError).toBeUndefined()
     expect(value.runtime.triage).toHaveBeenCalledTimes(1)
     expect(value.runtime.code).not.toHaveBeenCalled()
   })
@@ -1858,16 +2949,23 @@ describe("durable general issue triage", () => {
     value.github.discovered = []
     await reconcile(value)
     const current = required(value.store.review(value.github.currentIssue.ref))
-    expect(current).toMatchObject({ state: "complete", attempts: 1, commentId: previous.commentId })
+    expect(current).toMatchObject({
+      state: "stale",
+      attempts: 1,
+      commentId: previous.commentId,
+      binding: previous.binding,
+      assessedAt: previous.assessedAt,
+    })
     expect(current.ref.name).toBe("renamed-project")
     expect(current.revision).not.toBe(previous.revision)
-    expect(current.binding.policyHash).not.toBe(previous.binding.policyHash)
-    expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+    expect(current.binding.policyHash).toBe(previous.binding.policyHash)
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
     expect(() => value.store.review(previous.ref)).toThrow("Inconsistent review identity")
     value.orchestrator.accept("old-cursor-reference", { kind: "review", ref: previous.ref })
     await value.orchestrator.drain()
     expect(value.store.review(current.ref)?.revision).toBe(current.revision)
-    expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    expect(value.github.currentIssue.labels).not.toContain("bot:triaged")
     expect(triageComments(value)).toHaveLength(1)
     expect(value.runtime.code).not.toHaveBeenCalled()
   })
@@ -1896,93 +2994,86 @@ describe("durable general issue triage", () => {
     release.resolve()
     await delivery
     expect(value.store.review(value.github.currentIssue.ref)?.ref.name).toBe("renamed-project")
-    expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+    expect(value.store.review(value.github.currentIssue.ref)?.state).toBe("stale")
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
     expect(value.runtime.code).not.toHaveBeenCalled()
   })
 
-  test("a rename never converts an old approval into authority for its new proposal", async () => {
+  test("a rename requires fresh assessment and cannot turn old approval into coding authority", async () => {
     const value = fixture()
     const previous = await value.propose()
     value.config.repository.name = "renamed-project"
     value.github.currentIssue.ref.name = "renamed-project"
     value.github.currentIssue.labels.push("bot:approved")
     await value.deliver(value.work({ action: "labeled", label: "bot:approved", actor: maintainer }))
-    const current = required(value.store.proposal(value.github.currentIssue.ref))
-    expect(current.revision).not.toBe(previous.revision)
-    expect(current.ref.name).toBe("renamed-project")
+    expect(value.store.proposal(value.github.currentIssue.ref)).toBeUndefined()
+    expect(value.store.review(value.github.currentIssue.ref)).toMatchObject({
+      state: "stale",
+      attempts: 1,
+      ref: { name: "renamed-project" },
+    })
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
     expect(value.github.currentIssue.labels).not.toContain("bot:approved")
     expect(value.store.jobs()).toEqual([])
     expect(value.runtime.code).not.toHaveBeenCalled()
     expect(() => value.store.saveProposal(previous)).toThrow(/immutable/)
-    now += 2_000
     await value.approve()
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expectNoPublication(value)
+    await value.deliver(directRequest(value, "assignment"), "fresh-fix-after-rename")
+    expect(value.runtime.triage).toHaveBeenCalledTimes(2)
     expect(value.runtime.code).toHaveBeenCalledTimes(1)
     expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
   })
 
   test.each(["runtime_timeout", "model_request_transient"])(
-    "%s uses three persisted attempts with one-minute and five-minute backoff across restart",
+    "%s is terminal after one invocation regardless of old backoffs, restart, or changed evidence",
     async (code) => {
       const value = fixture()
       value.runtime.triage.mockRejectedValue(new Error(code))
       await value.deliver()
       const first = required(value.store.review(value.github.currentIssue.ref))
-      expect(first).toMatchObject({ state: "pending", attempts: 1, nextAttemptAt: now + 60_000 })
-      expect(value.github.currentIssue.labels).not.toContain("bot:triaged")
-      now += 59_999
-      await reconcile(value)
-      await value.deliver(value.work(), "duplicate-before-backoff")
-      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+      expect(first).toMatchObject({ state: "failed", attempts: 1, error: code, nextAttemptAt: 0 })
+      expect(value.github.currentIssue.labels).toEqual(["bot:triage-failed"])
+      for (const elapsed of [59_999, 1, 299_999, 1, 10 * 86_400_000]) {
+        now += elapsed
+        await reconcile(value)
+        await value.deliver(value.work(), `spent-after-${elapsed}-${now}`)
+        expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+        expect(value.store.review(first.ref)).toMatchObject({
+          revision: first.revision,
+          state: "failed",
+          attempts: 1,
+          nextAttemptAt: 0,
+          error: code,
+        })
+      }
       const originalRuntime = value.runtime
       await value.restart()
-      value.runtime.triage.mockRejectedValue(new Error(code))
       expect(value.runtime.triage).not.toHaveBeenCalled()
-      now += 1
-      await reconcile(value)
-      const second = required(value.store.review(value.github.currentIssue.ref))
-      expect(second).toMatchObject({
-        revision: first.revision,
-        state: "pending",
-        attempts: 2,
-        nextAttemptAt: now + 300_000,
-      })
-      now += 299_999
-      await reconcile(value)
-      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
-      now += 1
-      await reconcile(value)
-      expect(value.store.review(value.github.currentIssue.ref)).toMatchObject({
-        revision: first.revision,
-        state: "failed",
-        attempts: 3,
-        error: code,
-      })
-      expect(value.github.currentIssue.labels).toEqual(["bot:triage-failed"])
-      now += 10 * 86_400_000
       value.github.currentIssue.labels = []
-      await value.deliver(value.work(), "exhausted-cycle-new-delivery")
-      await reconcile(value)
-      expect(originalRuntime.triage).toHaveBeenCalledTimes(1)
-      expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+      await value.deliver(value.work(), "spent-new-guid")
       expect(value.github.currentIssue.labels).toEqual(["bot:triage-failed"])
-      await value.restart()
-      expect(value.runtime.triage).not.toHaveBeenCalled()
-      expect(value.store.review(value.github.currentIssue.ref)).toMatchObject({
-        revision: first.revision,
-        attempts: 3,
-        state: "failed",
-      })
       value.github.currentIssue.body += " New public evidence changes the assessment binding."
       await value.deliver(
         value.work({ action: "edited", material: true }),
-        "new-evidence-after-exhaustion",
+        "new-evidence-after-failure",
       )
-      const renewed = required(value.store.review(value.github.currentIssue.ref))
-      expect(renewed).toMatchObject({ state: "complete", attempts: 1, outcome: "fix_candidate" })
-      expect(renewed.revision).not.toBe(first.revision)
-      expect(renewed.binding.fingerprint).not.toBe(first.binding.fingerprint)
-      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
-      expect(value.github.currentIssue.labels).toEqual(["bot:triaged", "fix_available"])
+      await reconcile(value)
+      expect(value.store.review(first.ref)).toMatchObject({
+        state: "stale",
+        attempts: 1,
+        error: code,
+        nextAttemptAt: 0,
+        binding: first.binding,
+      })
+      expect(originalRuntime.triage).toHaveBeenCalledTimes(1)
+      expect(value.runtime.triage).not.toHaveBeenCalled()
+      expect(value.github.currentIssue.labels).not.toContain("bot:triaged")
+      expect(value.store.proposals()).toEqual([])
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expectNoPublication(value)
     },
   )
 
@@ -2013,34 +3104,38 @@ describe("durable general issue triage", () => {
     expect(value.github.currentIssue.labels).toEqual(["bot:needs-info", "bot:triaged"])
   })
 
-  test("more than three successful proposal renewal cycles each require a fresh assessment and approval", async () => {
+  test("repeated 24-hour expiry cannot renew an assessment, proposal, or approval", async () => {
     const value = fixture()
-    let proposal = await value.propose()
-    const revisions = new Set([proposal.revision])
-    const reviewRevisions = new Set([required(value.store.review(proposal.ref)).revision])
+    const proposal = await value.propose()
+    const review = required(value.store.review(proposal.ref))
     for (let cycle = 1; cycle <= 4; cycle++) {
       const oldApproval = value.approval()
-      now = proposal.expiresAt
+      now = proposal.expiresAt + (cycle - 1) * 86_400_000
       await value.deliver(oldApproval, `expired-approval-${cycle}`)
-      const current = required(value.store.proposal(proposal.ref))
-      expect(current.revision).not.toBe(proposal.revision)
-      expect(current.decision).toEqual(decision())
+      await reconcile(value)
+      expect(value.store.proposal(proposal.ref)).toBeUndefined()
+      expect(value.store.review(proposal.ref)).toMatchObject({
+        revision: review.revision,
+        attempts: 1,
+        createdAt: review.createdAt,
+        assessedAt: review.assessedAt,
+        assessment: review.assessment,
+      })
+      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
       expect(value.github.currentIssue.labels).not.toContain("bot:approved")
+      expect(value.github.currentIssue.labels).not.toContain("fix_available")
       expect(value.runtime.code).not.toHaveBeenCalled()
       expect(value.store.jobs()).toEqual([])
-      expect(value.store.review(current.ref)).toMatchObject({ state: "complete", attempts: 1 })
-      revisions.add(current.revision)
-      reviewRevisions.add(required(value.store.review(current.ref)).revision)
-      proposal = current
     }
-    expect(revisions.size).toBe(5)
-    expect(reviewRevisions.size).toBe(5)
-    expect(value.runtime.triage).toHaveBeenCalledTimes(5)
     expect(triageComments(value)).toHaveLength(1)
-    expect(proposalComments(value)).toHaveLength(5)
+    expect(proposalComments(value)).toHaveLength(1)
     await value.approve()
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expectNoPublication(value)
+    await value.deliver(directRequest(value, "assignment"), "fresh-fix-after-expiry")
+    expect(value.runtime.triage).toHaveBeenCalledTimes(2)
     expect(value.runtime.code).toHaveBeenCalledTimes(1)
-    expect(value.store.jobs()[0].proposalRevision).toBe(proposal.revision)
     expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
   })
 
@@ -2060,7 +3155,7 @@ describe("durable general issue triage", () => {
   })
 
   test.each(["external conflict", "completed PR"])(
-    "%s does not block general triage or create another coding job",
+    "%s does not block explicit read-only retriage or create another coding job",
     async (kind) => {
       const value = fixture()
       if (kind === "completed PR") {
@@ -2074,7 +3169,8 @@ describe("durable general issue triage", () => {
       const codingCalls = value.runtime.code.mock.calls.length
       const drafts = value.publisher.createDraft.mock.calls.length
       value.runtime.triage.mockResolvedValue(nonFix("needs_human"))
-      await value.deliver(value.work({ action: "edited", material: kind === "completed PR" }))
+      await value.deliver(retriageRequest(value))
+      await reconcile(value)
       expect(value.runtime.triage).toHaveBeenCalledTimes(triageCalls + 1)
       expect(value.store.review(value.github.currentIssue.ref)).toMatchObject({
         state: "complete",
@@ -2415,20 +3511,21 @@ describe("freshness and revocation", () => {
     "%s during snapshot preparation does not start another inference",
     async (kind) => {
       const value = fixture()
-      await value.propose()
+      const previous = required(value.store.review((await value.propose()).ref))
       value.github.currentIssue.body += " Additional public reproduction details."
       value.github.snapshotAt.mockImplementationOnce(async (branch, sha) => {
         if (kind === "closed") value.github.currentIssue.state = "closed"
         else value.github.currentIssue.labels.push("bot:skip")
         return { branch, sha, files: copyFiles(value.github.baseline.files) }
       })
-      await value.deliver(value.work({ action: "edited", material: true }))
+      await value.deliver(retriageRequest(value))
       expect(value.runtime.triage).toHaveBeenCalledTimes(1)
       expect(value.store.review(value.github.currentIssue.ref)).toMatchObject({
         state: "stale",
         inactiveReason: kind,
         attempts: 0,
       })
+      expect(value.store.review(previous.ref)?.assessedAt).toBeUndefined()
       expect(value.github.currentIssue.labels).not.toContain("bot:triaged")
       expect(value.store.proposals()).toEqual([])
       expect(value.runtime.code).not.toHaveBeenCalled()
@@ -2436,7 +3533,7 @@ describe("freshness and revocation", () => {
   )
 
   test.each(["approval removed", "closed and reopened"])(
-    "%s gets a fresh assessment and proposal cycle even within the same second",
+    "%s cannot renew inference or proposal authority even within the same second",
     async (kind) => {
       const value = fixture()
       const previous = await value.propose()
@@ -2451,17 +3548,20 @@ describe("freshness and revocation", () => {
         value.github.currentIssue.state = "open"
         await value.deliver(value.work({ action: "reopened", material: true }))
       }
-      const current = required(value.store.proposal(value.github.currentIssue.ref))
-      expect(current.revision).not.toBe(previous.revision)
-      expect(current.createdAt).toBe(previous.createdAt)
-      expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+      expect(value.store.proposal(value.github.currentIssue.ref)).toBeUndefined()
+      expect(value.store.review(previous.ref)).toMatchObject({
+        state: "stale",
+        attempts: 1,
+        assessedAt: previous.createdAt,
+      })
+      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
       expect(value.store.jobs()).toEqual([])
       expect(value.runtime.code).not.toHaveBeenCalled()
-      expect(value.github.currentIssue.labels).not.toContain("bot:approved")
-      now += 2_000
       await value.approve()
-      expect(value.runtime.code).toHaveBeenCalledTimes(1)
-      expect(value.publisher.createDraft).toHaveBeenCalledTimes(1)
+      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      expect(value.store.jobs()).toEqual([])
+      expectNoPublication(value)
     },
   )
 
@@ -2500,7 +3600,7 @@ describe("freshness and revocation", () => {
     await reconcile(value)
     await value.deliver(value.work({ action: "edited", material: true }))
     const current = required(value.store.review(first.ref))
-    expect(current.state).toBe("complete")
+    expect(current.state).toBe("stale")
     expect(current.assessment).toEqual(first.assessment)
     expect(reviewResultBytes(current)).toBe(reviewResultBytes(first))
     expect(Buffer.byteLength(JSON.stringify(current))).toBeLessThan(65_536)
@@ -2608,13 +3708,22 @@ describe("freshness and revocation", () => {
       value.runtime.triage.mockResolvedValue(output())
       value.github.currentIssue.body += " New public evidence after the invalid result."
       await value.deliver(value.work({ action: "edited", material: true }))
+      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+      expect(value.store.review(value.github.currentIssue.ref)).toMatchObject({
+        state: "stale",
+        attempts: 1,
+        error: "triage_invalid_output",
+        nextAttemptAt: 0,
+      })
+      expect(value.runtime.code).not.toHaveBeenCalled()
+      await value.deliver(retriageRequest(value))
       expect(value.runtime.triage).toHaveBeenCalledTimes(2)
       expect(value.store.review(value.github.currentIssue.ref)?.state).toBe("complete")
       expect(value.runtime.code).not.toHaveBeenCalled()
     },
   )
 
-  test("shutdown persists interrupted triage with its consumed attempt and backoff", async () => {
+  test("shutdown terminally fails interrupted triage without a retry deadline", async () => {
     const value = fixture()
     const entered = Promise.withResolvers<AbortSignal>()
     value.runtime.triage.mockImplementation(async (_snapshot, _prompt, signal) => {
@@ -2627,11 +3736,17 @@ describe("freshness and revocation", () => {
     await value.orchestrator.stop()
     await delivery
     expect(value.store.review(value.github.currentIssue.ref)).toMatchObject({
-      state: "pending",
+      state: "failed",
       attempts: 1,
-      nextAttemptAt: now + 60_000,
+      nextAttemptAt: 0,
       error: "triage_interrupted",
     })
+    const originalRuntime = value.runtime
+    await value.restart()
+    now += 2 * 86_400_000
+    await reconcile(value)
+    expect(originalRuntime.triage).toHaveBeenCalledTimes(1)
+    expect(value.runtime.triage).not.toHaveBeenCalled()
     expect(value.runtime.code).not.toHaveBeenCalled()
   })
 
@@ -2723,7 +3838,12 @@ describe("freshness and revocation", () => {
     if (kind === "expiry") now = proposal.expiresAt
     await value.approve()
     expect(value.store.jobs()).toEqual([])
-    expect(value.store.proposal(proposal.ref)?.revision).not.toBe(proposal.revision)
+    expect(value.store.proposal(proposal.ref)).toBeUndefined()
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    expect(value.store.review(proposal.ref)).toMatchObject({
+      attempts: 1,
+      assessedAt: proposal.createdAt,
+    })
     expect(value.github.currentIssue.labels).not.toContain("bot:approved")
     expect(value.runtime.code).not.toHaveBeenCalled()
     expectNoPublication(value)

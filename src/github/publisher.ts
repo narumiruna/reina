@@ -1,6 +1,15 @@
 import { artifactHash } from "../agent/validate.js"
 import { REVIEW_LABELS, type Review } from "../triage/review.js"
-import type { Artifact, IssueRef, Job, Proposal, Repository } from "../types.js"
+import type {
+  Artifact,
+  Issue,
+  IssueRef,
+  Job,
+  Proposal,
+  Repository,
+  RetriageRequest,
+} from "../types.js"
+import { currentRetriage, RETRIAGE_LABEL } from "./retriage.js"
 import {
   branchFor,
   decodeBase64,
@@ -343,6 +352,36 @@ export class Publisher {
     signal?: AbortSignal,
   ): Promise<Review> {
     return publishReview(this.github, review, save, signal)
+  }
+
+  /** Removes only a durably admitted trigger, with authoritative checks around DELETE. */
+  async consumeRetriage(
+    issue: Issue,
+    request: RetriageRequest,
+    claimRemoval: () => boolean,
+  ): Promise<void> {
+    const current = await currentRetriage(this.github, issue, request)
+    if (!current.present) return // Only the exact bot-owned cleanup proves absence.
+    // The caller must commit this one-use cleanup intent before DELETE. A crash
+    // or unknown write cannot regain removal authority after a process restart.
+    if (!claimRemoval()) throw new GitHubOutcomeUnknown("publication_retriage_cleanup_uncertain")
+    try {
+      await githubWrite(() =>
+        this.github.client.rest.issues.removeLabel({
+          ...this.github.coordinates,
+          issue_number: current.issue.ref.number,
+          name: RETRIAGE_LABEL,
+        }),
+      )
+    } catch (error) {
+      if (error instanceof GitHubDeferred) throw error
+      // An error or 404 cannot establish absence. Reconcile the original history
+      // identity below; never retry a potentially accepted DELETE blindly.
+    }
+    // GitHub has no conditional label DELETE. A human remove/re-add in the write
+    // window denies inference even if this DELETE also removed the newer label.
+    const confirmed = await currentRetriage(this.github, issue, request)
+    if (confirmed.present) throw new GitHubOutcomeUnknown("github_retriage_outcome_unknown")
   }
 
   async labels(number: number, add: string[], remove: string[]): Promise<void> {
