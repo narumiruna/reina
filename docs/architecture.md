@@ -490,7 +490,13 @@ A fix-candidate summary can complete while separate proposal publication remains
 `fix_available` requires that proposal's confirmation. Failure projection uses `bot:triage-failed`
 and no current reviewed claim. If GitHub is unavailable, projection remains pending rather than
 becoming successful completion. Manual label edits repair the projection, not approval authority
-or model budgets. Never clear publication intents or attempts to force recovery.
+or model budgets. Reprojecting an unchanged failed review preserves its already-correct
+`bot:triage-failed` label without remove/add writes, including repeated visits in one scan.
+Missing failure labels are restored, and conflicting reviewed/outcome labels are removed without
+changing the assessment revision or retry budget. A missing failure label is added only after
+required summary reconciliation. Deploying this behavior stops future redundant label events;
+it does not remove existing GitHub timeline history. Never clear publication intents or attempts
+to force recovery.
 
 ## Approval and state
 

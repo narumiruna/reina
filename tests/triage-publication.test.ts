@@ -213,6 +213,15 @@ function setup() {
   }
 }
 
+function failReview(review: Review): void {
+  review.state = "failed"
+  review.error = "triage_invalid_output"
+  delete review.assessment
+  delete review.outcome
+  delete review.assessedAt
+  delete review.publishedRevision
+}
+
 beforeEach(() => {
   vi.useFakeTimers()
   vi.setSystemTime(now)
@@ -811,6 +820,147 @@ describe("label projection and failure recovery", () => {
     expect(op.api.issue.labels).not.toContain("bot:triaged")
     expect(op.api.rest.issues.createComment).toHaveBeenCalledTimes(1)
     expect(op.review.state).toBe("failed")
+  })
+
+  test.each([false, true])(
+    "unchanged failed review with previous summary=%s has no repeated writes",
+    async (previousSummary) => {
+      const op = setup()
+      if (previousSummary) await op.run()
+      failReview(op.review)
+      await op.run()
+      const writes = clone(op.api.writes)
+      const durable = clone(op.review)
+
+      await op.run()
+      await op.run(undefined, new Publisher(op.api.client(), repository, bot.id))
+
+      expect(op.api.writes).toEqual(writes)
+      expect(op.review).toEqual(durable)
+      expect(op.api.issue.labels).toContain("bot:triage-failed")
+      expect(op.api.rest.issues.createComment).toHaveBeenCalledTimes(previousSummary ? 1 : 0)
+      expect(op.api.rest.issues.updateComment).toHaveBeenCalledTimes(previousSummary ? 1 : 0)
+    },
+  )
+
+  test("a manually removed failure label is restored with only the missing write", async () => {
+    const op = setup()
+    failReview(op.review)
+    await op.run()
+    const durable = clone(op.review)
+    op.api.issue.labels = op.api.issue.labels.filter((name) => name !== "bot:triage-failed")
+    const writes = op.api.writes.length
+
+    await op.run()
+
+    expect(op.api.writes.slice(writes)).toEqual(["add:bot:triage-failed"])
+    expect(op.review).toEqual(durable)
+    const restored = clone(op.api.writes)
+    await op.run()
+    expect(op.api.writes).toEqual(restored)
+  })
+
+  test("failed cleanup removes conflicting claims without toggling its correct label", async () => {
+    const op = setup()
+    failReview(op.review)
+    await op.run()
+    const durable = clone(op.review)
+    op.api.issue.labels.push("bot:triaged", "bot:needs-info", "bot:needs-human")
+    const writes = op.api.writes.length
+
+    await op.run()
+
+    expect(op.api.writes.slice(writes)).toEqual([
+      "remove:bot:triaged",
+      "remove:bot:needs-info",
+      "remove:bot:needs-human",
+    ])
+    expect(op.api.issue.labels).toEqual([
+      "bug",
+      "bot:approved",
+      "fix_available",
+      "bot:triage-failed",
+    ])
+    expect(op.review).toEqual(durable)
+  })
+
+  test("a missing failure label is added only after an old summary is replaced", async () => {
+    const op = setup()
+    await op.run()
+    failReview(op.review)
+    const writes = op.api.writes.length
+    op.api.onWrite = (name) => {
+      if (name === "updateComment") {
+        expect(op.api.issue.labels).not.toContain("bot:triaged")
+        expect(op.api.issue.labels).not.toContain("bot:triage-failed")
+      }
+      if (name === "add:bot:triage-failed") {
+        expect(op.api.comments[0].body).toContain("Assessment failed")
+        expect(op.api.issue.labels).not.toContain("bot:triaged")
+      }
+    }
+
+    await op.run()
+
+    expect(op.api.writes.slice(writes)).toEqual([
+      "remove:bot:triaged",
+      "remove:bot:needs-info",
+      "updateComment",
+      "add:bot:triage-failed",
+    ])
+  })
+
+  test("a failed summary update does not publish a missing failure label", async () => {
+    const op = setup()
+    await op.run()
+    failReview(op.review)
+    op.api.rest.issues.updateComment.mockRejectedValueOnce(apiError(429, { "retry-after": "1" }))
+    const writes = op.api.writes.length
+
+    await expect(op.run()).rejects.toBeInstanceOf(GitHubDeferred)
+
+    expect(op.api.writes.slice(writes)).toEqual(["remove:bot:triaged", "remove:bot:needs-info"])
+    expect(op.api.issue.labels).not.toContain("bot:triage-failed")
+    expect(op.review.publishedRevision).toBeUndefined()
+    await op.run()
+    expect(op.api.comments[0].body).toContain("Assessment failed")
+    expect(op.api.issue.labels).toContain("bot:triage-failed")
+  })
+
+  test.each(["closed", "skipped"] as const)(
+    "a failed review still removes its failure label when %s",
+    async (reason) => {
+      const op = setup()
+      failReview(op.review)
+      await op.run()
+      if (reason === "closed") op.api.issue.state = "closed"
+      else op.api.issue.labels.push("bot:skip")
+      const writes = op.api.writes.length
+
+      await op.run()
+
+      expect(op.review).toMatchObject({ state: "stale", inactiveReason: reason })
+      expect(op.api.writes.slice(writes)).toEqual(["remove:bot:triage-failed"])
+      expect(op.api.issue.labels).not.toContain("bot:triage-failed")
+      expect(op.api.issue.labels).toEqual(
+        expect.arrayContaining(["bug", "bot:approved", "fix_available"]),
+      )
+    },
+  )
+
+  test("a failed review preserves its failure label without bypassing a summary conflict", async () => {
+    const op = setup()
+    failReview(op.review)
+    await op.run()
+    const conflicting = op.api.comment(`Untrusted prefix\n${marker}\nNot an owned summary`)
+    const writes = clone(op.api.writes)
+
+    await expect(op.run()).rejects.toMatchObject({ code: "publication_comment_conflict" })
+
+    expect(op.api.writes).toEqual(writes)
+    expect(op.api.issue.labels).toContain("bot:triage-failed")
+    expect(op.review.publishedRevision).toBeUndefined()
+    expect(conflicting.body).toBe(`Untrusted prefix\n${marker}\nNot an owned summary`)
   })
 
   test("a restored oversized escaped assessment cannot block stale label cleanup", async () => {
