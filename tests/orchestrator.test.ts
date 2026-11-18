@@ -834,6 +834,55 @@ describe("direct human requests use the existing policy-bound workflow", () => {
     },
   )
 
+  test("a retryable issue read preserves an unused assignment grant through review expiry", async () => {
+    const value = fixture()
+    const proposal = await value.propose()
+    const reusable = required(value.store.review(proposal.ref))
+    expect(reusable).toMatchObject({ state: "complete", outcome: "fix_candidate" })
+    now = proposal.expiresAt - 5_000
+    const work = directRequest(value, "assignment")
+    const source = `fix-assignment:${work.ref.id}:${work.ref.issueId}:2000`
+    const receipt = "assignment-awaiting-projection"
+    const projectionRetryAt = now + 1_000
+    const issueRetryAt = proposal.expiresAt + 1_000
+    value.publisher.review.mockRejectedValueOnce(
+      new GitHubIssueDeferred("github_fixture_projection", projectionRetryAt),
+    )
+    await value.deliver(work, receipt)
+    const pending = required(value.store.triageAdmission(source))
+    expect(pending).toMatchObject({ status: "pending", binding: reusable.binding })
+    expect(value.store.review(work.ref)).toEqual(reusable)
+
+    now = projectionRetryAt
+    value.github.issue.mockRejectedValueOnce(
+      new GitHubIssueDeferred("github_issue_changed_during_read", issueRetryAt),
+    )
+    await value.orchestrator.drain()
+    expect(value.log.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "deferred",
+        correlationId: receipt,
+        reason: "github_issue_changed_during_read",
+      }),
+    )
+    expect(value.store.review(work.ref)).toEqual(reusable)
+    expect(value.store.triageAdmission(source)).toEqual(pending)
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    expect(value.runtime.code).not.toHaveBeenCalled()
+
+    now = issueRetryAt
+    await value.orchestrator.drain()
+    expect(value.store.triageAdmission(source)).toMatchObject({ ...pending, status: "claimed" })
+    const reassessed = required(value.store.review(work.ref))
+    expect(reassessed).toMatchObject({ state: "complete", attempts: 1, assessedAt: issueRetryAt })
+    expect(reassessed.revision).not.toBe(reusable.revision)
+    await value.deliver(work, "assignment-after-claim-new-guid")
+    expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+    expect(value.runtime.code).toHaveBeenCalledTimes(1)
+    expect(value.store.jobs().map((job) => job.state)).toEqual(["pr_ready"])
+    expect(value.store.deliveries()).toEqual([])
+  })
+
   test("head drift during explicit permission validation revokes an unused assignment grant", async () => {
     const value = fixture()
     const work = directRequest(value, "assignment")
@@ -1568,46 +1617,99 @@ describe("one-shot human read-only retriage", () => {
     },
   )
 
-  test("an older material event does not abort matching retriage after trigger cleanup", async () => {
-    const value = fixture()
-    const work = retriageRequest(value)
-    const entered = Promise.withResolvers<void>()
-    const release = Promise.withResolvers<void>()
-    const snapshot = required(value.github.snapshotAt.getMockImplementation())
-    value.github.snapshotAt.mockImplementationOnce(async (...args) => {
-      entered.resolve()
-      await release.promise
-      return snapshot(...args)
-    })
-    const delivery = value.deliver(work, "newer-manual-request")
-    await entered.promise
-    try {
-      expect(retriageAdmission(value, work)).toMatchObject({
-        status: "pending",
-        cleanupIntent: true,
+  describe.each(["before the first review", "at the snapshot", "during inference"] as const)(
+    "material intake after retriage cleanup %s",
+    (phase) => {
+      test.each([
+        { title: "an older edit preserves retriage", offset: -1_000, preserve: true },
+        { title: "a same-time edit revokes retriage", offset: 0, preserve: false },
+        { title: "a newer edit revokes retriage", offset: 1_000, preserve: false },
+      ])("$title", async ({ offset, preserve }) => {
+        const value = fixture()
+        const work = retriageRequest(value)
+        const entered = Promise.withResolvers<AbortSignal | undefined>()
+        const release = Promise.withResolvers<void>()
+        const running = phase === "during inference"
+        if (phase === "before the first review") {
+          const consume = required(value.publisher.consumeRetriage.getMockImplementation())
+          value.publisher.consumeRetriage.mockImplementationOnce(async (...args) => {
+            await consume(...args)
+            entered.resolve(undefined)
+            await release.promise
+          })
+        } else if (phase === "at the snapshot") {
+          const snapshot = required(value.github.snapshotAt.getMockImplementation())
+          value.github.snapshotAt.mockImplementationOnce(async (...args) => {
+            entered.resolve(undefined)
+            await release.promise
+            return snapshot(...args)
+          })
+        } else {
+          value.runtime.triage.mockImplementationOnce(async (_snapshot, _prompt, signal) => {
+            entered.resolve(signal)
+            await waitForRelease(release.promise, signal)
+            return output()
+          })
+        }
+        const receipt = "manual-request-after-cleanup"
+        const delivery = value.deliver(work, receipt)
+        const signal = await entered.promise
+        const review = value.store.review(work.ref)
+        try {
+          const admission = required(retriageAdmission(value, work))
+          expect(admission).toMatchObject({
+            status: running ? "claimed" : "pending",
+            cleanupIntent: true,
+          })
+          expect(value.github.currentIssue.labels).not.toContain("bot:retriage")
+          expect(review?.state).toBe(
+            phase === "before the first review" ? undefined : running ? "running" : "pending",
+          )
+
+          now += 1_000
+          // Change only the intake timestamp, not live evidence, to test its cutoff.
+          value.orchestrator.accept(
+            "material-event-after-cleanup",
+            value.work({
+              action: "edited",
+              material: true,
+              changedAt: required(work.retriage).createdAt + offset,
+            }),
+          )
+          if (running) expect(required(signal).aborted).toBe(!preserve)
+          const receipts = value.store.deliveries().map((item) => item.id)
+          expect(receipts.includes(receipt)).toBe(preserve)
+          if (preserve) {
+            expect(value.store.review(work.ref)).toEqual(review)
+            expect(retriageAdmission(value, work)).toEqual(admission)
+          } else {
+            expect(retriageAdmission(value, work)?.status).toBe(running ? "claimed" : "revoked")
+            if (review) {
+              expect(value.store.review(work.ref)?.state).toBe("stale")
+              expect(value.store.review(work.ref)?.revision).not.toBe(review.revision)
+            }
+          }
+        } finally {
+          release.resolve()
+          await delivery
+        }
+        const finished = value.store.review(work.ref)
+        if (preserve) {
+          expect(retriageAdmission(value, work)?.status).toBe("claimed")
+          expect(finished).toMatchObject({ state: "complete", attempts: 1 })
+          if (review) expect(finished?.revision).toBe(review.revision)
+        } else if (review) {
+          expect(finished).toMatchObject({ state: "stale", inactiveReason: "changed" })
+        } else {
+          expect(finished).toBeUndefined()
+        }
+        expect(value.runtime.triage).toHaveBeenCalledTimes(preserve || running ? 1 : 0)
+        expect(value.runtime.code).not.toHaveBeenCalled()
+        expect(value.store.proposals()).toEqual([])
+        expect(value.store.jobs()).toEqual([])
       })
-      expect(value.github.currentIssue.labels).not.toContain("bot:retriage")
-      const pending = required(value.store.review(work.ref))
-      value.orchestrator.accept(
-        "older-material-event-after-cleanup",
-        value.work({
-          action: "edited",
-          material: true,
-          changedAt: required(work.retriage).createdAt - 500,
-        }),
-      )
-      expect(value.store.review(work.ref)).toEqual(pending)
-      expect(retriageAdmission(value, work)?.status).toBe("pending")
-    } finally {
-      release.resolve()
-    }
-    await delivery
-    expect(retriageAdmission(value, work)?.status).toBe("claimed")
-    expect(value.store.review(work.ref)?.state).toBe("complete")
-    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
-    expect(value.runtime.code).not.toHaveBeenCalled()
-    expect(value.store.jobs()).toEqual([])
-  })
+    },
+  )
 
   test.each(["queued", "inspecting"] as const)(
     "a material lifecycle event retires a %s retriage before it grants admission",
@@ -1796,6 +1898,32 @@ describe("one-shot human read-only retriage", () => {
       expectNoPublication(value)
     },
   )
+
+  test.each([
+    ["permission denial", "retriage_permission_denied"],
+    ["transition mismatch", "retriage_transition_not_current"],
+    ["unknown GitHub error", "request_rejected_or_failed"],
+  ] as const)("terminal retriage %s logs only %s", async (failure, reason) => {
+    const value = fixture()
+    const work = retriageRequest(value)
+    const receipt = "terminal-retriage-rejection"
+    const diagnostic = "retriage_error: private fixture diagnostic"
+    if (failure === "permission denial") value.github.permissions.set(maintainer.login, "read")
+    else if (failure === "transition mismatch")
+      required(value.github.events.at(-1)).actor = outsider
+    else value.github.permission.mockRejectedValueOnce(new GitHubError(diagnostic, 500))
+    await value.deliver(work, receipt)
+    expect(value.log.error).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ event: "failed", correlationId: receipt, reason }),
+    )
+    expect(JSON.stringify([value.log.info.mock.calls, value.log.error.mock.calls])).not.toContain(
+      diagnostic,
+    )
+    expect(value.store.deliveries()).toEqual([])
+    expect(retriageAdmission(value, work)).toBeUndefined()
+    expect(value.publisher.consumeRetriage).not.toHaveBeenCalled()
+    expect(value.runtime.triage).not.toHaveBeenCalled()
+  })
 
   test("ordinary label presence and scans do not infer a human retriage request", async () => {
     const value = fixture()

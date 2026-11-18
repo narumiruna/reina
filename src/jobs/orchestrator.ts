@@ -150,13 +150,13 @@ const reasons = new Set([
   "artifact_invalid_tar",
 ])
 
-function failureReason(error: unknown): string {
+function failureReason(error: unknown, fallback = "execution_failed"): string {
   if (
     error instanceof GitHubError &&
     /^(?:github|approval|publication|retriage)_[a-z0-9_]{1,64}$/.test(error.code)
   )
     return error.code
-  return error instanceof Error && reasons.has(error.message) ? error.message : "execution_failed"
+  return error instanceof Error && reasons.has(error.message) ? error.message : fallback
 }
 
 export class Orchestrator {
@@ -450,9 +450,11 @@ export class Orchestrator {
             reason:
               error instanceof GitHubIssueDeferred
                 ? error.code
-                : error instanceof Error && reasons.has(error.message)
-                  ? error.message
-                  : "request_rejected_or_failed",
+                : work.kind === "issue" && work.retriage
+                  ? failureReason(error, "request_rejected_or_failed")
+                  : error instanceof Error && reasons.has(error.message)
+                    ? error.message
+                    : "request_rejected_or_failed",
           })
         }
       }
@@ -473,14 +475,16 @@ export class Orchestrator {
       const stored = this.store.reviewForReconciliation(work.ref)
       const incomplete = error instanceof GitHubIssueDeferred
       const unavailable = [404, 410].includes(errorStatus(error) ?? 0)
-      // A retryable read does not revoke an unused admission or change why a
-      // review was already stale. Only a current result can recover as current.
+      // An incomplete read is not evidence of drift. A retry of the exact
+      // direct receipt must still be able to use its original unused grant.
+      const preserveUnusedGrant =
+        incomplete &&
+        error.retryAt !== undefined &&
+        (stored?.state === "pending" ||
+          (work.request && this.store.hasPendingDirectTriage(work.ref, correlationId)))
       if (
         stored &&
-        (unavailable ||
-          (incomplete &&
-            stored.state !== "stale" &&
-            !(stored.state === "pending" && error.retryAt !== undefined)))
+        (unavailable || (incomplete && stored.state !== "stale" && !preserveUnusedGrant))
       ) {
         const invalidated = this.reviews.invalidate(stored.ref, "unavailable", correlationId)
         if (invalidated) {

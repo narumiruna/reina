@@ -482,8 +482,12 @@ known bot-owned cleanup can reconcile a restart without another write. An uncert
 replacement race cannot authorize blind removal or inference. A maintainer may need to remove
 and re-add the trigger after such a failure. The publisher never adds this trigger and it is not
 part of `REVIEW_LABELS`. Bot cleanup is not a new request or a revocation of its own admission.
-Closure, skip, permission loss, and material changes revoke pending authority. Saved-result
-publication and safe metadata reads can recover without another model invocation.
+Closure, skip, permission loss, and newer or same-time material changes revoke pending authority.
+An older event does not revoke an exact newer retriage receipt while it is pending. After the
+claim, only a match to the current review revision preserves the work. Confirmed evidence changes
+still invalidate the result. A retryable issue read preserves an unused direct grant for the same
+bound receipt. Saved-result publication does not require another model invocation. Terminal
+retriage failures log bounded reason codes, not raw GitHub errors.
 
 The retriage handler ends after read-only publication and cannot execute code or create a PR.
 It revokes old proposal/job authority and persists a per-issue cutoff against older coding

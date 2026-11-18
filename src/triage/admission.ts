@@ -15,6 +15,8 @@ export interface TriageAdmission {
 
 export interface TriageAdmissionRecord extends TriageAdmission {
   status: "pending" | "claimed" | "revoked"
+  /** Exact review revision that spent the grant; absent on older records. */
+  claimRevision?: string
   /** One-use permission for trigger removal; survives uncertain writes/restart. */
   cleanupIntent: boolean
 }

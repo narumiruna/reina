@@ -83,11 +83,14 @@ const triageAdmissionSchema = z.strictObject({
   createdAt: timestamp,
   candidateKey: digest.optional(),
 })
-const triageAdmissionRecordSchema: z.ZodType<TriageAdmissionRecord> = z.strictObject({
-  ...triageAdmissionSchema.shape,
-  status: z.enum(["pending", "claimed", "revoked"]),
-  cleanupIntent: z.boolean(),
-})
+const triageAdmissionRecordSchema: z.ZodType<TriageAdmissionRecord> = z
+  .strictObject({
+    ...triageAdmissionSchema.shape,
+    status: z.enum(["pending", "claimed", "revoked"]),
+    claimRevision: z.uuid().optional(),
+    cleanupIntent: z.boolean(),
+  })
+  .refine((admission) => admission.claimRevision === undefined || admission.status === "claimed")
 
 export interface DeliveryIntakeResult {
   queued: boolean
@@ -978,25 +981,27 @@ export class Store {
     }
   }
 
-  private preserveTriageBindings(
+  /** Preserve controllers and grants separately from the current review revision. */
+  private preserveTriage(
     scope: DeliveryIntakeResult["revocations"][number],
     cutoff?: number,
-  ): void {
+  ): string | undefined {
     if (cutoff === undefined) return
-    const review = this.reviewForReconciliation(scope.ref)
-    if (!review) return
-    for (const row of this.database()
-      .prepare("SELECT * FROM triage_admissions WHERE issue_key = ? AND status = 'pending'")
-      .all(key(scope.ref))) {
-      const admission = this.readTriageAdmission(row)
-      if (
-        admission.createdAt > cutoff &&
-        sameRef(admission.ref, scope.ref) &&
-        sameRef(review.ref, scope.ref) &&
-        stable(admission.binding) === stable(review.binding)
-      ) {
-        if (admission.candidateKey) scope.preservedTriageSources.push(admission.source)
-        else if (
+    const { ref } = scope
+    const review = this.reviewForReconciliation(ref)
+    const reviewBinding = review && sameRef(review.ref, ref) ? stable(review.binding) : undefined
+    const db = this.database()
+    if (reviewBinding !== undefined) {
+      for (const row of db
+        .prepare(
+          "SELECT * FROM triage_admissions WHERE issue_key = ? AND status = 'pending' AND candidate_key IS NULL",
+        )
+        .all(key(ref))) {
+        const admission = this.readTriageAdmission(row)
+        if (
+          admission.createdAt > cutoff &&
+          sameRef(admission.ref, ref) &&
+          stable(admission.binding) === reviewBinding &&
           !scope.preservedBindings.some(
             (binding) => stable(binding) === stable(requestBinding(admission)),
           )
@@ -1004,6 +1009,44 @@ export class Store {
           scope.preservedBindings.push(requestBinding(admission))
       }
     }
+
+    let preservedReviewRevision: string | undefined
+    // Work from live receipts rather than historical claimed admissions.
+    for (const row of db
+      .prepare(
+        "SELECT payload,request_key FROM deliveries WHERE status = 'pending' AND request_key IS NOT NULL",
+      )
+      .all()) {
+      if (typeof row.payload !== "string") continue
+      const payload = JSON.parse(row.payload)
+      const candidate = retriageSource(payload)
+      if (
+        !candidate ||
+        candidate.requestKey !== row.request_key ||
+        candidate.createdAt <= cutoff ||
+        !sameRef(candidate.ref, ref) ||
+        payload.actor.type !== "User"
+      )
+        continue
+      const admission = this.triageAdmissionForCandidate(candidate.candidateKey)
+      if (!admission || admission.createdAt !== candidate.createdAt || !sameRef(admission.ref, ref))
+        continue
+      const bound = review && stable(admission.binding) === reviewBinding
+      if (admission.status === "pending") {
+        scope.preservedTriageSources.push(admission.source)
+        // An unused grant can protect its pending review, not a prior result.
+        if (bound && review.state === "pending") preservedReviewRevision = review.revision
+      } else if (
+        admission.status === "claimed" &&
+        bound &&
+        review.state !== "stale" &&
+        admission.claimRevision === review.revision
+      ) {
+        scope.preservedTriageSources.push(admission.source)
+        preservedReviewRevision = review.revision
+      }
+    }
+    return preservedReviewRevision
   }
 
   private revokeInvalidatedTriage(
@@ -1018,11 +1061,11 @@ export class Store {
         cutoff !== undefined &&
         admission.createdAt > cutoff &&
         sameRef(admission.ref, ref) &&
-        review !== undefined &&
-        stable(admission.binding) === stable(review.binding) &&
         (admission.candidateKey
           ? scope.preservedTriageSources.includes(admission.source)
-          : scope.preservedBindings.some(
+          : review !== undefined &&
+            stable(admission.binding) === stable(review.binding) &&
+            scope.preservedBindings.some(
               (binding) => stable(binding) === stable(requestBinding(admission)),
             )),
     )
@@ -1077,7 +1120,12 @@ export class Store {
         nextAttemptAt: 0,
       })
       if (!running.success) return undefined
-      if (admission) this.updateTriageAdmission({ ...admission, status: "claimed" })
+      if (admission)
+        this.updateTriageAdmission({
+          ...admission,
+          status: "claimed",
+          claimRevision: running.data.revision,
+        })
       this.reserveAutomaticTriage(current.ref)
       db.prepare("UPDATE reviews SET state = ?, json = ? WHERE issue_key = ?").run(
         running.data.state,
@@ -1289,6 +1337,42 @@ export class Store {
       : /^[1-9]\d*$/.test(eventId) && source === `${prefix}${eventId}`
   }
 
+  /** Check a retry's bound receipt without extending or consuming its grant. */
+  hasPendingDirectTriage(ref: IssueRef, delivery: string): boolean {
+    const row = this.pendingDelivery(delivery)
+    if (!row) return false
+    const source = requestSource(row.payload)
+    const actor = actorSchema.safeParse(row.payload.actor)
+    const binding = requestBindingSchema.safeParse(row.payload.requestBinding)
+    const now = Date.now()
+    if (
+      !source ||
+      source.requestKey !== row.requestKey ||
+      !sameRef(source.ref, ref) ||
+      !actor.success ||
+      actor.data.type !== "User" ||
+      !binding.success ||
+      source.createdAt > now ||
+      source.createdAt + TRIAGE_REQUEST_TTL_MS <= now ||
+      this.retiredCodingRequest(ref, source.createdAt)
+    )
+      return false
+    return this.database()
+      .prepare(
+        "SELECT * FROM triage_admissions WHERE issue_key = ? AND status = 'pending' AND candidate_key IS NULL",
+      )
+      .all(key(ref))
+      .some((row) => {
+        const admission = this.readTriageAdmission(row)
+        return (
+          sameRef(admission.ref, ref) &&
+          admission.createdAt === source.createdAt &&
+          this.matchesDirectSource(admission, source.request) &&
+          stable(requestBinding(admission)) === stable(binding.data)
+        )
+      })
+  }
+
   private pendingDirectReceipt(admission: TriageAdmission, id: string, request: ExecutionRequest) {
     const row = this.pendingDelivery(id)
     if (!row) return undefined
@@ -1459,7 +1543,7 @@ export class Store {
     const cutoff = changeCutoff(payload, ref.data)
     if (cutoff === undefined) return false
     const scope = this.revocationScope(ref.data, cutoff)
-    this.preserveTriageBindings(scope, cutoff)
+    this.preserveTriage(scope, cutoff)
     return (
       this.newerRequests(ref.data, cutoff).length > 0 ||
       scope.preservedJobIds.length > 0 ||
@@ -1536,7 +1620,7 @@ export class Store {
         }
         this.invalidateRecords(ref, scope)
         // Read-only requests may preserve a review, never proposal or job authority.
-        this.preserveTriageBindings(scope, cutoff)
+        this.preserveTriage(scope, cutoff)
         this.revokeInvalidatedTriage(ref, scope, cutoff)
         result.revocations.push(scope)
       }
@@ -1551,14 +1635,14 @@ export class Store {
         )
         const cutoff = changeCutoff(payload, ref)
         const scope = this.revocationScope(ref, cutoff)
-        this.preserveTriageBindings(scope, cutoff)
+        const preservedReviewRevision = this.preserveTriage(scope, cutoff)
         this.revokeInvalidatedTriage(ref, scope, cutoff)
         const row = db.prepare("SELECT * FROM reviews WHERE issue_key = ?").get(key(ref))
         if (!row) continue
         const current = this.readReview(row)
         if (!sameRef(current.ref, ref)) throw new Error("Inconsistent review identity")
         if (
-          scope.preservedTriageSources.length > 0 ||
+          preservedReviewRevision === current.revision ||
           scope.preservedBindings.some(
             (binding) => stable(binding) === stable(requestBinding(current)),
           )

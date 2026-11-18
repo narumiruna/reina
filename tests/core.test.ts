@@ -1172,6 +1172,31 @@ describe("single-shot triage grants", () => {
     expect(store.automaticTriageAllowed(review.ref)).toBe(false)
   })
 
+  test("an older claimed source cannot preserve a different review revision", () => {
+    const store = openStore()
+    const review = pendingReview(proposal())
+    vi.advanceTimersByTime(1)
+    const admission = retriageAdmission(review)
+    const id = acceptRetriage(store, admission)
+    expect(store.beginRetriage(admission, id)).toBe(true)
+    expect(store.saveReview(review)).toBe(true)
+    expect(store.claimTriage(review, admission.source)?.state).toBe("running")
+    expect(store.triageAdmission(admission.source)?.claimRevision).toBe(review.revision)
+
+    const replacement = { ...review, revision: randomUUID(), updatedAt: Date.now() }
+    expect(store.saveReview(replacement, review.revision)).toBe(true)
+    const change = store.acceptDelivery(
+      "delayed-material-for-replacement",
+      { kind: "issue", ref: review.ref, material: true, changedAt: admission.createdAt - 1 },
+      [review.ref],
+      [{ ref: review.ref, reason: "changed" }],
+    )
+    expect(change.queued).toBe(true)
+    expect(change.revocations[0]?.preservedTriageSources).toEqual([])
+    expect(store.review(review.ref)?.state).toBe("stale")
+    expect(store.triageAdmission(admission.source)?.status).toBe("claimed")
+  })
+
   test("admission and claim transactions roll back without partially spending a grant", () => {
     const store = openStore()
     const review = pendingReview(proposal())
