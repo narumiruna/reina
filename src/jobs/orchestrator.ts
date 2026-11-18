@@ -591,7 +591,10 @@ export class Orchestrator {
         proposal.image !== this.config.image ||
         proposal.expiresAt <= Date.now())
     ) {
-      this.cancel(issue.ref)
+      // Expiring a proposal revokes coding authority, not an unused assessment
+      // grant already bound to a fresh human request awaiting metadata reads.
+      this.store.invalidate(issue.ref)
+      this.cancel(issue.ref, true)
       await publisher.labels(issue.ref.number, [], ["fix_available", "bot:approved", "bot:working"])
       proposal = undefined
     }

@@ -781,6 +781,40 @@ function deferIssueRead(value: TestFixture, at: number, error: GitHubIssueDeferr
 }
 
 describe("direct human requests use the existing policy-bound workflow", () => {
+  test("proposal expiry does not revoke an unused fresh request while metadata reads defer", async () => {
+    const value = fixture()
+    const proposal = await value.propose()
+    now = proposal.expiresAt - 2_000
+    const work = directRequest(value, "assignment")
+    const project = required(value.publisher.review.getMockImplementation())
+    const retryAt = now + 5_000
+    value.publisher.review.mockImplementationOnce(async (...args) => {
+      const review = await project(...args)
+      value.github.comments.mockRejectedValueOnce(
+        new GitHubIssueDeferred("github_fixture_read", retryAt),
+      )
+      return review
+    })
+    await value.deliver(work, "request-awaiting-metadata")
+    expect(value.runtime.triage).toHaveBeenCalledTimes(1)
+    expect(value.runtime.code).not.toHaveBeenCalled()
+    expect(value.log.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "deferred",
+        correlationId: "request-awaiting-metadata",
+        reason: "github_fixture_read",
+      }),
+    )
+    now = retryAt
+    await value.orchestrator.drain()
+    expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+    expect(value.runtime.code).toHaveBeenCalledTimes(1)
+    expect(value.store.jobs()).toHaveLength(1)
+    await value.deliver(work, "expired-proposal-request-replay")
+    expect(value.runtime.triage).toHaveBeenCalledTimes(2)
+    expect(value.runtime.code).toHaveBeenCalledTimes(1)
+  })
+
   test("a fresh assignment after unseen base movement keeps its new assessment grant", async () => {
     const value = fixture()
     await value.propose()
