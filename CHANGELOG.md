@@ -1,5 +1,11 @@
 # reina
 
+## 0.4.1
+
+### Patch Changes
+
+- 2d99d65: Preserve an already-correct bot:triage-failed label during repeated review publication instead of removing and adding it again. Continue to repair missing or conflicting labels without new assessment attempts.
+
 ## 0.4.0
 
 ### Minor Changes
