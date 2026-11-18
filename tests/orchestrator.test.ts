@@ -1751,6 +1751,14 @@ describe("durable general issue triage", () => {
       )
       expect(value.github.currentIssue.labels).toEqual(["bot:triage-failed"])
       expect(value.store.proposals()).toEqual([])
+      const issues = value.github.octokit.rest.issues
+      const additions = issues.addLabels.mock.calls.length
+      const removals = issues.removeLabel.mock.calls.length
+      await reconcile(value)
+      await value.deliver(value.work({ action: "scan" }), "unchanged-failed-cycle")
+      expect(issues.addLabels).toHaveBeenCalledTimes(additions)
+      expect(issues.removeLabel).toHaveBeenCalledTimes(removals)
+      expect(value.runtime.triage).toHaveBeenCalledTimes(1)
       now += 2 * 86_400_000
       value.github.currentIssue.labels = []
       await value.deliver(value.work(), "failed-cycle-redelivery")

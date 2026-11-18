@@ -228,10 +228,10 @@ export async function publishReview(
     const current = await issue()
     return new Set(current.labels.map((label) => (typeof label === "string" ? label : label.name)))
   }
-  const projectLabels = async (desired: readonly string[]) => {
+  const projectLabels = async (desired: readonly string[], preserve: readonly string[] = []) => {
     const current = await labels()
     for (const name of REVIEW_LABELS) {
-      if (!current.has(name) || desired.includes(name)) continue
+      if (!current.has(name) || desired.includes(name) || preserve.includes(name)) continue
       persist()
       try {
         await wait(() =>
@@ -304,7 +304,8 @@ export async function publishReview(
     if (review.state !== "complete") {
       delete review.publishedRevision
       persist()
-      await projectLabels([])
+      // Preserve a correct failure label; add a missing one only after summary reconciliation.
+      await projectLabels([], review.state === "failed" ? ["bot:triage-failed"] : [])
       labelsCleared = true
     }
     let comment = await reconcile()
