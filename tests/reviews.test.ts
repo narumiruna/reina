@@ -166,7 +166,8 @@ function legacyRecords(store: Store, activeJob = false): void {
 }
 function downgrade(version: number): void {
   inspect((db) => {
-    db.exec(`DROP TABLE reviews; DROP TABLE review_cursor;
+    db.exec(`DROP TABLE triage_admissions; DROP TABLE triage_initial; DROP TABLE triage_epoch; DROP TABLE triage_coding_cutoffs;
+      DROP TABLE reviews; DROP TABLE review_cursor;
       DROP TABLE request_epoch; DROP INDEX deliveries_by_request;
       ALTER TABLE deliveries DROP COLUMN request_key;
       ${version < 4 ? "ALTER TABLE deliveries DROP COLUMN global_until;" : ""}
@@ -294,12 +295,12 @@ describe("strict review contract", () => {
 })
 
 describe("durable review storage", () => {
-  test("fresh schema6 does not infer success from old attempt hashes", () => {
+  test("fresh schema7 does not infer success from old attempt hashes", () => {
     const store = openStore()
     store.rememberAssessment("legacy-attempt-not-success")
     expect(store.review(review().ref)).toBeUndefined()
     expect(store.reviewBatch(100)).toEqual([])
-    expect(inspect((db) => db.prepare("PRAGMA user_version").get()?.user_version)).toBe(6)
+    expect(inspect((db) => db.prepare("PRAGMA user_version").get()?.user_version)).toBe(7)
     expect(store.saveReview(review(), randomUUID())).toBe(false)
     expect(inspect((db) => db.prepare("SELECT COUNT(*) AS count FROM reviews").get()?.count)).toBe(
       0,
@@ -429,7 +430,10 @@ describe("durable review storage", () => {
       })
       expect(invalidated?.revision).not.toBe(original.revision)
       expect(invalidated?.publishedRevision).toBeUndefined()
-      if (state === "running") expect(invalidated?.nextAttemptAt).toBe(Date.now() + 300_000)
+      if (state === "running") {
+        expect(invalidated?.nextAttemptAt).toBe(0)
+        expect(invalidated?.error).toBe("triage_interrupted")
+      }
       expect(store.proposal(original.ref)).toBeUndefined()
       store.close()
       store = openStore()
@@ -492,7 +496,7 @@ describe("durable review storage", () => {
     )
   })
 
-  test("recovers running attempts without repeating inference for assessed records", () => {
+  test("terminally fails interrupted attempts and preserves saved results and legacy counts", () => {
     let store = openStore()
     const values: Review[] = [
       { ...review(1), state: "running", attempts: 1 },
@@ -510,9 +514,8 @@ describe("durable review storage", () => {
         value.state === "running"
           ? {
               ...value,
-              state: value.attempts < 3 ? "pending" : "failed",
-              nextAttemptAt:
-                value.attempts < 3 ? Date.now() + (value.attempts === 1 ? 60_000 : 300_000) : 0,
+              state: "failed",
+              nextAttemptAt: 0,
               error: "triage_interrupted",
             }
           : value
@@ -549,8 +552,8 @@ describe("durable review storage", () => {
     const recovered = openStore()
     expect(recovered.review(first.ref)).toEqual({
       ...first,
-      state: "pending",
-      nextAttemptAt: Date.now() + 60_000,
+      state: "failed",
+      nextAttemptAt: 0,
       error: "triage_interrupted",
     })
     expect(recovered.review(last.ref)).toEqual({
@@ -956,7 +959,7 @@ describe("review rename reconciliation", () => {
   })
 })
 
-describe("schema5 migrations and private files", () => {
+describe("schema7 migrations and private files", () => {
   test.each([1, 2, 3, 4])(
     "migrates legacy schema%s atomically and preserves existing records and settings",
     (version) => {
@@ -976,7 +979,7 @@ describe("schema5 migrations and private files", () => {
       expect(store.review(review().ref)).toBeUndefined()
       expect(store.scanPage()).toBe(version < 3 ? 1 : 17)
       expect(store.assessed("legacy-attempt-not-success")).toBe(version !== 1)
-      expect(inspect((db) => db.prepare("PRAGMA user_version").get()?.user_version)).toBe(6)
+      expect(inspect((db) => db.prepare("PRAGMA user_version").get()?.user_version)).toBe(7)
       const delivery = inspect((db) => db.prepare("SELECT * FROM deliveries").get())
       expect(delivery).toMatchObject({
         id: "fixture-delivery",
@@ -1029,9 +1032,9 @@ describe("schema5 migrations and private files", () => {
     expect(
       inspect((db) => db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table'").all()),
     ).toEqual([{ name: "review_cursor" }])
-    inspect((db) => db.exec("DROP TABLE review_cursor; PRAGMA user_version = 7;"))
+    inspect((db) => db.exec("DROP TABLE review_cursor; PRAGMA user_version = 8;"))
     expect(() => openStore()).toThrow("Unsupported state database version")
-    expect(inspect((db) => db.prepare("PRAGMA user_version").get()?.user_version)).toBe(7)
+    expect(inspect((db) => db.prepare("PRAGMA user_version").get()?.user_version)).toBe(8)
   })
 
   test("preserves private permissions for the job database and lock", () => {

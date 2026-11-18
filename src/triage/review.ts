@@ -36,7 +36,6 @@ export interface Review {
 
 // Reserve 4 KiB of the 64 KiB record for mutable lifecycle metadata.
 export const REVIEW_RESULT_LIMIT = 60 * 1024
-export const REVIEW_RETRY_DELAYS = [60_000, 300_000] as const
 
 /** Measure the same immutable assessment representation before and after publication. */
 export function reviewResultBytes(review: Review): number {
@@ -72,7 +71,7 @@ export function staleReview(
     ...(review.state === "running"
       ? {
           error: "triage_interrupted",
-          nextAttemptAt: now + (REVIEW_RETRY_DELAYS[review.attempts - 1] ?? 0),
+          nextAttemptAt: 0,
         }
       : {}),
     updatedAt: Math.max(now, review.updatedAt),

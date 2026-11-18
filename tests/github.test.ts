@@ -418,6 +418,26 @@ describe("bounded GitHub reads", () => {
     expect(issue.comments).toEqual([{ id: 1, authorId: actor.id, body: fixture.comments[0].body }])
   })
 
+  test("extracts authoritative optional issue creation time without inventing a baseline", async () => {
+    const { api, github } = setup()
+    expect(await github.issue(12)).not.toHaveProperty("createdAt")
+    api.issue.created_at = "2026-11-03T09:00:00Z"
+    expect(await github.issue(12)).toMatchObject({
+      createdAt: Date.parse(api.issue.created_at),
+    })
+  })
+
+  test.each(["not-a-date", "1969-12-31T23:59:59Z", "2026-11-03T10:03:01Z"])(
+    "fails closed on invalid authoritative issue creation time %s",
+    async (created_at) => {
+      const { api, github } = setup()
+      api.issue.created_at = created_at
+      await expect(github.issue(12)).rejects.toMatchObject({
+        code: "github_invalid_issue_creation",
+      })
+    },
+  )
+
   test.each(["comments", "context", "incomplete", "duplicate"])(
     "fails closed on %s evidence",
     async (kind) => {
@@ -587,6 +607,19 @@ describe("bounded GitHub reads", () => {
     api.events.push(clone(api.events[1]))
     await expect(github.history(12)).rejects.toMatchObject({ code: "github_ambiguous_history" })
   })
+
+  test.each(["unsafe-event-id", "unsafe-actor-id", "string-id", "negative-time", "missing-login"])(
+    "rejects %s label history before it can authorize a retriage",
+    async (kind) => {
+      const { api, github } = setup()
+      if (kind === "unsafe-event-id") api.events[1].id = Number.MAX_SAFE_INTEGER + 1
+      if (kind === "unsafe-actor-id") api.events[1].actor.id = Number.MAX_SAFE_INTEGER + 1
+      if (kind === "string-id") api.events[1].id = "1002"
+      if (kind === "negative-time") api.events[1].created_at = "1969-12-31T23:59:59Z"
+      if (kind === "missing-login") api.events[1].actor.login = ""
+      await expect(github.history(12)).rejects.toThrow()
+    },
+  )
 
   test("bounds pagination even when a server never supplies a last page", async () => {
     const read = vi.fn(async () => response([{}], '<https://evil.test>; rel="next"'))

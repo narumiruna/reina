@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto"
 import { z } from "zod"
 import { authorize, authorizeRequest } from "../github/approval.js"
-import { inspectRequest } from "../github/commands.js"
+import { inspectRequest, validateRequest } from "../github/commands.js"
 import type { Publisher } from "../github/publisher.js"
+import { inspectRetriage, validateRetriage } from "../github/retriage.js"
 import {
   errorStatus,
   type GitHub,
@@ -22,9 +23,15 @@ import type {
   Job,
   Logger,
   Proposal,
+  RetriageRequest,
 } from "../types.js"
 import type { RequestBinding, Store } from "./store.js"
-import { IssueTriage } from "./triage.js"
+import {
+  IssueTriage,
+  reviewBinding,
+  sameBinding as sameReviewBinding,
+  type TriageAuthority,
+} from "./triage.js"
 import { Worker } from "./worker.js"
 
 const refSchema = z.object({
@@ -62,6 +69,12 @@ export const workSchema = z.discriminatedUnion("kind", [
           createdAt: z.number().int().nonnegative(),
         }),
       ])
+      .optional(),
+    retriage: z
+      .object({
+        candidateKey: z.string().regex(/^[a-f0-9]{64}$/),
+        createdAt: z.number().int().nonnegative(),
+      })
       .optional(),
     changedAt: z.number().int().nonnegative().optional(),
     requestIssueHash: z
@@ -139,7 +152,7 @@ const reasons = new Set([
 function failureReason(error: unknown): string {
   if (
     error instanceof GitHubError &&
-    /^(?:github|approval|publication)_[a-z0-9_]{1,64}$/.test(error.code)
+    /^(?:github|approval|publication|retriage)_[a-z0-9_]{1,64}$/.test(error.code)
   )
     return error.code
   return error instanceof Error && reasons.has(error.message) ? error.message : "execution_failed"
@@ -513,13 +526,17 @@ export class Orchestrator {
       return
     }
     if (
-      work.request &&
+      (work.request || work.retriage) &&
       work.requestIssueHash !==
         createHash("sha256")
           .update(JSON.stringify([issue.title, issue.body]))
           .digest("hex")
     )
       throw new Error("proposal_stale")
+    if (work.retriage) {
+      await this.retriage(work, issue, github, publisher, correlationId)
+      return
+    }
     const direct =
       work.request && work.actor
         ? await inspectRequest(github, issue, work.request, work.actor)
@@ -578,31 +595,47 @@ export class Orchestrator {
       await publisher.labels(issue.ref.number, [], ["fix_available", "bot:approved", "bot:working"])
       proposal = undefined
     }
+    // Revocation can already have removed the stored proposal (for example a
+    // verified rename). Keep its old public coding claims revoked on retries.
+    if (!proposal && this.store.review(issue.ref)?.state === "stale")
+      await publisher.labels(issue.ref.number, [], ["fix_available", "bot:approved", "bot:working"])
     // Remote acknowledgement or label writes can outlive receipt revocation.
     if (requestBinding) this.store.bindRequest(correlationId, requestBinding)
-    const controller = new AbortController()
-    const signal = AbortSignal.any([controller.signal, this.shutdown.signal])
-    this.controllers.set(key(issue.ref), controller)
-    this.controllerBranches.set(key(issue.ref), head.branch)
-    this.controllerRefs.set(key(issue.ref), issue.ref)
-    this.controllerContexts.set(key(issue.ref), { binding: requestBinding })
-    let review: Awaited<ReturnType<IssueTriage["run"]>>
-    try {
-      review = await this.reviews.run(issue, head, github, publisher, signal, correlationId)
-    } finally {
-      if (this.controllers.get(key(issue.ref)) === controller) {
-        this.controllers.delete(key(issue.ref))
-        this.controllerBranches.delete(key(issue.ref))
-        this.controllerRefs.delete(key(issue.ref))
-        this.controllerContexts.delete(key(issue.ref))
+    let explicit: TriageAuthority | undefined
+    if (direct?.command === "fix") {
+      const request = direct.request
+      const actor = work.actor
+      if (!actor) throw new Error("actor_missing")
+      const source =
+        request.kind === "comment"
+          ? `fix-comment:${issue.ref.id}:${issue.ref.issueId}:${request.commentId}`
+          : `fix-assignment:${issue.ref.id}:${issue.ref.issueId}:${request.eventId}`
+      const binding = reviewBinding(issue, head, this.config, this.botId)
+      const oldReview = this.store.review(issue.ref)
+      if (oldReview && !sameReviewBinding(oldReview.binding, binding))
+        this.reviews.invalidate(issue.ref, "changed", correlationId)
+      this.store.admitTriage({
+        source,
+        ref: issue.ref,
+        binding,
+        createdAt: request.createdAt,
+      })
+      explicit = {
+        source,
+        force: false,
+        validate: () => validateRequest(github, issue, request, actor),
       }
     }
-    if (this.stopped || signal.aborted) return
-    if (review?.state !== "complete") {
-      if (direct?.command === "fix" && review?.state === "pending")
-        throw new GitHubIssueDeferred("triage_retry_pending", review.nextAttemptAt)
-      return
-    }
+    const review = await this.runReview(
+      issue,
+      head,
+      github,
+      publisher,
+      correlationId,
+      explicit,
+      requestBinding,
+    )
+    if (this.stopped || review?.state !== "complete") return
     const existing = this.store
       .jobs()
       .find((job) => key(job.ref) === key(issue.ref) && job.state === "pr_ready")
@@ -692,6 +725,108 @@ export class Orchestrator {
     this.event("proposal_created", issue.ref, { correlationId, proposalId: proposal.revision })
     if (direct?.command === "fix") {
       await this.executeRequest(work, direct.request, proposal, github, publisher, correlationId)
+    }
+  }
+
+  private async runReview(
+    issue: Issue,
+    head: { branch: string; sha: string },
+    github: GitHub,
+    publisher: Publisher,
+    correlationId: string,
+    explicit?: TriageAuthority,
+    binding?: RequestBinding,
+  ): Promise<Review | undefined> {
+    const controller = new AbortController()
+    const signal = AbortSignal.any([controller.signal, this.shutdown.signal])
+    this.controllers.set(key(issue.ref), controller)
+    this.controllerBranches.set(key(issue.ref), head.branch)
+    this.controllerRefs.set(key(issue.ref), issue.ref)
+    this.controllerContexts.set(key(issue.ref), { binding })
+    try {
+      const review = await this.reviews.run(
+        issue,
+        head,
+        github,
+        publisher,
+        signal,
+        correlationId,
+        explicit,
+      )
+      return signal.aborted ? undefined : review
+    } finally {
+      if (this.controllers.get(key(issue.ref)) === controller) {
+        this.controllers.delete(key(issue.ref))
+        this.controllerBranches.delete(key(issue.ref))
+        this.controllerRefs.delete(key(issue.ref))
+        this.controllerContexts.delete(key(issue.ref))
+      }
+    }
+  }
+
+  private async retriage(
+    work: Extract<Work, { kind: "issue" }>,
+    issue: Issue,
+    github: GitHub,
+    publisher: Publisher,
+    correlationId: string,
+  ): Promise<void> {
+    if (!work.actor || !work.retriage || work.action !== "labeled" || work.label !== "bot:retriage")
+      throw new GitHubError("retriage_request_not_current")
+    const previous = this.store.triageAdmissionForCandidate(work.retriage.candidateKey)
+    const head = await github.head()
+    if (previous && previous.status !== "pending") {
+      await this.runReview(issue, head, github, publisher, correlationId)
+      return
+    }
+    let request: RetriageRequest
+    try {
+      request = await inspectRetriage(github, issue, work.retriage, work.actor, previous?.source)
+    } catch (error) {
+      if (previous && !(error instanceof GitHubDeferred) && !(error instanceof GitHubIssueDeferred))
+        this.store.revokeTriage(previous.source)
+      throw error
+    }
+    if (!previous) {
+      this.cancel(issue.ref)
+      this.reviews.invalidate(issue.ref, "changed", correlationId)
+      this.store.retireCodingRequests(issue.ref, request.createdAt)
+    }
+    const binding = reviewBinding(issue, head, this.config, this.botId)
+    if (previous && !sameReviewBinding(previous.binding, binding)) {
+      this.store.revokeTriage(previous.source)
+      return
+    }
+    if (
+      !this.store.admitTriage({
+        source: request.source,
+        candidateKey: request.candidateKey,
+        createdAt: request.createdAt,
+        ref: issue.ref,
+        binding,
+      })
+    )
+      return
+    if (!previous)
+      this.event("triage_requested", issue.ref, {
+        correlationId,
+        source: request.source,
+        actorId: request.actor.id,
+      })
+    try {
+      await publisher.labels(issue.ref.number, [], ["fix_available", "bot:approved", "bot:working"])
+      await publisher.consumeRetriage(issue, request, () =>
+        this.store.startTriageCleanup(request.source),
+      )
+      await this.runReview(issue, head, github, publisher, correlationId, {
+        source: request.source,
+        force: true,
+        validate: () => validateRetriage(github, issue, request),
+      })
+    } catch (error) {
+      if (!(error instanceof GitHubDeferred) && !(error instanceof GitHubIssueDeferred))
+        this.store.revokeTriage(request.source)
+      throw error
     }
   }
 

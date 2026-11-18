@@ -153,14 +153,17 @@ and credentials: revoke affected sessions and review provider authorization befo
 
 ## Upgrade to durable issue triage
 
-Job database `reina.sqlite` schema 6 retains the schema-5 review records and reconciliation cursor.
-The transactional 5-to-6 migration adds indexed durable request receipt keys and a `request_epoch`
-cutoff. Valid retained sources are backfilled. Unknown pre-upgrade sources need a new human request;
-legacy unbound pending requests are completed without coding. Known bound pending requests retain
-their original baseline. Fresh databases have no legacy cutoff. Existing claimed approvals,
-publication records, and legacy attempt hashes are preserved; hashes do not become completed
-reviews. This is not encrypted `settings.sqlite`, which remains at schema 3. No new UI, settings,
-environment variable, or automatic label provisioning is added.
+Job database `reina.sqlite` schema 7 retains review records, reconciliation cursors, and existing
+coding request receipts. The transactional migration adds permanent initial-triage markers,
+read-only admissions, one-use label-cleanup intents, and admission baselines. Existing attempts
+and ambiguous zero-attempt legacy reviews cannot regain automatic eligibility. Interrupted or
+scheduled inference does not retry; saved results and publication recovery remain available.
+Unknown pre-upgrade issue history requires a fresh human request, rather than an automatic repeat.
+Authoritative creation time after the upgrade cutoff permits initial assessment of new issues.
+Fresh databases have no legacy automatic cutoff. Pre-existing labels do not become requests.
+Existing claimed approvals, publication records, request epochs, and legacy attempt hashes remain;
+hashes do not become completed reviews. This is not encrypted `settings.sqlite`, which remains at
+schema 3. No new UI, setting, environment variable, or automatic label provisioning is added.
 
 Before upgrade, stop the single instance and back up both databases consistently, including WAL
 state, with the original `ENCRYPTION_KEY` retained separately. Test migration and restoration on
@@ -169,11 +172,20 @@ backups; never lower schema versions or delete approval/job/review records. A re
 old sessions, credentials, and publication intents but does not undo GitHub comments, labels,
 branches, or PRs. Review both restored authority and remote state before enabling dispatch.
 
-Have the App owner create `bot:triaged`, `bot:needs-info`, `bot:needs-human`, and `bot:triage-failed`
-in addition to the existing six definitions. See [label meanings](architecture.md#approval-and-state).
-Missing definitions can leave publication pending. Do not remove maintainer labels or edit immutable
-proposal comments to repair triage. Follow [triage recovery](architecture.md#attempts-and-publication-recovery)
-rather than clearing saved results, attempts, or publication intents.
+After reviewed code is deployed, have the App owner create `bot:retriage` alongside the existing
+ten definitions. A human with current write, maintain, or admin permission adds it to request one
+read-only reassessment. Admission is persisted before the bot removes the trigger; inference is
+claimed at most once. Failed, timed-out, or interrupted assessments require another fresh request.
+If cleanup is uncertain or races another transition, the maintainer may need to remove and re-add
+the label. Label presence on scans is not authority; the bot never adds this trigger itself.
+It does not authorize coding or a PR. A durable per-issue cutoff rejects older coding requests,
+including ones delivered later. A subsequent direct coding request must be created strictly after
+that retriage transition; same-second ordering fails closed. A later coding attempt needs fresh
+valid coding authority.
+See [label meanings](architecture.md#approval-and-state). Missing definitions can leave publication
+pending. Do not remove maintainer labels or edit immutable proposal comments to repair triage.
+Follow [triage recovery](architecture.md#attempts-and-publication-recovery) rather than clearing
+saved results, attempts, admissions, or publication intents.
 
 ## Connect GitHub
 
@@ -376,10 +388,12 @@ applying the replacement. Use an authorized admin session; do not send credentia
    itself require rebuilding dependencies. In **Runtime → Immutable worker image ID**, enter
    the verified replacement ID and select **Save and apply configuration**. Preserve unrelated
    settings and existing limits. Saved Runtime settings, not a changed local tag or stale
-   environment variable, select the worker. The new image changes the policy binding and permits
-   a fresh assessment; it also invalidates old proposals. Do not reset SQLite records, replay
-   consumed requests, clear publication intents, or treat this operation as coding authorization.
-5. **Verify current-cycle publication for every still-eligible affected issue.** Require runtime
+   environment variable, select the worker. The new image changes the policy binding and
+   invalidates old results/proposals, but does not authorize another assessment. After readiness
+   is confirmed, a permitted maintainer must add `bot:retriage` for each intended read-only retry,
+   with separate live-use/cost authorization. Do not reset SQLite records, replay consumed
+   requests, clear publication intents, or treat this operation as coding authorization.
+5. **Verify publication for each explicitly requested, still-eligible affected issue.** Require runtime
    readiness, a fresh review revision, `triage_completed`, one current summary, `bot:triaged`,
    and the matching `bot:needs-info` or `bot:needs-human` label when applicable. A fix candidate
    needs neither outcome label. Confirm `bot:triage-failed` is absent. Closed or skipped issues
@@ -707,7 +721,7 @@ continuation data. No ambient environment, command, filesystem, or host Pi auth 
 3. Securely back up the original encryption key separately from the state backup. Restrict access
    to both. Losing that key makes the encrypted App key and provider credentials undecryptable.
 4. Restore compatible application state and the original key together. A downgrade after job
-   schema 6 or settings schema 3 requires matching pre-upgrade backups. Review restored credentials
+   schema 7 or settings schema 3 requires matching pre-upgrade backups. Review restored credentials
    and revoke affected sessions; a backup can restore old authorization. Reconcile GitHub resources,
    including triage comments and labels, before enabling dispatch. A database restore does not undo
    remote writes. Do not delete state to hide an encryption-key mismatch.
@@ -928,10 +942,13 @@ later commits. Native assignment still requires an eligible GitHub identity.
 
 This is an owner-operated acceptance procedure, not permission for live writes or paid inference.
 Current issue-triage test evidence must be recorded separately from the historical counts above.
+The `bot:retriage` workflow, schema-7 production upgrade, real label-delivery/removal races, and
+paid-provider behavior remain owner acceptance checks. Do not enable paid dispatch until the
+required production-host checks and owner acceptance pass, or an explicit exception is recorded.
 
 1. **App owner and repository maintainer**
    - Prerequisites: authorize disposable issues and bounded provider use; confirm minimum App
-     permissions/events, all ten label definitions, and safe target CI.
+     permissions/events, all eleven label definitions, and safe target CI.
    - Actions: submit a clear small fix, missing reproduction details, and a product decision.
    - Expected: one mutable summary per issue with kind and host outcome. Needs-info gets
      `bot:needs-info`; a human decision gets `bot:needs-human`. `bot:triaged` follows confirmed
@@ -939,8 +956,12 @@ Current issue-triage test evidence must be recorded separately from the historic
      The label-based path needs fresh approval of that exact proposal. A permitted human's
      explicit mention request, or supported bot assignment, can instead delegate one policy-bound
      attempt without an additional label. Both paths publish the immutable proposal before coding.
-     Inspect one draft PR. Evidence/base/policy changes and 24-hour renewal need a new human
-     request or approval. Native assignment must first pass GitHub's assignee-eligibility check;
+     Inspect one draft PR through separately authorized coding work. Evidence/base/policy changes
+     and 24-hour proposal expiry never automatically renew assessment. Add `bot:retriage` for
+     another read-only assessment; add it again for a later one. Verify no code, job claim, or PR
+     from that trigger, including with old approval labels or resumed older coding receipts.
+     A fresh explicit coding request remains a separate delegation.
+     Native assignment must first pass GitHub's assignee-eligibility check;
      the current `reinabot[bot]` App is rejected by GitHub.
 2. **Repository maintainer and operator**
    - Prerequisites: authorize disposable edit, failure, and restart scenarios; retain saved state.
@@ -949,12 +970,15 @@ Current issue-triage test evidence must be recorded separately from the historic
    - Expected: stale-state removal, one updated summary, and no own-comment/label inference loop.
      Closure/skip makes the summary inactive and removes all four triage labels without inference.
      Unavailable/incomplete evidence invalidates the review without claimed successful writes.
-     Read recovery preserves the saved model error, attempt count, and retry deadline. A summary
+     Read recovery preserves the saved model error and consumed allowance. A summary
      conflict clears the reviewed claim without editing foreign comments. One trusted, scoped
      triage summary does not consume the ordinary 100-comment/128-KiB evidence budget.
-     Publication recovery reuses the saved result. At most three attempts use allowed one-minute/
-     five-minute retries; invalid output/isolation failure stops the cycle. Exhausted failures
-     remain suppressed after restart or label removal, separate from successful 24-hour renewal.
+     Publication recovery reuses the saved result. Exactly one initial invocation is the maximum;
+     timeout, transient error, interruption, and invalid output never grant background retries.
+     Scans, edits, base/policy changes, reopening, and restart cannot increase invocation counts.
+     Confirm a new permitted human label transition is needed after failure. Replay the same
+     source with a different delivery GUID and check that it cannot grant another run.
+     Check permission loss, ambiguous or incomplete history, and uncertain cleanup fail closed.
    - For a same-owner rename, update the configured repository name. Confirm that live numeric
      identity checks permit recovery, the summary is reused, and any replacement proposal needs
      a fresh human request or approval. Do not use this path for owner transfers or
@@ -969,8 +993,10 @@ Current issue-triage test evidence must be recorded separately from the historic
 4. **Deployment operator**
    - Prerequisites: stopped-instance backups with WAL state and the original key, disposable
      migration/restore copies, and supported Linux with private same-path staging.
-   - Actions: check job schema 4-to-5 and 5-to-6 migrations separately from settings schema 3; test restore,
-     permissions, quotas, cleanup, and the complete runtime suite. Reconcile restored GitHub state.
+   - Actions: check supported job migrations through schema 7 separately from settings schema 3; test restore,
+     permissions, quotas, cleanup, and the complete runtime suite. Verify legacy pending/running
+     work cannot restore inference eligibility. Reconcile restored GitHub state and later consumed
+     receipts: an older backup does not preserve the single-shot guarantee by itself.
    - Expected: compatible state and confirmed runtime controls before dispatch. Preflight alone
      is insufficient; retain full-suite results and any unverified paths.
 
