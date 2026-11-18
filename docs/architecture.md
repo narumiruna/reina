@@ -491,10 +491,11 @@ requests, including deliveries not received yet, rather than letting its result 
 A subsequent direct coding request must be created strictly after that retriage transition;
 same-second ordering fails closed. Existing explicit coding requests remain separate: they reuse a
 current result or authorize one needed assessment, then follow their normal coding checks.
-A later proposal still requires fresh valid coding authority. Ordinary comments, label repair,
-reopening, settings changes, and 24-hour proposal expiry do not grant reassessment. A host
-review-cycle UUID still binds each replacement proposal; timestamps are never extended to claim
-freshness. Existing single-slot execution, cancellation, worker limits, and GitHub cooldowns apply.
+A later scan can publish a proposal from a current fix candidate. Coding still requires fresh,
+valid authority for that proposal. Ordinary comments, label repair, reopening, settings changes,
+and 24-hour proposal expiry do not grant reassessment. A host review-cycle UUID still binds each
+replacement proposal; timestamps are never extended to claim freshness. Existing single-slot
+execution, cancellation, worker limits, and GitHub cooldowns apply.
 
 Publication retries use the saved assessment, not another model call. The publisher checks
 repository, issue, installation, bot authorship, stable issue marker, and stored comment ID before
@@ -702,8 +703,11 @@ changed, do not resume remote writes. Existing remote effects require operator r
    branches/PRs and triage comments/labels before enabling work. Restoring SQLite does not undo
    GitHub writes or guarantee that restored review projections are current. Preserve maintainer
    labels and immutable proposal evidence. Labels cannot reconstruct authorization.
-5. For an interrupted coding attempt, inspect its failure and have a maintainer remove/re-add
-   approval only if the proposal is still current. Otherwise wait for a new proposal.
+5. For an interrupted coding attempt, inspect its failure. If the proposal is still current, have
+   a maintainer remove and re-add `bot:approved`. If the proposal expired or is otherwise stale,
+   have a permitted maintainer add `bot:retriage`. If that label is already present, remove it and
+   then re-add it. Review and separately approve any new proposal. Alternatively, submit a fresh
+   authorized direct coding request.
 6. For unknown publication, inspect the stored intent and matching GitHub resources. Do not
    delete a branch/PR or reset an intent without explicit maintainer authorization.
 7. On rollback, stop scans/dispatch, cancel workers, preserve resource IDs, and restore a compatible

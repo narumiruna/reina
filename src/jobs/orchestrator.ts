@@ -29,6 +29,7 @@ import type { RequestBinding, Store } from "./store.js"
 import {
   IssueTriage,
   reviewBinding,
+  reviewResultFresh,
   sameBinding as sameReviewBinding,
   type TriageAuthority,
 } from "./triage.js"
@@ -167,7 +168,10 @@ export class Orchestrator {
   private controllers = new Map<string, AbortController>()
   private controllerBranches = new Map<string, string>()
   private controllerRefs = new Map<string, IssueRef>()
-  private controllerContexts = new Map<string, { jobId?: string; binding?: RequestBinding }>()
+  private controllerContexts = new Map<
+    string,
+    { jobId?: string; binding?: RequestBinding; retriageSource?: string }
+  >()
   private worker: Worker
   private reviews: IssueTriage
 
@@ -253,12 +257,19 @@ export class Orchestrator {
         reason,
       })
     }
-    for (const { ref, preservedJobIds, preservedBindings } of intake.revocations) {
+    for (const {
+      ref,
+      preservedJobIds,
+      preservedBindings,
+      preservedTriageSources,
+    } of intake.revocations) {
       const context = this.controllerContexts.get(key(ref))
       const binding = context?.binding
       const preserved = context?.jobId
         ? preservedJobIds.includes(context.jobId)
-        : binding && preservedBindings.some((preserved) => sameRequestBinding(preserved, binding))
+        : context?.retriageSource
+          ? preservedTriageSources.includes(context.retriageSource)
+          : binding && preservedBindings.some((preserved) => sameRequestBinding(preserved, binding))
       if (!preserved) this.cancel(ref, true)
     }
     if (!intake.queued) return
@@ -458,19 +469,24 @@ export class Orchestrator {
     try {
       issue = await github.issue(work.ref.number)
     } catch (error) {
+      if (this.stopped) throw error
       const stored = this.store.reviewForReconciliation(work.ref)
+      const incomplete = error instanceof GitHubIssueDeferred
+      const unavailable = [404, 410].includes(errorStatus(error) ?? 0)
+      // A retryable read does not revoke an unused admission or change why a
+      // review was already stale. Only a current result can recover as current.
       if (
         stored &&
-        (error instanceof GitHubIssueDeferred || [404, 410].includes(errorStatus(error) ?? 0))
+        (unavailable ||
+          (incomplete &&
+            stored.state !== "stale" &&
+            !(stored.state === "pending" && error.retryAt !== undefined)))
       ) {
         const invalidated = this.reviews.invalidate(stored.ref, "unavailable", correlationId)
         if (invalidated) {
           const review: Review = {
             ...invalidated,
-            evidenceError:
-              error instanceof GitHubIssueDeferred
-                ? "triage_evidence_unavailable"
-                : "triage_issue_unavailable",
+            evidenceError: unavailable ? "triage_issue_unavailable" : "triage_evidence_unavailable",
             updatedAt: Math.max(Date.now(), invalidated.updatedAt),
           }
           if (!this.store.saveReview(review, invalidated.revision)) throw new Error("triage_stale")
@@ -617,12 +633,10 @@ export class Orchestrator {
       const oldReview = this.store.review(issue.ref)
       if (oldReview && !sameReviewBinding(oldReview.binding, binding))
         this.reviews.invalidate(issue.ref, "changed", correlationId)
-      this.store.admitTriage({
-        source,
-        ref: issue.ref,
-        binding,
-        createdAt: request.createdAt,
-      })
+      this.store.admitTriage(
+        { source, ref: issue.ref, binding, createdAt: request.createdAt },
+        { deliveryId: correlationId, request },
+      )
       explicit = {
         source,
         force: false,
@@ -653,6 +667,22 @@ export class Orchestrator {
     if (review.outcome !== "fix_candidate") {
       if (proposal) this.cancel(issue.ref)
       await publisher.labels(issue.ref.number, [], ["fix_available", "bot:approved", "bot:working"])
+      return
+    }
+    // Projection can finish after the cached proposal expires. Use the
+    // current result, not a proposal that expired during the remote calls.
+    if (proposal && proposal.expiresAt <= Date.now()) {
+      this.store.invalidate(issue.ref)
+      proposal = undefined
+      await publisher.labels(issue.ref.number, [], ["fix_available", "bot:approved", "bot:working"])
+    }
+    if (!reviewResultFresh(review)) {
+      if (issue.labels.includes("bot:approved") || issue.labels.includes("fix_available"))
+        await publisher.labels(
+          issue.ref.number,
+          [],
+          ["fix_available", "bot:approved", "bot:working"],
+        )
       return
     }
     if (proposal && !proposal.commentId) {
@@ -703,12 +733,7 @@ export class Orchestrator {
       this.store.review(issue.ref)?.revision !== review.revision
     )
       return
-    if (
-      !review.assessment ||
-      review.assessedAt === undefined ||
-      review.assessedAt + 86_400_000 <= Date.now()
-    )
-      return
+    if (!review.assessment || review.assessedAt === undefined || !reviewResultFresh(review)) return
     proposal = makeProposal(
       current,
       snapshot,
@@ -745,7 +770,10 @@ export class Orchestrator {
     this.controllers.set(key(issue.ref), controller)
     this.controllerBranches.set(key(issue.ref), head.branch)
     this.controllerRefs.set(key(issue.ref), issue.ref)
-    this.controllerContexts.set(key(issue.ref), { binding })
+    this.controllerContexts.set(key(issue.ref), {
+      binding,
+      ...(explicit?.force ? { retriageSource: explicit.source } : {}),
+    })
     try {
       const review = await this.reviews.run(
         issue,
@@ -786,28 +814,32 @@ export class Orchestrator {
     try {
       request = await inspectRetriage(github, issue, work.retriage, work.actor, previous?.source)
     } catch (error) {
-      if (previous && !(error instanceof GitHubDeferred) && !(error instanceof GitHubIssueDeferred))
+      if (
+        !this.stopped &&
+        previous &&
+        !(error instanceof GitHubDeferred) &&
+        !(error instanceof GitHubIssueDeferred)
+      )
         this.store.revokeTriage(previous.source)
       throw error
     }
-    if (!previous) {
-      this.cancel(issue.ref)
-      this.reviews.invalidate(issue.ref, "changed", correlationId)
-      this.store.retireCodingRequests(issue.ref, request.createdAt)
-    }
+    if (this.stopped) return
     const binding = reviewBinding(issue, head, this.config, this.botId)
     if (previous && !sameReviewBinding(previous.binding, binding)) {
       this.store.revokeTriage(previous.source)
       return
     }
     if (
-      !this.store.admitTriage({
-        source: request.source,
-        candidateKey: request.candidateKey,
-        createdAt: request.createdAt,
-        ref: issue.ref,
-        binding,
-      })
+      !this.store.beginRetriage(
+        {
+          source: request.source,
+          candidateKey: request.candidateKey,
+          createdAt: request.createdAt,
+          ref: issue.ref,
+          binding,
+        },
+        correlationId,
+      )
     )
       return
     if (!previous)
@@ -818,16 +850,24 @@ export class Orchestrator {
       })
     try {
       await publisher.labels(issue.ref.number, [], ["fix_available", "bot:approved", "bot:working"])
-      await publisher.consumeRetriage(issue, request, () =>
-        this.store.startTriageCleanup(request.source),
+      if (this.stopped) return
+      await publisher.consumeRetriage(
+        issue,
+        request,
+        () => !this.stopped && this.store.startTriageCleanup(request.source),
       )
+      if (this.stopped) return
       await this.runReview(issue, head, github, publisher, correlationId, {
         source: request.source,
         force: true,
         validate: () => validateRetriage(github, issue, request),
       })
     } catch (error) {
-      if (!(error instanceof GitHubDeferred) && !(error instanceof GitHubIssueDeferred))
+      if (
+        !this.stopped &&
+        !(error instanceof GitHubDeferred) &&
+        !(error instanceof GitHubIssueDeferred)
+      )
         this.store.revokeTriage(request.source)
       throw error
     }

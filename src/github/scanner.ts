@@ -395,6 +395,13 @@ export class GitHub {
     )
     if (data.number !== number) throw new GitHubError("github_issue_mismatch")
     const issueId = numericId(data.id)
+    let createdAt: number | undefined
+    if (data.created_at !== undefined) {
+      createdAt = typeof data.created_at === "string" ? Date.parse(data.created_at) : Number.NaN
+      if (!Number.isSafeInteger(createdAt) || createdAt < 0 || createdAt > Date.now()) {
+        throw new GitHubIssueDeferred("github_invalid_issue_creation")
+      }
+    }
     const { comments, ordinaryBytes } = await this.readComments(number, issueId, data.comments)
     if (
       Buffer.byteLength(data.title) + Buffer.byteLength(data.body ?? "") + ordinaryBytes >
@@ -408,13 +415,6 @@ export class GitHub {
     })
     if (assignees && new Set(assignees.map((assignee) => assignee.id)).size !== assignees.length)
       throw new GitHubError("github_invalid_assignees")
-    const createdAt = data.created_at === undefined ? undefined : Date.parse(data.created_at)
-    if (
-      createdAt !== undefined &&
-      (!Number.isSafeInteger(createdAt) || createdAt < 0 || createdAt > Date.now())
-    ) {
-      throw new GitHubError("github_invalid_issue_creation")
-    }
     return {
       ref: { ...this.repository, number, issueId },
       title: data.title,

@@ -10,6 +10,7 @@ import {
   GitHub,
   type GitHubClient,
   GitHubDeferred,
+  GitHubIssueDeferred,
   GitHubOutcomeUnknown,
   gitHash,
 } from "../src/github/scanner.js"
@@ -427,14 +428,15 @@ describe("bounded GitHub reads", () => {
     })
   })
 
-  test.each(["not-a-date", "1969-12-31T23:59:59Z", "2026-11-03T10:03:01Z"])(
-    "fails closed on invalid authoritative issue creation time %s",
+  test.each(["not-a-date", "1969-12-31T23:59:59Z", "2026-11-03T10:03:01Z", 0])(
+    "defers only the issue on invalid authoritative creation time %s",
     async (created_at) => {
       const { api, github } = setup()
       api.issue.created_at = created_at
-      await expect(github.issue(12)).rejects.toMatchObject({
-        code: "github_invalid_issue_creation",
-      })
+      const issue = github.issue(12)
+      await expect(issue).rejects.toBeInstanceOf(GitHubIssueDeferred)
+      await expect(issue).rejects.toMatchObject({ code: "github_invalid_issue_creation" })
+      expect(api.rest.issues.listComments).not.toHaveBeenCalled()
     },
   )
 

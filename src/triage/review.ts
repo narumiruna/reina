@@ -59,10 +59,12 @@ export function staleReview(
   if (
     review.state === "stale" &&
     review.inactiveReason === reason &&
+    review.evidenceError !== "triage_evidence_unavailable" &&
     reviewResultBytes(review) <= REVIEW_RESULT_LIMIT
   )
     return review
-  const { publishedRevision: _published, ...previous } = review
+  // A new invalidation ends any restoration eligibility from a prior read failure.
+  const { publishedRevision: _published, evidenceError: _evidence, ...previous } = review
   const invalidated: Review = {
     ...previous,
     revision: randomUUID(),

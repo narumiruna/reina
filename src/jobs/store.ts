@@ -12,7 +12,7 @@ import {
   staleReview,
 } from "../triage/review.js"
 import { triageSchema } from "../triage/schema.js"
-import type { Approval, IssueRef, Job, JobState, Proposal } from "../types.js"
+import type { Approval, ExecutionRequest, IssueRef, Job, JobState, Proposal } from "../types.js"
 
 const positiveId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
 const timestamp = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
@@ -95,6 +95,7 @@ export interface DeliveryIntakeResult {
     ref: IssueRef
     preservedJobIds: string[]
     preservedBindings: RequestBinding[]
+    preservedTriageSources: string[]
   }[]
   reviews: {
     ref: IssueRef
@@ -317,9 +318,14 @@ function sameReviewPins(a: IssueRef, b: IssueRef): boolean {
   )
 }
 
-function requestSource(
-  payload: unknown,
-): { ref: IssueRef; createdAt: number; requestKey: string } | undefined {
+function requestSource(payload: unknown):
+  | {
+      ref: IssueRef
+      request: z.infer<typeof requestCandidateSchema>
+      createdAt: number
+      requestKey: string
+    }
+  | undefined {
   if (typeof payload !== "object" || payload === null) return undefined
   const candidate = payload as Record<string, unknown>
   const ref = refSchema.safeParse(candidate.ref)
@@ -345,12 +351,15 @@ function requestSource(
   }
   return {
     ref: ref.data,
+    request: request.data,
     createdAt: request.data.createdAt,
     requestKey: createHash("sha256").update(stable(identity)).digest("hex"),
   }
 }
 
-function retriageSource(payload: unknown): { createdAt: number; requestKey: string } | undefined {
+function retriageSource(
+  payload: unknown,
+): { ref: IssueRef; candidateKey: string; createdAt: number; requestKey: string } | undefined {
   if (typeof payload !== "object" || payload === null) return undefined
   const candidate = payload as Record<string, unknown>
   const ref = refSchema.safeParse(candidate.ref)
@@ -362,6 +371,8 @@ function retriageSource(payload: unknown): { createdAt: number; requestKey: stri
     return undefined
   // The signed candidate digest, not a mutable envelope or delivery GUID, is the receipt.
   return {
+    ref: ref.data,
+    candidateKey: retriage.data.candidateKey,
     createdAt: retriage.data.createdAt,
     requestKey: createHash("sha256").update(`retriage:${retriage.data.candidateKey}`).digest("hex"),
   }
@@ -819,42 +830,108 @@ export class Store {
     return row ? this.readTriageAdmission(row) : undefined
   }
 
-  admitTriage(admission: TriageAdmission): boolean {
-    const db = this.database()
+  /** The caller must verify the live request before identifying its accepted delivery. */
+  admitTriage(
+    admission: TriageAdmission,
+    receipt?: { deliveryId: string; request: ExecutionRequest },
+  ): boolean {
     const parsed = triageAdmissionSchema.safeParse(admission)
-    if (!parsed.success) return false
+    if (!parsed.success || parsed.data.candidateKey) return false
     const value = parsed.data
     return this.transaction(() => {
-      if (!value.candidateKey && this.retiredCodingRequest(value.ref, value.createdAt)) return false
-      const previous = this.triageAdmission(value.source)
-      if (previous) {
-        const { status, cleanupIntent: _cleanup, ...identity } = previous
-        return status === "pending" && stable(identity) === stable(value)
-      }
-      if (value.candidateKey && this.triageAdmissionForCandidate(value.candidateKey)) return false
-      const requestEpoch = db.prepare("SELECT reject_before FROM request_epoch WHERE id = 1").get()
-      if (!requestEpoch) throw new Error("Missing request epoch record")
-      const cutoff = value.candidateKey
-        ? this.triageEpoch().labelAfter
-        : requestEpoch.reject_before === null
-          ? null
-          : validate(timestamp, requestEpoch.reject_before, "request epoch")
-      if (value.createdAt > Date.now() || (cutoff !== null && value.createdAt <= cutoff))
+      if (this.retiredCodingRequest(value.ref, value.createdAt) || value.createdAt > Date.now())
         return false
-      const record: TriageAdmissionRecord = { ...value, status: "pending", cleanupIntent: false }
-      db.prepare(
+      const pending =
+        receipt && this.pendingDirectReceipt(value, receipt.deliveryId, receipt.request)
+      if (receipt && !pending) return false
+      const previous = this.triageAdmission(value.source)
+      if (previous) return this.samePendingAdmission(previous, value)
+      const cutoff = this.requestEpoch()
+      if (
+        cutoff !== null &&
+        value.createdAt <= cutoff &&
+        (!pending || !this.unspentMigratedReceipt(pending, cutoff))
+      )
+        return false
+      this.insertTriageAdmission(value)
+      return true
+    })
+  }
+
+  /** Admit a verified read-only transition and retire older coding authority together. */
+  beginRetriage(admission: TriageAdmission, id: string): boolean {
+    const parsed = triageAdmissionSchema.safeParse(admission)
+    if (!parsed.success || !parsed.data.candidateKey) return false
+    const value = parsed.data
+    return this.transaction(() => {
+      const row = this.pendingDelivery(id)
+      const candidate = row && retriageSource(row.payload)
+      const actor = actorSchema.safeParse(row?.payload.actor)
+      const prefix = `retriage:${value.ref.installationId}:${value.ref.id}:${value.ref.issueId}:${value.ref.number}:`
+      if (
+        !candidate ||
+        candidate.requestKey !== row?.requestKey ||
+        !sameRef(candidate.ref, value.ref) ||
+        candidate.candidateKey !== value.candidateKey ||
+        candidate.createdAt !== value.createdAt ||
+        !actor.success ||
+        actor.data.type !== "User" ||
+        !value.source.startsWith(prefix) ||
+        !/^[1-9]\d*$/.test(value.source.slice(prefix.length)) ||
+        value.createdAt > Date.now() ||
+        value.createdAt <= this.triageEpoch().labelAfter
+      )
+        return false
+      const previous = this.triageAdmission(value.source)
+      if (previous) return this.samePendingAdmission(previous, value)
+      if (this.triageAdmissionForCandidate(candidate.candidateKey)) return false
+
+      this.retireCodingReceipts(value.ref, value.createdAt)
+      this.invalidateRecords(value.ref)
+      const review = this.review(value.ref)
+      if (review) this.storeStaleReview(review, "changed", Date.now())
+      const newer = this.newerRequests(value.ref, value.createdAt)
+      this.revokeTriageAdmissions(
+        value.ref,
+        (other) =>
+          other.createdAt > value.createdAt &&
+          sameRef(other.ref, value.ref) &&
+          stable(other.binding) === stable(value.binding) &&
+          (other.candidateKey !== undefined ||
+            (!this.retiredCodingRequest(other.ref, other.createdAt) &&
+              newer.some(
+                ({ source, binding }) =>
+                  binding !== undefined &&
+                  stable(binding) === stable(requestBinding(other)) &&
+                  source.createdAt === other.createdAt &&
+                  this.matchesDirectSource(other, source.request),
+              ))),
+      )
+      this.insertTriageAdmission(value)
+      return true
+    })
+  }
+
+  private samePendingAdmission(previous: TriageAdmissionRecord, value: TriageAdmission): boolean {
+    const { status, cleanupIntent: _cleanup, ...identity } = previous
+    return status === "pending" && stable(identity) === stable(value)
+  }
+
+  private insertTriageAdmission(value: TriageAdmission): void {
+    const record: TriageAdmissionRecord = { ...value, status: "pending", cleanupIntent: false }
+    this.database()
+      .prepare(
         "INSERT INTO triage_admissions(source,issue_key,candidate_key,status,json) VALUES(?,?,?,?,?)",
-      ).run(
+      )
+      .run(
         value.source,
         key(value.ref),
         value.candidateKey ?? null,
         record.status,
         JSON.stringify(record),
       )
-      // Human-first work reserves the initial budget even if it is later cancelled.
-      this.reserveAutomaticTriage(value.ref)
-      return true
-    })
+    // Human-first work reserves the initial budget even if it is later cancelled.
+    this.reserveAutomaticTriage(value.ref)
   }
 
   private updateTriageAdmission(admission: TriageAdmissionRecord): void {
@@ -915,12 +992,17 @@ export class Store {
       if (
         admission.createdAt > cutoff &&
         sameRef(admission.ref, scope.ref) &&
-        stable(admission.binding) === stable(review.binding) &&
-        !scope.preservedBindings.some(
-          (binding) => stable(binding) === stable(requestBinding(admission)),
+        sameRef(review.ref, scope.ref) &&
+        stable(admission.binding) === stable(review.binding)
+      ) {
+        if (admission.candidateKey) scope.preservedTriageSources.push(admission.source)
+        else if (
+          !scope.preservedBindings.some(
+            (binding) => stable(binding) === stable(requestBinding(admission)),
+          )
         )
-      )
-        scope.preservedBindings.push(requestBinding(admission))
+          scope.preservedBindings.push(requestBinding(admission))
+      }
     }
   }
 
@@ -938,9 +1020,11 @@ export class Store {
         sameRef(admission.ref, ref) &&
         review !== undefined &&
         stable(admission.binding) === stable(review.binding) &&
-        scope.preservedBindings.some(
-          (binding) => stable(binding) === stable(requestBinding(admission)),
-        ),
+        (admission.candidateKey
+          ? scope.preservedTriageSources.includes(admission.source)
+          : scope.preservedBindings.some(
+              (binding) => stable(binding) === stable(requestBinding(admission)),
+            )),
     )
   }
 
@@ -1174,35 +1258,130 @@ export class Store {
     )
   }
 
-  private duplicateRequest(source: NonNullable<ReturnType<typeof requestSource>>): boolean {
-    const db = this.database()
-    if (this.retiredCodingRequest(source.ref, source.createdAt)) return true
-    if (
-      db.prepare("SELECT id FROM deliveries WHERE request_key = ? LIMIT 1").get(source.requestKey)
-    )
-      return true
-    // Legacy claims remain durable evidence even when their delivery payload is gone.
-    for (const row of db
-      .prepare("SELECT json FROM approvals WHERE issue_key = ?")
-      .all(key(source.ref))) {
-      const approval = parseRecord(approvalSchema, row.json, "approval")
-      if (
-        approval.request &&
-        requestSource({ kind: "issue", ref: source.ref, request: approval.request })?.requestKey ===
-          source.requestKey
+  private pendingDelivery(id: string) {
+    deliveryId(id)
+    const row = this.database()
+      .prepare(
+        "SELECT payload,request_key,accepted_at FROM deliveries WHERE id = ? AND status = 'pending'",
       )
-        return true
+      .get(id)
+    if (typeof row?.payload !== "string") return undefined
+    const payload = JSON.parse(row.payload)
+    if (typeof payload !== "object" || payload === null) return undefined
+    return {
+      payload,
+      requestKey: row.request_key,
+      acceptedAt: validate(timestamp, row.accepted_at, "delivery acceptance"),
     }
-    const cutoff = db.prepare("SELECT reject_before FROM request_epoch WHERE id = 1").get()
-    if (!cutoff) throw new Error("Missing request epoch record")
+  }
+
+  private matchesDirectSource(
+    admission: TriageAdmission,
+    request: NonNullable<ReturnType<typeof requestSource>>["request"],
+    eventId?: string,
+  ): boolean {
+    const { ref, source } = admission
+    if (request.kind === "comment")
+      return source === `fix-comment:${ref.id}:${ref.issueId}:${request.commentId}`
+    const prefix = `fix-assignment:${ref.id}:${ref.issueId}:`
+    return eventId === undefined
+      ? source.startsWith(prefix) && /^[1-9]\d*$/.test(source.slice(prefix.length))
+      : /^[1-9]\d*$/.test(eventId) && source === `${prefix}${eventId}`
+  }
+
+  private pendingDirectReceipt(admission: TriageAdmission, id: string, request: ExecutionRequest) {
+    const row = this.pendingDelivery(id)
+    if (!row) return undefined
+    const source = requestSource(row.payload)
+    const actor = actorSchema.safeParse(row.payload.actor)
+    const candidate = requestCandidateSchema.safeParse(request)
+    const binding = requestBindingSchema.safeParse(row.payload.requestBinding)
+    if (
+      !source ||
+      source.requestKey !== row.requestKey ||
+      !sameRef(source.ref, admission.ref) ||
+      source.createdAt !== admission.createdAt ||
+      !actor.success ||
+      actor.data.type !== "User" ||
+      !candidate.success ||
+      stable(candidate.data) !== stable(source.request) ||
+      !this.matchesDirectSource(
+        admission,
+        source.request,
+        request.kind === "assignment" ? request.eventId : undefined,
+      ) ||
+      !binding.success ||
+      stable(binding.data) !== stable(requestBinding(admission))
+    )
+      return undefined
+    return { source, acceptedAt: row.acceptedAt, issueHash: row.payload.requestIssueHash }
+  }
+
+  private unspentMigratedReceipt(
+    receipt: NonNullable<ReturnType<Store["pendingDirectReceipt"]>>,
+    cutoff: number,
+  ): boolean {
+    const { source, acceptedAt, issueHash } = receipt
+    if (acceptedAt > cutoff || !digest.safeParse(issueHash).success || this.consumedRequest(source))
+      return false
+    // A second payload-bearing legacy row or an assessment that may have run
+    // since intake makes the request's unspent status ambiguous. Null payload
+    // rows can be replay rejections written after migration, not attempts.
+    const count = this.database()
+      .prepare(
+        "SELECT COUNT(*) AS count FROM deliveries WHERE request_key = ? AND payload IS NOT NULL",
+      )
+      .get(source.requestKey)?.count
+    const review = this.review(source.ref)
     return (
-      cutoff.reject_before !== null &&
-      source.createdAt <= validate(timestamp, cutoff.reject_before, "request epoch")
+      count === 1 &&
+      (!review ||
+        (review.attempts === 0 && !review.assessment && !review.error) ||
+        review.updatedAt < acceptedAt)
     )
   }
 
-  private newerRequests(ref: IssueRef, cutoff: number): { binding?: RequestBinding }[] {
-    const requests: { binding?: RequestBinding }[] = []
+  private consumedRequest(source: NonNullable<ReturnType<typeof requestSource>>): boolean {
+    return this.database()
+      .prepare("SELECT json FROM approvals WHERE issue_key = ?")
+      .all(key(source.ref))
+      .some((row) => {
+        const approval = parseRecord(approvalSchema, row.json, "approval")
+        return (
+          approval.request !== undefined &&
+          requestSource({ kind: "issue", ref: source.ref, request: approval.request })
+            ?.requestKey === source.requestKey
+        )
+      })
+  }
+
+  private requestEpoch(): number | null {
+    const row = this.database()
+      .prepare("SELECT reject_before FROM request_epoch WHERE id = 1")
+      .get()
+    if (!row) throw new Error("Missing request epoch record")
+    return row.reject_before === null
+      ? null
+      : validate(timestamp, row.reject_before, "request epoch")
+  }
+
+  private duplicateRequest(source: NonNullable<ReturnType<typeof requestSource>>): boolean {
+    const cutoff = this.requestEpoch()
+    return (
+      this.retiredCodingRequest(source.ref, source.createdAt) ||
+      this.database()
+        .prepare("SELECT id FROM deliveries WHERE request_key = ? LIMIT 1")
+        .get(source.requestKey) !== undefined ||
+      this.consumedRequest(source) ||
+      (cutoff !== null && source.createdAt <= cutoff)
+    )
+  }
+
+  private newerRequests(ref: IssueRef, cutoff: number) {
+    const requests: {
+      source: NonNullable<ReturnType<typeof requestSource>>
+      binding?: RequestBinding
+    }[] = []
     for (const row of this.database()
       .prepare("SELECT payload FROM deliveries WHERE status = 'pending'")
       .all()) {
@@ -1219,7 +1398,7 @@ export class Store {
       )
         continue
       const binding = requestBindingSchema.safeParse(payload.requestBinding)
-      requests.push(binding.success ? { binding: binding.data } : {})
+      requests.push({ source, ...(binding.success ? { binding: binding.data } : {}) })
     }
     return requests
   }
@@ -1232,6 +1411,7 @@ export class Store {
       ref,
       preservedJobIds: [],
       preservedBindings: [],
+      preservedTriageSources: [],
     }
     if (cutoff === undefined) return scope
     const db = this.database()
@@ -1283,7 +1463,8 @@ export class Store {
     return (
       this.newerRequests(ref.data, cutoff).length > 0 ||
       scope.preservedJobIds.length > 0 ||
-      scope.preservedBindings.length > 0
+      scope.preservedBindings.length > 0 ||
+      scope.preservedTriageSources.length > 0
     )
   }
 
@@ -1331,10 +1512,15 @@ export class Store {
           .all(id)) {
           if (typeof row.payload !== "string") continue
           const pending = JSON.parse(row.payload)
-          if (typeof pending !== "object" || pending === null || !pending.request) continue
+          if (
+            typeof pending !== "object" ||
+            pending === null ||
+            (!pending.request && !pending.retriage)
+          )
+            continue
           const pendingRef = refSchema.safeParse(pending.ref)
           if (!pendingRef.success || !sameRef(ref, pendingRef.data)) continue
-          const pendingSource = requestSource(pending)
+          const pendingSource = retriageSource(pending) ?? requestSource(pending)
           const actor = actorSchema.safeParse(pending.actor)
           if (
             cutoff !== undefined &&
@@ -1372,22 +1558,28 @@ export class Store {
         const current = this.readReview(row)
         if (!sameRef(current.ref, ref)) throw new Error("Inconsistent review identity")
         if (
+          scope.preservedTriageSources.length > 0 ||
           scope.preservedBindings.some(
             (binding) => stable(binding) === stable(requestBinding(current)),
           )
         )
           continue
-        const review = validate(reviewSchema, staleReview(current, reason, now), "review")
-        db.prepare("UPDATE reviews SET revision = ?, state = ?, json = ? WHERE issue_key = ?").run(
-          review.revision,
-          review.state,
-          JSON.stringify(review),
-          key(ref),
-        )
-        result.reviews.push({ ref, reason, revision: review.revision })
+        result.reviews.push({ ref, reason, revision: this.storeStaleReview(current, reason, now) })
       }
       return result
     })
+  }
+
+  private storeStaleReview(
+    current: Review,
+    reason: ReviewInvalidation["reason"],
+    now: number,
+  ): string {
+    const review = validate(reviewSchema, staleReview(current, reason, now), "review")
+    this.database()
+      .prepare("UPDATE reviews SET revision = ?, state = ?, json = ? WHERE issue_key = ?")
+      .run(review.revision, review.state, JSON.stringify(review), key(current.ref))
+    return review.revision
   }
 
   deliveries(): { id: string; payload: unknown }[] {
@@ -1436,31 +1628,35 @@ export class Store {
   }
 
   retireCodingRequests(ref: IssueRef, cutoff: number): void {
-    const issueKey = key(ref)
     const before = validate(timestamp, cutoff, "request retirement cutoff")
     if (before > Date.now()) throw new Error("Invalid request retirement cutoff")
     this.transaction(() => {
-      const db = this.database()
-      db.prepare(`INSERT INTO triage_coding_cutoffs(issue_key,reject_before) VALUES(?,?)
-        ON CONFLICT(issue_key) DO UPDATE SET reject_before = MAX(triage_coding_cutoffs.reject_before,excluded.reject_before)`).run(
-        issueKey,
-        before,
-      )
+      this.retireCodingReceipts(ref, before)
       this.revokeTriageAdmissions(
         ref,
         (admission) => !!admission.candidateKey || admission.createdAt > before,
       )
-      for (const row of db
-        .prepare("SELECT id,payload FROM deliveries WHERE status = 'pending'")
-        .all()) {
-        if (typeof row.payload !== "string") continue
-        const source = requestSource(JSON.parse(row.payload))
-        if (!source || key(source.ref) !== issueKey || source.createdAt > before) continue
-        db.prepare(
-          "UPDATE deliveries SET status = 'complete', payload = NULL, request_key = ? WHERE id = ?",
-        ).run(source.requestKey, row.id as string)
-      }
     })
+  }
+
+  private retireCodingReceipts(ref: IssueRef, before: number): void {
+    const db = this.database()
+    const issueKey = key(ref)
+    db.prepare(`INSERT INTO triage_coding_cutoffs(issue_key,reject_before) VALUES(?,?)
+      ON CONFLICT(issue_key) DO UPDATE SET reject_before = MAX(triage_coding_cutoffs.reject_before,excluded.reject_before)`).run(
+      issueKey,
+      before,
+    )
+    for (const row of db
+      .prepare("SELECT id,payload FROM deliveries WHERE status = 'pending'")
+      .all()) {
+      if (typeof row.payload !== "string") continue
+      const source = requestSource(JSON.parse(row.payload))
+      if (!source || key(source.ref) !== issueKey || source.createdAt > before) continue
+      db.prepare(
+        "UPDATE deliveries SET status = 'complete', payload = NULL, request_key = ? WHERE id = ?",
+      ).run(source.requestKey, row.id as string)
+    }
   }
 
   completeDelivery(id: string): void {

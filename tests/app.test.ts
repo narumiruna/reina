@@ -5,7 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { pino } from "pino"
 import { Probot, ProbotOctokit } from "probot"
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
+import { afterEach, assert, beforeEach, describe, expect, test, vi } from "vitest"
 import { artifactHash } from "../src/agent/validate.js"
 import { httpServer, register, sanitizeWebhook, webhookWork } from "../src/app.js"
 import { Publisher, proposalBody } from "../src/github/publisher.js"
@@ -817,25 +817,26 @@ describe("webhook routing and bounded event data", () => {
       issue: { ...payload().issue, updated_at: new Date(now).toISOString() },
     })
     const original = webhookWork("issues", event, configuration(), botId)
+    assert(original?.kind === "issue" && original.retriage)
     event.repository.name = event.repository.name.toUpperCase()
     event.repository.owner.login = event.repository.owner.login.toUpperCase()
     expect(webhookWork("issues", event, configuration(), botId)).toEqual(original)
-    expect(
-      webhookWork(
-        "issues",
-        { ...event, issue: { ...event.issue, body: "Changed private body" } },
-        configuration(),
-        botId,
-      ),
-    ).not.toEqual(original)
-    expect(
-      webhookWork(
-        "issues",
-        { ...event, issue: { ...event.issue, updated_at: new Date(now - 1000).toISOString() } },
-        configuration(),
-        botId,
-      ),
-    ).not.toEqual(original)
+    const changedBody = webhookWork(
+      "issues",
+      { ...event, issue: { ...event.issue, body: "Changed private body" } },
+      configuration(),
+      botId,
+    )
+    assert(changedBody?.kind === "issue" && changedBody.retriage)
+    expect(changedBody.retriage.candidateKey).not.toBe(original.retriage.candidateKey)
+    const changedTime = webhookWork(
+      "issues",
+      { ...event, issue: { ...event.issue, updated_at: new Date(now - 1000).toISOString() } },
+      configuration(),
+      botId,
+    )
+    assert(changedTime?.kind === "issue" && changedTime.retriage)
+    expect(changedTime.retriage.candidateKey).not.toBe(original.retriage.candidateKey)
   })
 
   test.each(["assigned", "unassigned"] as const)(

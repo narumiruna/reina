@@ -391,8 +391,9 @@ applying the replacement. Use an authorized admin session; do not send credentia
    environment variable, select the worker. The new image changes the policy binding and
    invalidates old results/proposals, but does not authorize another assessment. After readiness
    is confirmed, a permitted maintainer must add `bot:retriage` for each intended read-only retry,
-   with separate live-use/cost authorization. Do not reset SQLite records, replay consumed
-   requests, clear publication intents, or treat this operation as coding authorization.
+   with separate live-use/cost authorization. If the label is already present, remove it and then
+   re-add it to create a fresh transition. Do not reset SQLite records, replay consumed requests,
+   clear publication intents, or treat this operation as coding authorization.
 5. **Verify publication for each explicitly requested, still-eligible affected issue.** Require runtime
    readiness, a fresh review revision, `triage_completed`, one current summary, `bot:triaged`,
    and the matching `bot:needs-info` or `bot:needs-human` label when applicable. A fix candidate
@@ -957,9 +958,10 @@ required production-host checks and owner acceptance pass, or an explicit except
      explicit mention request, or supported bot assignment, can instead delegate one policy-bound
      attempt without an additional label. Both paths publish the immutable proposal before coding.
      Inspect one draft PR through separately authorized coding work. Evidence/base/policy changes
-     and 24-hour proposal expiry never automatically renew assessment. Add `bot:retriage` for
-     another read-only assessment; add it again for a later one. Verify no code, job claim, or PR
-     from that trigger, including with old approval labels or resumed older coding receipts.
+     and 24-hour proposal expiry never automatically renew assessment. For each read-only
+     reassessment, add `bot:retriage`. If the label is already present, remove it and then re-add
+     it to create a fresh transition. Verify no code, job claim, or PR from that trigger, including
+     with old approval labels or resumed older coding receipts.
      A fresh explicit coding request remains a separate delegation.
      Native assignment must first pass GitHub's assignee-eligibility check;
      the current `reinabot[bot]` App is rejected by GitHub.
