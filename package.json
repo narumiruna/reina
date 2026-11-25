@@ -43,7 +43,7 @@
     "diff": "9.0.0",
     "ipaddr.js": "2.5.0",
     "mdast-util-from-markdown": "2.1.0",
-    "openid-client": "6.9.0",
+    "openid-client": "6.9.1",
     "picomatch": "4.0.7",
     "pino": "10.4.0",
     "probot": "14.3.7",
